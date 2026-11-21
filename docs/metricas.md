@@ -38,9 +38,9 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Virtualização | `IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED)` | | | E1 |
 | Processos, threads, handles | `GetPerformanceInfo` | | | E1 |
 | Tempo ligado | `GetTickCount64` | | | E1 |
-| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | "CPU não suportada" (não AMD ou fora de 17h-1Ah) | Spike (Zen 3; ±0,1 °C do Afterburner) |
-| Temperatura por CCD | SMN por família/modelo; validado só Zen 3 Vermeer (19h, 20h-2Fh): `0x59954 + 4·n`, bit 11 = válido | A | "não validado nesta família" | Spike (Zen 3) |
-| Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | "CPU não suportada" | Spike (Zen 3) |
+| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | "CPU não suportada" (não AMD ou fora de 17h-1Ah) | E2 (wintop: ±0,2 °C do Afterburner no spike) |
+| Temperatura por CCD | SMN por família/modelo; validado só Zen 3 Vermeer (19h, 20h-2Fh): `0x59954 + 4·n`, bit 11 = válido | A | "não validado nesta família" | E2 (Zen 3) |
+| Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | "CPU não suportada" | E2 (Zen 3) |
 
 ## Memória
 
@@ -56,7 +56,7 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Fabricante e modelo | `StorageDeviceProperty` (VendorId + ProductId) | | | Spike |
+| Fabricante e modelo | nome amigável do PnP (SetupAPI, `GUID_DEVINTERFACE_DISK` + `IOCTL_STORAGE_GET_DEVICE_NUMBER`), igual ao Task Manager; sem ele, VendorId + ProductId do `StorageDeviceProperty` | | | E2 (= Task Manager) |
 | Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | Spike |
 | SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
 | Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s) | Spike |
@@ -66,9 +66,9 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Tempo ativo (%) | `IOCTL_DISK_PERFORMANCE` (handle sem acesso; não acorda o disco): `100 - Δidle/ΔQueryTime`, limitado a 0-100. Mesma fonte do PDH `\PhysicalDisk`, sem os ~54 MB que o provedor do PDH reserva | | | E1 (= PDH na mesma janela) |
 | Leitura / escrita (B/s) | `IOCTL_DISK_PERFORMANCE`: Δ`BytesRead` / Δ`BytesWritten` por segundo | | | E1 (= PDH) |
 | Tempo médio de resposta | `IOCTL_DISK_PERFORMANCE`: Δ(`ReadTime` + `WriteTime`) / Δ(`ReadCount` + `WriteCount`) | | | E1 (= PDH) |
-| Temperatura NVMe (e alguns SATA) | `StorageDeviceTemperatureProperty` (52), primeira entrada diferente de "não reportado" | A | | Spike |
-| Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190) | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido) | Spike (repouso real ainda não testado) |
-| Temperatura do Storage Space | máximo dos membros | A | | Spike |
+| Temperatura NVMe (e alguns SATA) | `StorageDeviceTemperatureProperty` (52), primeira entrada diferente de "não reportado"; a cada 10 s | A | | E2 (= `Get-StorageReliabilityCounter`) |
+| Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190), a cada 60 s | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido) | E2 (= `Get-StorageReliabilityCounter`; repouso real ainda não testado) |
+| Temperatura do Storage Space | máximo dos membros | A | "vários pools: associação pendente"; "em repouso" (todos os membros parados) | E2 |
 
 ## Rede (uma linha por interface física)
 

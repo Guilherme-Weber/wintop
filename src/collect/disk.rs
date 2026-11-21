@@ -8,6 +8,11 @@
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
+    SPDRP_FRIENDLYNAME, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
+    SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
+};
 use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
@@ -15,8 +20,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_PERFORMANCE,
-    IOCTL_STORAGE_QUERY_PROPERTY,
+    GUID_DEVINTERFACE_DISK, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
+    IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
 };
 use windows::Win32::System::Power::GetDevicePowerState;
 use windows::core::{BOOL, PCWSTR};
@@ -47,10 +52,10 @@ const PAGEFILES_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\M
 /// Nova tentativa de ler capacidade e layout de um HDD que estava em repouso.
 const RETRY_ASLEEP: Duration = Duration::from_secs(60);
 
-struct Handle(OwnedHandle);
+pub(super) struct Handle(OwnedHandle);
 
 impl Handle {
-    fn open(n: u32, access: u32) -> Option<Self> {
+    pub(super) fn open(n: u32, access: u32) -> Option<Self> {
         Self::open_path(&format!(r"\\.\PhysicalDrive{n}"), access)
     }
 
@@ -77,7 +82,12 @@ impl Handle {
         HANDLE(self.0.as_raw_handle())
     }
 
-    fn ioctl(&self, code: u32, input: Option<&[u8]>, out_len: usize) -> Result<Vec<u8>, String> {
+    pub(super) fn ioctl(
+        &self,
+        code: u32,
+        input: Option<&[u8]>,
+        out_len: usize,
+    ) -> Result<Vec<u8>, String> {
         let mut out = vec![0u8; out_len];
         let mut ret = 0u32;
         // SAFETY: buffers locais com os tamanhos informados; chamada síncrona.
@@ -99,14 +109,14 @@ impl Handle {
     }
 
     /// STORAGE_PROPERTY_QUERY { PropertyId, QueryType = PropertyStandardQuery, ... }.
-    fn property(&self, id: u32) -> Result<Vec<u8>, String> {
+    pub(super) fn property(&self, id: u32) -> Result<Vec<u8>, String> {
         let mut q = [0u8; 12];
         q[..4].copy_from_slice(&id.to_le_bytes());
         self.ioctl(IOCTL_STORAGE_QUERY_PROPERTY, Some(&q), 1024)
     }
 
     /// `Some(true)` acordado, `Some(false)` em repouso, `None` sem resposta.
-    fn awake(&self) -> Option<bool> {
+    pub(super) fn awake(&self) -> Option<bool> {
         let mut on = BOOL(1);
         // SAFETY: handle válido e ponteiro para BOOL.
         unsafe { GetDevicePowerState(self.raw(), &raw mut on) }
@@ -286,30 +296,34 @@ fn volume_letters() -> Vec<(u32, String)> {
 }
 
 /// Inventário de um disco (lido na descoberta; capacidade e layout de novo se estava em repouso).
-struct Inventory {
-    number: u32,
+pub(super) struct Inventory {
+    pub(super) number: u32,
     model: Metric<String>,
-    bus: Metric<Bus>,
-    ssd: Metric<bool>,
+    pub(super) bus: Metric<Bus>,
+    pub(super) ssd: Metric<bool>,
     capacity: Metric<u64>,
-    pool_member: Metric<bool>,
+    pub(super) pool_member: Metric<bool>,
     asleep_since: Option<Instant>,
     /// Handle de metadados mantido aberto; USB não (não impedir a remoção segura).
-    handle: Option<Handle>,
+    pub(super) handle: Option<Handle>,
     last: Option<PerfSample>,
-    /// A última leitura de desempenho falhou (disco removido?).
-    lost: bool,
+    /// A última leitura falhou (disco removido?).
+    pub(super) lost: bool,
 }
 
 impl Inventory {
-    fn discover(n: u32) -> Option<Self> {
+    /// `names`: nomes amigáveis do PnP (`friendly_names`), preferidos ao do descritor.
+    fn discover(n: u32, names: &[(u32, String)]) -> Option<Self> {
         let meta = Handle::open(n, 0)?;
         let desc = meta.property(PROP_DEVICE);
-        let model = desc
-            .as_deref()
-            .map_err(Clone::clone)
-            .and_then(|d| model_name(d).ok_or_else(|| "descriptor has no model".into()))
-            .or_else(fail);
+        let model = match names.iter().find(|(m, _)| *m == n) {
+            Some((_, name)) => Ok(name.clone()),
+            None => desc
+                .as_deref()
+                .map_err(Clone::clone)
+                .and_then(|d| model_name(d).ok_or_else(|| "descriptor has no model".into()))
+                .or_else(fail),
+        };
         let bus = desc
             .as_deref()
             .map_err(Clone::clone)
@@ -415,6 +429,123 @@ impl Inventory {
     }
 }
 
+/// Todos os discos físicos presentes.
+pub(super) fn discover_all() -> Vec<Inventory> {
+    let mut disks = Vec::new();
+    refresh(&mut disks);
+    disks
+}
+
+/// Disco perdido sai; se o número voltar a existir, é redescoberto do zero (handle e
+/// metadados novos: pode ser outro disco). Discos novos entram.
+pub(super) fn refresh(disks: &mut Vec<Inventory>) {
+    disks.retain(|d| !d.lost);
+    let new: Vec<u32> = (0..64)
+        .filter(|n| !disks.iter().any(|d| d.number == *n) && Handle::open(*n, 0).is_some())
+        .collect();
+    if new.is_empty() {
+        return;
+    }
+    let names = friendly_names();
+    disks.extend(
+        new.into_iter()
+            .filter_map(|n| Inventory::discover(n, &names)),
+    );
+    disks.sort_by_key(|d| d.number);
+}
+
+/// Nome amigável do PnP de cada disco (o que o Task Manager mostra): `(número, nome)`.
+/// Pela interface `GUID_DEVINTERFACE_DISK` do SetupAPI; o número vem do
+/// `IOCTL_STORAGE_GET_DEVICE_NUMBER` no caminho da interface.
+fn friendly_names() -> Vec<(u32, String)> {
+    let guid = GUID_DEVINTERFACE_DISK;
+    // SAFETY: GUID local; a lista é destruída no fim da função.
+    let Ok(set) = (unsafe {
+        SetupDiGetClassDevsW(
+            Some(&raw const guid),
+            PCWSTR::null(),
+            None,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+    }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let mut iface = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: lista válida; erro (ERROR_NO_MORE_ITEMS) encerra.
+        let r =
+            unsafe { SetupDiEnumDeviceInterfaces(set, None, &raw const guid, i, &raw mut iface) };
+        if r.is_err() {
+            break;
+        }
+        if let Some(entry) = interface_name(set, &iface) {
+            out.push(entry);
+        }
+    }
+    // SAFETY: lista criada acima, não usada depois.
+    unsafe {
+        let _ = SetupDiDestroyDeviceInfoList(set);
+    }
+    out
+}
+
+fn interface_name(set: HDEVINFO, iface: &SP_DEVICE_INTERFACE_DATA) -> Option<(u32, String)> {
+    // SP_DEVICE_INTERFACE_DETAIL_DATA_W: cbSize (8 no x64) + caminho UTF-16 a partir do byte 4.
+    let mut buf = vec![0u64; 256];
+    buf[0] = 8;
+    let mut dev = SP_DEVINFO_DATA {
+        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: buffer alinhado de 2 KB com cbSize preenchido; tamanho informado em bytes.
+    unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            set,
+            iface,
+            Some(buf.as_mut_ptr().cast()),
+            (buf.len() * 8) as u32,
+            None,
+            Some(&raw mut dev),
+        )
+    }
+    .ok()?;
+    // SAFETY: Vec<u64> visto como u16 a partir do byte 4, dentro do buffer (o caminho termina
+    // em zero; `from_wide` para no zero ou no fim).
+    let path_w =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u16>().add(2), buf.len() * 4 - 2) };
+    let path = win::from_wide(path_w);
+    // STORAGE_DEVICE_NUMBER { DeviceType, DeviceNumber, PartitionNumber }.
+    let number = Handle::open_path(&path, 0)?
+        .ioctl(IOCTL_STORAGE_GET_DEVICE_NUMBER, None, 12)
+        .ok()
+        .and_then(|b| u32_at(&b, 4))?;
+    let mut name = [0u8; 512];
+    // SAFETY: estruturas válidas; buffer local.
+    unsafe {
+        SetupDiGetDeviceRegistryPropertyW(
+            set,
+            &raw const dev,
+            SPDRP_FRIENDLYNAME,
+            None,
+            Some(&mut name),
+            None,
+        )
+    }
+    .ok()?;
+    let wide_name: Vec<u16> = name
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let name = win::from_wide(&wide_name).trim().to_string();
+    (!name.is_empty()).then_some((number, name))
+}
+
 pub struct DiskCollector {
     disks: Vec<Inventory>,
     letters: Vec<(u32, String)>,
@@ -432,7 +563,7 @@ impl DiskCollector {
             .filter_map(|p| win::drive_letter(p))
             .collect();
         Self {
-            disks: (0..64).filter_map(Inventory::discover).collect(),
+            disks: discover_all(),
             letters: volume_letters(),
             discovered: Some(Instant::now()),
             system_drive: win::windows_drive(),
@@ -443,17 +574,7 @@ impl DiskCollector {
     /// Discos novos entram, discos que sumiram saem; letras relidas.
     fn rediscover(&mut self) {
         self.discovered = Some(Instant::now());
-        // Disco perdido sai; se o número voltar a existir, é redescoberto do zero (handle e
-        // metadados novos: pode ser outro disco).
-        self.disks.retain(|d| !d.lost);
-        for n in 0..64 {
-            if !self.disks.iter().any(|d| d.number == n)
-                && let Some(inv) = Inventory::discover(n)
-            {
-                self.disks.push(inv);
-            }
-        }
-        self.disks.sort_by_key(|d| d.number);
+        refresh(&mut self.disks);
         self.letters = volume_letters();
     }
 

@@ -1,0 +1,291 @@
+//! Temperatura dos discos (thread lenta: cada leitura leva até 156 ms nos HDDs).
+//!
+//! - nativa: `StorageDeviceTemperatureProperty` (NVMe e alguns SATA), a cada 10 s;
+//! - SMART: `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190), a cada 60 s;
+//! - HDD em repouso (`GetDevicePowerState`) não é lido, para não acordá-lo;
+//! - Storage Space: máximo dos membros (com um pool só).
+//!
+//! Offsets conferidos com o MSVC (winioctl.h) na Etapa 0.
+
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::System::Ioctl::IOCTL_STORAGE_PREDICT_FAILURE;
+
+use super::disk::{Handle, Inventory, discover_all, refresh};
+use crate::model::{Bus, DiskTemp, Metric, Missing, fail, neutral};
+
+const PROP_TEMPERATURE: u32 = 52; // StorageDeviceTemperatureProperty
+const TEMP_NOT_REPORTED: i16 = i16::MIN; // STORAGE_TEMPERATURE_VALUE_NOT_REPORTED
+// STORAGE_TEMPERATURE_DATA_DESCRIPTOR / STORAGE_TEMPERATURE_INFO
+const T_INFO_COUNT: usize = 12;
+const T_INFO: usize = 24;
+const T_INFO_SIZE: usize = 16;
+const T_TEMP: usize = 2;
+/// STORAGE_PREDICT_FAILURE { ULONG PredictFailure; UCHAR VendorSpecific[512]; }.
+const PREDICT_SIZE: usize = 516;
+
+const NATIVE_EVERY: Duration = Duration::from_secs(10);
+const SMART_EVERY: Duration = Duration::from_secs(60);
+const REDISCOVER: Duration = Duration::from_secs(60);
+
+/// Primeira temperatura reportada (índice 0 = composta no NVMe), ignorando "não reportado".
+fn native_temp(b: &[u8]) -> Option<i16> {
+    let count = usize::from(u16::from_le_bytes(
+        b.get(T_INFO_COUNT..T_INFO_COUNT + 2)?.try_into().ok()?,
+    ));
+    (0..count).find_map(|i| {
+        let off = T_INFO + i * T_INFO_SIZE + T_TEMP;
+        let t = i16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?);
+        (t != TEMP_NOT_REPORTED).then_some(t)
+    })
+}
+
+/// Temperatura SMART: 30 atributos de 12 bytes após 2 bytes de revisão; valor bruto no byte 5.
+fn smart_temp(vendor: &[u8]) -> Option<(u8, u8)> {
+    let attr = |want: u8| {
+        (0..30).find_map(|i| {
+            let b = 2 + i * 12;
+            let a = vendor.get(b..b + 12)?;
+            (a[0] == want && a[5] > 0).then_some((want, a[5]))
+        })
+    };
+    attr(194).or_else(|| attr(190))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Unknown,
+    Native,
+    Smart,
+}
+
+struct State {
+    method: Method,
+    last: Option<Instant>,
+    value: Metric<i16>,
+    source: &'static str,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            method: Method::Unknown,
+            last: None,
+            value: fail("not read yet"),
+            source: "",
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        let every = if self.method == Method::Smart {
+            SMART_EVERY
+        } else {
+            NATIVE_EVERY
+        };
+        self.last.is_none_or(|t| now.duration_since(t) >= every)
+    }
+}
+
+pub struct DiskTempCollector {
+    disks: Vec<(Inventory, State)>,
+    discovered: Instant,
+}
+
+impl DiskTempCollector {
+    pub fn new() -> Self {
+        Self {
+            disks: discover_all()
+                .into_iter()
+                .map(|d| (d, State::new()))
+                .collect(),
+            discovered: Instant::now(),
+        }
+    }
+
+    fn rediscover(&mut self) {
+        self.discovered = Instant::now();
+        // O estado volta pelo número; o de um disco perdido é descartado (o número pode ser
+        // de outro disco agora).
+        let mut inv = Vec::with_capacity(self.disks.len());
+        let mut states = Vec::with_capacity(self.disks.len());
+        for (d, st) in self.disks.drain(..) {
+            if !d.lost {
+                states.push((d.number, st));
+            }
+            inv.push(d);
+        }
+        refresh(&mut inv);
+        self.disks = inv
+            .into_iter()
+            .map(|d| {
+                let st = states
+                    .iter()
+                    .position(|(n, _)| *n == d.number)
+                    .map_or_else(State::new, |i| states.swap_remove(i).1);
+                (d, st)
+            })
+            .collect();
+    }
+
+    pub fn read(&mut self) -> Metric<Vec<DiskTemp>> {
+        if self.discovered.elapsed() >= REDISCOVER || self.disks.iter().any(|(d, _)| d.lost) {
+            self.rediscover();
+        }
+        if self.disks.is_empty() {
+            return fail("no physical disk could be opened");
+        }
+        let now = Instant::now();
+        for (d, st) in &mut self.disks {
+            if d.bus != Ok(Bus::Spaces) && st.due(now) {
+                read_one(d, st);
+                st.last = Some(now);
+            }
+        }
+        let pools = self
+            .disks
+            .iter()
+            .filter(|(d, _)| d.bus == Ok(Bus::Spaces))
+            .count();
+        let members: Vec<&Metric<i16>> = self
+            .disks
+            .iter()
+            .filter(|(d, _)| d.pool_member == Ok(true))
+            .map(|(_, st)| &st.value)
+            .collect();
+        Ok(self
+            .disks
+            .iter()
+            .map(|(d, st)| {
+                if d.bus == Ok(Bus::Spaces) {
+                    DiskTemp {
+                        number: d.number,
+                        celsius: pool_temp(pools, &members),
+                        source: "pool members",
+                    }
+                } else {
+                    DiskTemp {
+                        number: d.number,
+                        celsius: st.value.clone(),
+                        source: st.source,
+                    }
+                }
+            })
+            .collect())
+    }
+}
+
+/// Máximo dos membros do pool. Com mais de um pool, a associação membro-pool é pendente.
+fn pool_temp(pools: usize, members: &[&Metric<i16>]) -> Metric<i16> {
+    if pools > 1 {
+        return neutral("several pools: association pending");
+    }
+    if let Some(max) = members.iter().filter_map(|m| m.as_ref().ok()).max() {
+        return Ok(*max);
+    }
+    if !members.is_empty()
+        && members
+            .iter()
+            .all(|m| matches!(m, Err(Missing::Neutral(_))))
+    {
+        return neutral("asleep");
+    }
+    fail("no member temperature")
+}
+
+fn read_one(d: &mut Inventory, st: &mut State) {
+    // Sem handle guardado (USB): abre só para esta leitura.
+    let temp;
+    let meta = if let Some(h) = &d.handle {
+        h
+    } else {
+        temp = Handle::open(d.number, 0);
+        let Some(h) = &temp else {
+            d.lost = true;
+            st.value = fail("disk not found");
+            return;
+        };
+        h
+    };
+    // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura.
+    if d.ssd == Ok(false) && meta.awake() == Some(false) {
+        st.value = neutral("asleep");
+        return;
+    }
+    if st.method != Method::Smart
+        && let Some(t) = meta
+            .property(PROP_TEMPERATURE)
+            .ok()
+            .as_deref()
+            .and_then(native_temp)
+    {
+        st.method = Method::Native;
+        st.value = Ok(t);
+        st.source = "native";
+        return;
+    }
+    // Sem temperatura nativa: SMART (exige handle de leitura e escrita).
+    let smart = Handle::open(d.number, GENERIC_READ.0 | GENERIC_WRITE.0)
+        .ok_or_else(|| "no read/write access (not elevated?)".to_string())
+        .and_then(|rw| rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE))
+        .and_then(|b| {
+            b.get(4..)
+                .and_then(smart_temp)
+                .ok_or_else(|| "no temperature sensor (native or SMART 194/190)".to_string())
+        });
+    match smart {
+        Ok((id, c)) => {
+            st.method = Method::Smart;
+            st.value = Ok(i16::from(c));
+            st.source = if id == 194 { "SMART 194" } else { "SMART 190" };
+        }
+        Err(e) => {
+            // Volta a tentar a nativa na próxima vez só se ela nunca funcionou.
+            st.value = fail(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperatura_nativa_ignora_nao_reportado() {
+        let mut b = vec![0u8; T_INFO + 2 * T_INFO_SIZE];
+        b[T_INFO_COUNT..T_INFO_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+        b[T_INFO + T_TEMP..T_INFO + T_TEMP + 2].copy_from_slice(&TEMP_NOT_REPORTED.to_le_bytes());
+        let second = T_INFO + T_INFO_SIZE + T_TEMP;
+        b[second..second + 2].copy_from_slice(&41i16.to_le_bytes());
+        assert_eq!(native_temp(&b), Some(41));
+        b[T_INFO_COUNT..T_INFO_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(native_temp(&b), None);
+        assert_eq!(native_temp(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn smart_prefere_194() {
+        let mut v = vec![0u8; 2 + 30 * 12];
+        v[2] = 190;
+        v[2 + 5] = 30;
+        v[2 + 12] = 194;
+        v[2 + 12 + 5] = 35;
+        assert_eq!(smart_temp(&v), Some((194, 35)));
+        v[2 + 12] = 0;
+        assert_eq!(smart_temp(&v), Some((190, 30)));
+    }
+
+    #[test]
+    fn temperatura_do_pool() {
+        let (a, b): (Metric<i16>, Metric<i16>) = (Ok(35), Ok(41));
+        let asleep: Metric<i16> = neutral("asleep");
+        let bad: Metric<i16> = fail("x");
+        assert_eq!(pool_temp(1, &[&a, &asleep, &b]), Ok(41));
+        assert_eq!(pool_temp(1, &[&asleep, &asleep]), neutral("asleep"));
+        assert!(matches!(
+            pool_temp(1, &[&asleep, &bad]),
+            Err(Missing::Fail(_))
+        ));
+        assert!(matches!(pool_temp(2, &[&a]), Err(Missing::Neutral(_))));
+    }
+}

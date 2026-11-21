@@ -3,9 +3,11 @@
 
 mod cpu;
 mod disk;
+mod disk_temp;
 mod gpu;
 mod memory;
 mod net;
+mod pawnio;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -45,6 +47,7 @@ fn perf_info() -> Result<PERFORMANCE_INFORMATION, String> {
 /// Coletores da thread rápida (intervalo principal, padrão 1 s).
 pub struct FastCollectors {
     cpu: Result<cpu::CpuCollector, String>,
+    pawnio: Result<pawnio::PawnIoCollector, String>,
     memory: Result<memory::MemoryCollector, String>,
     disk: Result<disk::DiskCollector, String>,
     net: Result<net::NetCollector, String>,
@@ -66,6 +69,7 @@ impl FastCollectors {
     pub fn new() -> Self {
         Self {
             cpu: create("CPU", cpu::CpuCollector::new),
+            pawnio: create("CPU sensor", pawnio::PawnIoCollector::new),
             memory: create("memory", memory::MemoryCollector::new),
             disk: create("disk", disk::DiskCollector::new),
             net: create("network", net::NetCollector::new),
@@ -77,12 +81,18 @@ impl FastCollectors {
         let start = Instant::now();
         let pi = perf_info();
         let cpu = run("CPU", &mut self.cpu, |c| Ok(c.read(pi.as_ref())));
+        let cpu_sensors = run(
+            "CPU sensor",
+            &mut self.pawnio,
+            pawnio::PawnIoCollector::read,
+        );
         let memory = run("memory", &mut self.memory, |c| Ok(c.read(pi.as_ref())));
         let disks = run("disk", &mut self.disk, disk::DiskCollector::read);
         let nics = run("network", &mut self.net, net::NetCollector::read);
         let gpus = run("GPU", &mut self.gpu, gpu::GpuCollector::read);
         Fast {
             cpu,
+            cpu_sensors,
             memory,
             disks,
             nics,
@@ -95,20 +105,28 @@ impl FastCollectors {
 /// Coletores da thread lenta (leituras caras).
 pub struct SlowCollectors {
     gpu: Result<gpu::GpuSlowCollector, String>,
+    disk_temp: Result<disk_temp::DiskTempCollector, String>,
 }
 
 impl SlowCollectors {
     pub fn new() -> Self {
         Self {
             gpu: create("GPU PCIe", gpu::GpuSlowCollector::new),
+            disk_temp: create("disk temperature", disk_temp::DiskTempCollector::new),
         }
     }
 
     pub fn collect(&mut self) -> Slow {
         let start = Instant::now();
         let gpus = run("GPU PCIe", &mut self.gpu, gpu::GpuSlowCollector::read);
+        let disk_temps = run(
+            "disk temperature",
+            &mut self.disk_temp,
+            disk_temp::DiskTempCollector::read,
+        );
         Slow {
             gpus,
+            disk_temps,
             took: start.elapsed(),
         }
     }

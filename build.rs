@@ -23,11 +23,37 @@ fn main() {
         "wintop.exe.manifest: assemblyIdentity deve ter {expected} (versão do Cargo.toml)"
     );
 
+    copy_module();
+
     let mut res = winresource::WindowsResource::new();
     res.set_manifest_file("wintop.exe.manifest");
     res.set("FileDescription", "wintop - monitor de sistema em terminal");
     res.set("ProductName", "wintop");
     if let Err(e) = res.compile_for("wintop") {
         panic!("falha ao embutir o manifesto: {e}");
+    }
+}
+
+/// Copia o módulo do PawnIO (LGPL-2.1, arquivo separado) e a licença para
+/// `target\<perfil>\modules\`, o mesmo layout da instalação (`<pasta do exe>\modules\`): o
+/// executável elevado nunca procura o módulo num caminho gravado na compilação.
+fn copy_module() {
+    const FILES: [&str; 2] = ["AMDFamily17.bin", "COPYING-LGPL-2.1"];
+    for f in FILES {
+        println!("cargo:rerun-if-changed=modules/{f}");
+    }
+    // OUT_DIR = target\<perfil>\build\wintop-<hash>\out (layout antigo) ou
+    // target\<perfil>\build\wintop\<hash>\out (atual): o perfil é o pai da pasta `build`.
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let profile = out
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "build"))
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| panic!("pasta `build` acima de OUT_DIR ({})", out.display()));
+    let dest = profile.join("modules");
+    std::fs::create_dir_all(&dest).expect("criar target/<perfil>/modules");
+    for f in FILES {
+        std::fs::copy(std::path::Path::new("modules").join(f), dest.join(f))
+            .unwrap_or_else(|e| panic!("copiar modules/{f}: {e}"));
     }
 }

@@ -205,10 +205,32 @@ pub struct GpuSlow {
     pub pcie_rx: Metric<u64>,
 }
 
+/// Sensores da CPU pelo PawnIO.
+#[derive(Clone, Debug)]
+pub struct CpuSensors {
+    /// °C.
+    pub tctl: Metric<f64>,
+    /// (número do CCD a partir de 1, °C).
+    pub ccds: Metric<Vec<(u32, f64)>>,
+    /// Watts.
+    pub package_power: Metric<f64>,
+}
+
+/// Temperatura de um disco (thread lenta).
+#[derive(Clone, Debug)]
+pub struct DiskTemp {
+    pub number: u32,
+    /// °C.
+    pub celsius: Metric<i16>,
+    /// De onde veio: "native", "SMART 194", "SMART 190", "pool members".
+    pub source: &'static str,
+}
+
 /// Uma coleta da thread rápida.
 #[derive(Clone, Debug)]
 pub struct Fast {
     pub cpu: Metric<Cpu>,
+    pub cpu_sensors: Metric<CpuSensors>,
     pub memory: Metric<Memory>,
     pub disks: Metric<Vec<Disk>>,
     pub nics: Metric<Vec<Nic>>,
@@ -221,5 +243,6 @@ pub struct Fast {
 #[derive(Clone, Debug)]
 pub struct Slow {
     pub gpus: Metric<Vec<GpuSlow>>,
+    pub disk_temps: Metric<Vec<DiskTemp>>,
     pub took: Duration,
 }

@@ -116,6 +116,23 @@ fn fast_report(r: &mut Report, f: &Fast) {
         }
     }
 
+    Report::section("CPU sensors");
+    match &f.cpu_sensors {
+        Err(e) => r.line("PawnIO", &Err::<(), _>(e.clone()), |()| String::new()),
+        Ok(s) => {
+            r.line("Tctl", &s.tctl, |v| format!("{} °C", num(*v, 1)));
+            r.line("CCD temperatures", &s.ccds, |v| {
+                v.iter()
+                    .map(|(n, t)| format!("CCD{n} {} °C", num(*t, 1)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            r.line("Package power", &s.package_power, |v| {
+                format!("{} W", num(*v, 1))
+            });
+        }
+    }
+
     Report::section("Memory");
     match &f.memory {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
@@ -260,6 +277,19 @@ fn slow_report(r: &mut Report, s: &Slow) {
                 });
                 r.line(&format!("GPU {} PCIe RX", g.index), &g.pcie_rx, |v| {
                     format!("{}/s", bytes(*v))
+                });
+            }
+        }
+    }
+    match &s.disk_temps {
+        Err(e) => r.line("Disk temperature", &Err::<(), _>(e.clone()), |()| {
+            String::new()
+        }),
+        Ok(list) => {
+            for t in list {
+                let source = t.source;
+                r.line(&format!("Disk {} temperature", t.number), &t.celsius, |c| {
+                    format!("{c} °C ({source})")
                 });
             }
         }
