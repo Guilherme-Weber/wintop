@@ -203,6 +203,55 @@ pub struct GpuSlow {
     pub index: u32,
     pub pcie_tx: Metric<u64>,
     pub pcie_rx: Metric<u64>,
+    /// VRAM dedicada por categoria (como o gputaskman).
+    pub vram: Metric<VramBreakdown>,
+}
+
+/// Categoria de uso da VRAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VramKind {
+    /// O jogo que o RTSS acompanha (a interface separa pelo PID; o coletor não sabe qual é).
+    Game,
+    App,
+    Compositor,
+    Browser,
+    System,
+    Kernel,
+    Free,
+}
+
+impl VramKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Game => "game",
+            Self::App => "app",
+            Self::Compositor => "compositor",
+            Self::Browser => "browser",
+            Self::System => "system",
+            Self::Kernel => "kernel",
+            Self::Free => "free",
+        }
+    }
+}
+
+/// VRAM local de um processo.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VramProc {
+    pub pid: u32,
+    pub name: String,
+    pub local: u64,
+    pub kind: VramKind,
+}
+
+/// VRAM dedicada dividida por categoria; processos do maior para o menor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VramBreakdown {
+    pub total: u64,
+    pub used: u64,
+    /// Na ordem de exibição: app, compositor, browser, system, kernel, free (o jogo é separado
+    /// do "app" pela interface, que sabe o PID dele).
+    pub segments: Vec<(VramKind, u64)>,
+    pub processes: Vec<VramProc>,
 }
 
 /// Sensores da CPU pelo PawnIO.
@@ -246,6 +295,9 @@ pub struct Game {
     pub gpu_time: Metric<(f64, f64)>,
     /// "GPU" ou "CPU": quem limita o frame.
     pub bound: Metric<&'static str>,
+    /// Frametimes mais recentes em µs (por frame no modo exato; amostras de 250 ms no
+    /// aproximado), do mais antigo ao mais novo: o gráfico de frametime.
+    pub recent_us: Vec<u32>,
 }
 
 /// Estado do RTSS e do jogo (thread do RTSS, a cada 250 ms).

@@ -174,6 +174,19 @@ fn slow() -> Slow {
             index: 0,
             pcie_tx: Ok(55 * MB),
             pcie_rx: Ok(250 * MB),
+            vram: Ok(crate::model::VramBreakdown {
+                total: 16_303 * MB,
+                used: 11 * GB,
+                segments: vec![
+                    (crate::model::VramKind::App, 2 * GB),
+                    (crate::model::VramKind::Compositor, 859 * MB),
+                    (crate::model::VramKind::Browser, 638 * MB),
+                    (crate::model::VramKind::System, 105 * MB),
+                    (crate::model::VramKind::Kernel, 4 * MB),
+                    (crate::model::VramKind::Free, 5 * GB),
+                ],
+                processes: vec![],
+            }),
         }]),
         disk_temps: Ok(vec![
             t(0, Ok(39), "SMART 194"),
@@ -200,6 +213,7 @@ fn game() -> Fps {
             lows: Ok((98.0, 61.0)),
             gpu_time: Ok((5.2, 6.8)),
             bound: Ok("GPU"),
+            recent_us: (0..400).map(|i| 6_000 + (i * 37 % 5_000)).collect(),
         }),
     }
 }

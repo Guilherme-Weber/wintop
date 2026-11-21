@@ -12,9 +12,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
-use super::widgets::{DIM, Graph, Meter, gradient};
+use super::widgets::{DIM, Graph, Meter, Segmented, gradient};
 use crate::fmt::{bits, bytes, num};
-use crate::model::{Disk, Fast, Fps, Metric, Missing, Slow};
+use crate::model::{Disk, Fast, Fps, Metric, Missing, Slow, VramBreakdown, VramKind};
 use crate::win::printable;
 
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
@@ -94,8 +94,8 @@ impl State {
         if let Ok(g) = &f.gpus
             && let Some(g) = g.first()
         {
-            self.gpu
-                .push(g.usage.as_ref().map_or(0.0, |v| f64::from(*v) / 100.0));
+            let (_, v) = busiest_engine(g);
+            self.gpu.push(f64::from(v) / 100.0);
         }
         if let Ok(list) = &f.disks {
             self.disks
@@ -368,7 +368,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     let [graph, bars, info] = Layout::vertical([
         Constraint::Min(2),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(3),
     ])
     .areas(inner);
@@ -380,11 +380,35 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         graph,
     );
     frame.render_widget(
-        Paragraph::new(metric(&g.usage, |v| format!("{v}%"))),
-        Rect::new(graph.x, graph.y, label_w(&g.usage, graph), 1).intersection(graph),
+        Paragraph::new(match busiest_engine(g) {
+            (name, v) if g.usage.is_ok() => Line::from(vec![
+                Span::styled(format!("{v}% "), Style::new().fg(TEXT)),
+                label(name),
+            ]),
+            _ => Line::from(metric(&g.usage, |v| format!("{v}%"))),
+        }),
+        Rect::new(graph.x, graph.y, label_w(&g.usage, graph).max(14), 1).intersection(graph),
     );
-    bar_line(frame, bars, 0, "VRAM  ", &g.dedicated);
-    bar_line(frame, bars, 1, "shared", &g.shared);
+    let breakdown = st
+        .slow
+        .as_ref()
+        .and_then(|s| s.gpus.as_ref().ok())
+        .and_then(|l| l.iter().find(|x| x.index == g.index))
+        .and_then(|x| x.vram.as_ref().ok());
+    let game_pid = st
+        .fps
+        .as_ref()
+        .and_then(|f| f.game.as_ref().ok())
+        .map(|g| g.pid);
+    // VRAM por categoria (como o gputaskman): barra cortada em cores + legenda. Antes da 1ª
+    // coleta lenta (ou se ela falhou), a barra simples da memória dedicada.
+    if let Some(b) = breakdown {
+        vram_bar(frame, bars, b, game_pid, &g.dedicated);
+        bar_line(frame, bars, 2, "shared", &g.shared);
+    } else {
+        bar_line(frame, bars, 0, "VRAM  ", &g.dedicated);
+        bar_line(frame, bars, 1, "shared", &g.shared);
+    }
     let clock = |m: &Metric<(u32, u32)>| metric(m, |(c, _)| format!("{c} MHz"));
     let slow_gpus = st.slow.as_ref().map(|s| &s.gpus);
     let slow = slow_gpus
@@ -470,6 +494,112 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(
         Paragraph::new(vec![Line::from(l1), Line::from(l2), Line::from(l3)]),
         info,
+    );
+}
+
+/// Engine mais usada (NVML): 3D/compute, encoder ou decoder, como o Task Manager mostra o
+/// máximo dos engines. O Copy não existe no NVML.
+fn busiest_engine(g: &crate::model::Gpu) -> (&'static str, u32) {
+    let get = |m: &Metric<u32>| m.as_ref().copied().unwrap_or(0);
+    let mut best = ("3D", get(&g.usage));
+    for (name, m) in [("encode", &g.encoder), ("decode", &g.decoder)] {
+        if get(m) > best.1 {
+            best = (name, get(m));
+        }
+    }
+    best
+}
+
+/// Cor de cada categoria da VRAM (próximas às do gputaskman).
+fn vram_color(k: VramKind) -> Color {
+    match k {
+        VramKind::Game => Color::Rgb(230, 140, 60),
+        VramKind::App => Color::Rgb(90, 200, 220),
+        VramKind::Compositor => Color::Rgb(170, 170, 170),
+        VramKind::Browser => Color::Rgb(60, 110, 230),
+        VramKind::System => Color::Rgb(125, 125, 135),
+        VramKind::Kernel => Color::Rgb(95, 95, 105),
+        VramKind::Free => DIM,
+    }
+}
+
+/// Partes da barra: o jogo do RTSS sai do "app" e vira a própria categoria.
+fn vram_parts(b: &VramBreakdown, game_pid: Option<u32>) -> Vec<(VramKind, u64)> {
+    let game: u64 = b
+        .processes
+        .iter()
+        .filter(|p| Some(p.pid) == game_pid && p.kind == VramKind::App)
+        .map(|p| p.local)
+        .sum();
+    let mut parts = Vec::with_capacity(b.segments.len() + 1);
+    if game > 0 {
+        parts.push((VramKind::Game, game));
+    }
+    for &(k, v) in &b.segments {
+        let v = if k == VramKind::App {
+            v.saturating_sub(game)
+        } else {
+            v
+        };
+        parts.push((k, v));
+    }
+    parts
+}
+
+/// VRAM: barra cortada por categoria na linha 0 (com usado/total da memória dedicada) e a
+/// legenda na linha 1.
+fn vram_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    b: &VramBreakdown,
+    game_pid: Option<u32>,
+    dedicated: &Metric<(u64, u64)>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let parts = vram_parts(b, game_pid);
+    let text = metric(dedicated, |(u, t)| {
+        format!(" {} / {}", bytes(*u), bytes(*t))
+    });
+    let text_w = (text.width() as u16).min(area.width / 2);
+    let label_w = 7u16.min(area.width);
+    frame.render_widget(
+        Paragraph::new(label("VRAM  ")),
+        Rect::new(area.x, area.y, label_w, 1),
+    );
+    let bar_w = area.width.saturating_sub(label_w + text_w);
+    let colored: Vec<(u64, Color)> = parts
+        .iter()
+        .filter(|(k, _)| *k != VramKind::Free)
+        .map(|&(k, v)| (v, vram_color(k)))
+        .collect();
+    frame.render_widget(
+        Segmented {
+            parts: &colored,
+            total: b.total,
+        },
+        Rect::new(area.x + label_w, area.y, bar_w, 1).intersection(area),
+    );
+    frame.render_widget(
+        Paragraph::new(text),
+        Rect::new(area.x + label_w + bar_w, area.y, text_w, 1).intersection(area),
+    );
+    if area.height < 2 {
+        return;
+    }
+    let mut legend = vec![Span::raw(" ".repeat(usize::from(label_w)))];
+    for (k, v) in parts.iter().filter(|(_, v)| *v > 0) {
+        legend.push(Span::styled("■ ", Style::new().fg(vram_color(*k))));
+        legend.push(label(&format!("{} ", k.label())));
+        legend.push(Span::styled(
+            format!("{}  ", bytes(*v)),
+            Style::new().fg(TEXT),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(legend)),
+        Rect::new(area.x, area.y + 1, area.width, 1).intersection(area),
     );
 }
 

@@ -174,3 +174,57 @@ mod tests {
         assert_eq!(buf[(2, 0)].fg, DIM);
     }
 }
+
+/// Barra cortada em partes coloridas (VRAM por categoria, como o gputaskman). Cada célula pega a
+/// cor da parte que cobre o seu meio; o que sobra do total fica apagado.
+pub struct Segmented<'a> {
+    pub parts: &'a [(u64, Color)],
+    pub total: u64,
+}
+
+impl Widget for Segmented<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let w = usize::from(area.width);
+        if w == 0 || area.height == 0 || self.total == 0 {
+            return;
+        }
+        for i in 0..w {
+            // Meio da célula, em bytes.
+            let mid = ((i as f64 + 0.5) / w as f64) * self.total as f64;
+            let mut acc = 0.0;
+            let mut color = DIM;
+            for &(bytes, c) in self.parts {
+                acc += bytes as f64;
+                if mid < acc {
+                    color = c;
+                    break;
+                }
+            }
+            if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
+                cell.set_symbol("■").set_style(Style::new().fg(color));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    #[test]
+    fn partes_proporcionais() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let (a, b) = (Color::Red, Color::Blue);
+        Segmented {
+            parts: &[(3, a), (2, b)],
+            total: 10,
+        }
+        .render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].fg, a);
+        assert_eq!(buf[(2, 0)].fg, a);
+        assert_eq!(buf[(3, 0)].fg, b);
+        assert_eq!(buf[(4, 0)].fg, b);
+        assert_eq!(buf[(5, 0)].fg, DIM);
+    }
+}

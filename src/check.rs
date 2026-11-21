@@ -285,6 +285,14 @@ fn slow_report(r: &mut Report, s: &Slow) {
                 r.line(&format!("GPU {} PCIe RX", g.index), &g.pcie_rx, |v| {
                     format!("{}/s", bytes(*v))
                 });
+                r.line(&format!("GPU {} VRAM by kind", g.index), &g.vram, |v| {
+                    let parts: Vec<String> = v
+                        .segments
+                        .iter()
+                        .map(|(k, b)| format!("{} {}", k.label(), bytes(*b)))
+                        .collect();
+                    format!("{} ({} processes)", parts.join(", "), v.processes.len())
+                });
             }
         }
     }

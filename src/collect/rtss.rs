@@ -332,6 +332,8 @@ const INSTANCES: usize = 8;
 /// Buffer de leitura por instância: 512 registros de 8 bytes por leitura (mensagens maiores
 /// chegam em partes, com ERROR_MORE_DATA).
 const BUF: usize = 4 * 1024;
+/// Frametimes mais recentes enviados à interface (o gráfico tem no máximo ~2 por coluna).
+const RECENT_FRAMES: usize = 512;
 /// Frames guardados por app: 1000 FPS × 60 s.
 const MAX_FRAMES: usize = 60_000;
 /// Conclusões de leitura atendidas por período: acima disso o pipe espera o próximo período
@@ -906,6 +908,10 @@ impl RtssCollector {
             lows,
             gpu_time,
             bound,
+            recent_us: ring.map_or_else(Vec::new, |r| {
+                let n = r.frames.len().saturating_sub(RECENT_FRAMES);
+                r.frames.iter().skip(n).map(|(_, us)| *us).collect()
+            }),
         }
     }
 }

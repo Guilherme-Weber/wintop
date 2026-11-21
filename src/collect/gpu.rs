@@ -14,6 +14,7 @@ use nvml_wrapper::enum_wrappers::device::{
 use nvml_wrapper::error::NvmlError;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
+use super::vram::VramCollector;
 use crate::model::{Fan, Gpu, GpuSlow, Metric, Missing, fail, neutral};
 use crate::pdh::{self, Query, Slot};
 use crate::win;
@@ -332,11 +333,35 @@ fn failed_gpu(index: u32, cause: &str) -> Gpu {
 /// PCIe TX/RX (thread lenta; cada leitura leva ~23 ms). NVML próprio desta thread.
 pub struct GpuSlowCollector {
     nvml: SharedNvml,
+    /// Prefixo PDH (LUID) de cada GPU do NVML, pela mesma associação do coletor rápido.
+    luids: Vec<Metric<String>>,
+    vram: VramCollector,
 }
 
 impl GpuSlowCollector {
     pub fn new(nvml: SharedNvml) -> Self {
-        Self { nvml }
+        let adapters = dxgi_adapters();
+        let luids = match nvml.as_ref() {
+            Err(e) => vec![fail(e.clone())],
+            Ok(n) => (0..n.device_count().unwrap_or(0))
+                .map(|i| {
+                    let d = n
+                        .device_by_index(i)
+                        .map_err(|e| Missing::Fail(format!("NVML: {e}")))?;
+                    let p = d
+                        .pci_info()
+                        .map_err(|e| Missing::Fail(format!("NVML pci_info: {e}")))?;
+                    let a = adapters.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
+                    match_adapter(a, p.pci_device_id, p.pci_sub_system_id)
+                        .map(|a| luid_prefix(a.luid_high, a.luid_low))
+                })
+                .collect(),
+        };
+        Self {
+            nvml,
+            luids,
+            vram: VramCollector::new(),
+        }
     }
 
     pub fn read(&mut self) -> Metric<Vec<GpuSlow>> {
@@ -346,12 +371,14 @@ impl GpuSlowCollector {
             .as_ref()
             .map_err(|e| Missing::Fail(e.clone()))?;
         let count = nv(nvml.device_count())?;
-        Ok((0..count)
-            .map(|index| match nvml.device_by_index(index) {
+        let mut out = Vec::new();
+        for index in 0..count {
+            out.push(match nvml.device_by_index(index) {
                 Err(e) => GpuSlow {
                     index,
                     pcie_tx: fail(format!("NVML: {e}")),
                     pcie_rx: fail(format!("NVML: {e}")),
+                    vram: fail(format!("NVML: {e}")),
                 },
                 // KB/s → bytes/s.
                 Ok(d) => GpuSlow {
@@ -360,9 +387,21 @@ impl GpuSlowCollector {
                         .map(|k| u64::from(k) * 1024),
                     pcie_rx: nv(d.pcie_throughput(PcieUtilCounter::Receive))
                         .map(|k| u64::from(k) * 1024),
+                    vram: {
+                        let luid = self
+                            .luids
+                            .get(index as usize)
+                            .cloned()
+                            .unwrap_or_else(|| fail("GPU without a DXGI adapter"));
+                        match (luid, nv(d.memory_info())) {
+                            (Ok(l), Ok(m)) => self.vram.read(&l, m.total),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                    },
                 },
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 }
 

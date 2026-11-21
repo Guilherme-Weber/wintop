@@ -10,6 +10,7 @@ mod net;
 mod own;
 mod pawnio;
 pub mod rtss;
+mod vram;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
