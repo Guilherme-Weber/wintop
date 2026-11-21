@@ -173,6 +173,8 @@ impl State {
         self.session = Session::default();
         self.game_fps = Series::default();
         self.game_ft = Series::default();
+        self.pending_fps = None;
+        self.pending_ft = None;
     }
 
     /// Nova coleta da thread rápida: guarda, alimenta os históricos (inclusive os do jogo, no
@@ -209,7 +211,9 @@ impl State {
         {
             let (_, v) = busiest_engine(g);
             self.gpu.push(f64::from(v) / 100.0);
-            self.session.gpu.update(f64::from(v));
+            if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
+                self.session.gpu.update(f64::from(v));
+            }
             if let Ok(t) = &g.temp {
                 self.session.gpu_temp.update(f64::from(*t));
             }
@@ -271,13 +275,11 @@ impl State {
             }
         }
         // Jogo no ritmo da UI: 1 ponto por tick (FPS mais recente; pior frametime do tick).
-        if let Some(v) = self.pending_fps.take() {
-            self.game_fps.push(v);
-            self.session.fps.update(v);
-        }
-        if let Some(v) = self.pending_ft.take() {
-            self.game_ft.push(v);
-            self.session.ft.update(v);
+        // As duas séries andam juntas (uma sem valor no tick recebe 0), para não desalinharem.
+        let (fps, ft) = (self.pending_fps.take(), self.pending_ft.take());
+        if fps.is_some() || ft.is_some() {
+            self.game_fps.push(fps.unwrap_or(0.0));
+            self.game_ft.push(ft.unwrap_or(0.0));
         }
         self.fast = Some(f);
     }
@@ -288,9 +290,15 @@ impl State {
         if let Ok(g) = &s.game {
             if let Ok(v) = &g.fps {
                 self.pending_fps = Some(*v);
+                self.session.fps.update(*v);
             }
-            if let Ok((_, _, hi)) = &g.frametime {
-                self.pending_ft = Some(self.pending_ft.map_or(*hi, |p| p.max(*hi)));
+            // Extremos do frametime: o melhor e o pior frame vistos (coerentes com o atual).
+            if let Ok((_, lo, hi)) = &g.frametime {
+                self.session.ft.update(*lo);
+                self.session.ft.update(*hi);
+            }
+            if let Some(p) = g.peak_ms {
+                self.pending_ft = Some(self.pending_ft.map_or(p, |q| q.max(p)));
             }
         }
         self.fps = Some(s);
@@ -423,7 +431,8 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
         Layout::horizontal([Constraint::Percentage(59), Constraint::Percentage(41)]).areas(top);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(bottom);
-    let [mem, net] = Layout::vertical([Constraint::Length(8), Constraint::Min(4)]).areas(left);
+    let mem_h = mem_text(st, left.width).map_or(8, |t| t.height());
+    let [mem, net] = Layout::vertical([Constraint::Length(mem_h), Constraint::Min(4)]).areas(left);
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
     // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
     let disk_rows = (disk_order(st).len() + temp_failures(st).len()) as u16;
@@ -449,15 +458,15 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
             label(&format!("  {n} {name}  "))
         }
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            tab("1", "Overview", Tab::Overview),
-            tab("2", "Processes", Tab::Processes),
-            tab("3", "GPU", Tab::Gpu),
-            tab("4", "Sensors", Tab::Sensors),
-        ])),
-        area,
-    );
+    let tabs = Line::from(vec![
+        tab("1", "Overview", Tab::Overview),
+        tab("2", "Processes", Tab::Processes),
+        tab("3", "GPU", Tab::Gpu),
+        tab("4", "Sensors", Tab::Sensors),
+    ]);
+    let tw = (tabs.width() as u16).min(area.width);
+    let [left, rest] = Layout::horizontal([Constraint::Length(tw), Constraint::Min(0)]).areas(area);
+    frame.render_widget(Paragraph::new(tabs), left);
     let up = st
         .fast
         .as_ref()
@@ -479,7 +488,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
     if !st.clock.is_empty() {
         right.extend([bar_sep(), text(st.clock.clone())]);
     }
-    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), rest);
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
@@ -489,25 +498,22 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
         )
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            key(" 1-4"),
-            label(" tabs  "),
-            key("+/-"),
-            label(&format!(" interval {} ms  ", st.interval_ms)),
-            key("r"),
-            label(" reset min/max  "),
-            key("d"),
-            label(" fold pool  "),
-            key("q"),
-            label(" quit"),
-        ])),
-        area,
-    );
+    let left = Line::from(vec![
+        key(" 1-4"),
+        label(" tabs  "),
+        key("+/-"),
+        label(&format!(" interval {} ms  ", st.interval_ms)),
+        key("r"),
+        label(" reset min/max  "),
+        key("d"),
+        label(" fold pool  "),
+        key("q"),
+        label(" quit"),
+    ]);
     let mut right = Vec::new();
     if let Some(f) = &st.fast {
-        if let Ok(o) = &f.own {
-            right.extend([
+        match &f.own {
+            Ok(o) => right.extend([
                 label("wintop "),
                 metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
                 Span::raw(" "),
@@ -515,7 +521,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
                 label(" ("),
                 metric(&o.commit, |v| format!("{} commit", bytes(*v))),
                 label(")"),
-            ]);
+            ]),
+            Err(e) => right.extend([label("wintop "), missing(e)]),
         }
         right.extend([
             bar_sep(),
@@ -526,18 +533,20 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         ]);
     }
     let failing = failing_sources(st);
-    right.extend([
-        bar_sep(),
-        if failing == 0 {
-            label("sources: all OK ")
-        } else {
-            Span::styled(
-                format!("! {failing} sources failing "),
-                Style::new().fg(FAIL),
-            )
-        },
-    ]);
-    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+    if !right.is_empty() {
+        right.push(bar_sep());
+    }
+    right.push(match failing {
+        0 => label("sources: all OK "),
+        1 => Span::styled("! 1 source failing ", Style::new().fg(FAIL)),
+        n => Span::styled(format!("! {n} sources failing "), Style::new().fg(FAIL)),
+    });
+    // O lado direito (estado) tem prioridade; a ajuda usa o que sobra, sem sobrepor.
+    let right = Line::from(right);
+    let rw = (right.width() as u16).min(area.width);
+    let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(rw)]).areas(area);
+    frame.render_widget(Paragraph::new(left), l);
+    frame.render_widget(Paragraph::new(right).right_aligned(), r);
 }
 
 /// Fontes inteiras em falha (coletor sem nenhum dado).
@@ -556,8 +565,12 @@ fn failing_sources(st: &State) -> usize {
         n += usize::from(s.gpus.as_ref().is_err_and(fail));
         n += usize::from(s.disk_temps.as_ref().is_err_and(fail));
     }
+    if let Some(f) = &st.fast {
+        n += usize::from(f.own.as_ref().is_err_and(fail));
+    }
     if let Some(f) = &st.fps {
         n += usize::from(f.rtss.as_ref().is_err_and(fail));
+        n += usize::from(f.pipe.as_ref().is_err_and(fail));
     }
     n
 }
@@ -576,9 +589,12 @@ fn waiting(frame: &mut Frame<'_>, area: Rect, block: Block<'static>) {
 /// Caixa sem dados: espera ou a falha do coletor.
 fn empty_box<T>(frame: &mut Frame<'_>, area: Rect, title: &str, m: Option<&Metric<T>>) {
     match m {
-        Some(Err(e)) => {
-            frame.render_widget(Paragraph::new(missing(e)).block(boxed(title, "")), area)
-        }
+        Some(Err(e)) => frame.render_widget(
+            Paragraph::new(missing(e))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(boxed(title, "")),
+            area,
+        ),
         _ => waiting(frame, area, boxed(title, "")),
     }
 }
@@ -595,6 +611,11 @@ fn grid_cols(n: usize) -> usize {
     }
 }
 
+/// Largura do gráfico total da CPU (~45%; a grade por lógico fica com o resto).
+fn total_width(w: u16) -> u16 {
+    (w * 9 / 20).max(16).min(w.saturating_sub(16))
+}
+
 fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let Some(Ok(c)) = st.fast.as_ref().map(|f| &f.cpu) else {
         empty_box(frame, area, "cpu", st.fast.as_ref().map(|f| &f.cpu));
@@ -605,7 +626,10 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .as_ref()
         .map_or_else(|e| format!("cpu · {e}"), |n| format!("cpu · {n}"));
     let per_len = c.per_logical.as_ref().map_or(0, Vec::len);
-    let block = boxed(&name, &format!("total 60s · {per_len} logical"));
+    // Janela real do gráfico total: 2 amostras por coluna, no intervalo atual.
+    let cols = u64::from(total_width(area.width.saturating_sub(2)).saturating_sub(1));
+    let secs = cols * 2 * st.interval_ms / 1000;
+    let block = boxed(&name, &format!("total {secs}s · {per_len} logical"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Linhas de sensores e topologia.
@@ -683,9 +707,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     .areas(inner);
     put(frame, Paragraph::new(info_lines), info, info);
     // Total à esquerda (~45%), grade por lógico no resto.
-    let total_w = (graphs.width * 9 / 20)
-        .max(16)
-        .min(graphs.width.saturating_sub(16));
+    let total_w = total_width(graphs.width);
     let [total, grid] =
         Layout::horizontal([Constraint::Length(total_w), Constraint::Min(8)]).areas(graphs);
 
@@ -835,7 +857,76 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let details = gpu_details(st, &g, inner.width);
-    let bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
+    let mut bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
+    // Painel das engines e dos extremos da sessão.
+    let eng = |name: &str, m: &Metric<u32>| -> (Vec<Span<'static>>, Option<f64>) {
+        let style = if name == engine {
+            Style::new().fg(TITLE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(LABEL)
+        };
+        // Falha: a causa usa a linha toda (sem medidor, que mostraria um 0% falso).
+        match m {
+            Ok(v) => (
+                vec![
+                    Span::styled(format!("{name:<8}"), style),
+                    text(format!("{v:>3}%")),
+                ],
+                Some(f64::from(*v)),
+            ),
+            Err(e) => (
+                vec![Span::styled(format!("{name:<8}"), style), missing(e)],
+                None,
+            ),
+        }
+    };
+    // Extremos da sessão: "min x · max y unidade" (a unidade só no fim, para caber).
+    let mm = |m: MinMax, f: &dyn Fn(f64) -> String, unit: &str| -> Vec<Span<'static>> {
+        m.get().map_or_else(
+            || vec![label("-")],
+            |(lo, hi)| {
+                vec![
+                    label("min "),
+                    text(f(lo)),
+                    label(" · max "),
+                    text(format!("{}{unit}", f(hi))),
+                ]
+            },
+        )
+    };
+    let row = |name: &str, spans: Vec<Span<'static>>| -> (Vec<Span<'static>>, Option<f64>) {
+        let mut v = vec![label(&format!("{name:<6}"))];
+        v.extend(spans);
+        (v, None)
+    };
+    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = vec![
+        eng("3D", &g.usage),
+        eng("encode", &g.encoder),
+        eng("decode", &g.decoder),
+        eng("mem act", &g.mem_activity),
+        (vec![label("session (r resets)")], None),
+    ];
+    let n0 = |v: f64| num(v, 0);
+    rows.push(row("util", mm(st.session.gpu, &n0, "%")));
+    rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
+    rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
+    rows.push(row(
+        "VRAM",
+        mm(st.session.vram, &|v| short_bytes(v as u64), ""),
+    ));
+    rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
+    // Sem altura para o painel todo: os extremos da sessão viram uma linha (com quebra) embaixo.
+    let mut session_lines = Vec::new();
+    if inner.height.saturating_sub(bottom_h) < rows.len() as u16 {
+        let mut spans = vec![label("session")];
+        for (r, _) in rows.drain(5..) {
+            spans.push(label("   "));
+            spans.extend(r);
+        }
+        rows.truncate(4);
+        session_lines = wrap(spans, inner.width, 0, 8);
+        bottom_h += session_lines.len() as u16;
+    }
     let [top, bottom] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(bottom_h)]).areas(inner);
     let [graph, panel] =
@@ -864,57 +955,6 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         gr.intersection(graph),
     );
 
-    // Painel das engines e dos extremos da sessão.
-    let pct = |m: &Metric<u32>| m.as_ref().copied().unwrap_or(0);
-    let eng = |name: &str, m: &Metric<u32>| -> Vec<Span<'static>> {
-        let style = if name == engine {
-            Style::new().fg(TITLE).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(LABEL)
-        };
-        vec![
-            Span::styled(format!("{name:<8}"), style),
-            metric(m, |v| format!("{v:>3}%")),
-        ]
-    };
-    // Extremos da sessão: "min x · max y unidade" (a unidade só no fim, para caber).
-    let mm = |m: MinMax, f: &dyn Fn(f64) -> String, unit: &str| -> Vec<Span<'static>> {
-        m.get().map_or_else(
-            || vec![label("-")],
-            |(lo, hi)| {
-                vec![
-                    label("min "),
-                    text(f(lo)),
-                    label(" · max "),
-                    text(format!("{}{unit}", f(hi))),
-                ]
-            },
-        )
-    };
-    let row = |name: &str, spans: Vec<Span<'static>>| -> (Vec<Span<'static>>, Option<f64>) {
-        let mut v = vec![label(&format!("{name:<6}"))];
-        v.extend(spans);
-        (v, None)
-    };
-    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = vec![
-        (eng("3D", &g.usage), Some(f64::from(pct(&g.usage)))),
-        (eng("encode", &g.encoder), Some(f64::from(pct(&g.encoder)))),
-        (eng("decode", &g.decoder), Some(f64::from(pct(&g.decoder)))),
-        (
-            eng("mem act", &g.mem_activity),
-            Some(f64::from(pct(&g.mem_activity))),
-        ),
-        (vec![label("session (r resets)")], None),
-    ];
-    let n0 = |v: f64| num(v, 0);
-    rows.push(row("util", mm(st.session.gpu, &n0, "%")));
-    rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
-    rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
-    rows.push(row(
-        "VRAM",
-        mm(st.session.vram, &|v| short_bytes(v as u64), ""),
-    ));
-    rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
     for (i, (spans, meter)) in rows.into_iter().enumerate() {
         let y = panel.y + i as u16;
         if y >= panel.y + panel.height {
@@ -940,10 +980,9 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .slow
         .as_ref()
         .and_then(|s| s.gpus.as_ref().ok())
-        .and_then(|l| l.iter().find(|x| x.index == g.index))
-        .cloned();
+        .and_then(|l| l.iter().find(|x| x.index == g.index));
     let b = bottom;
-    match slow.as_ref().map(|s| &s.vram) {
+    match slow.map(|s| &s.vram) {
         Some(Ok(v)) => vram_bar(frame, b, v, details.game_pid, &g.dedicated),
         _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated),
     }
@@ -957,7 +996,8 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         );
     }
     bar_line(frame, b, 1 + n, "shared", &g.shared);
-    for (i, l) in details.info.into_iter().enumerate() {
+    let below = details.info.into_iter().chain(session_lines);
+    for (i, l) in below.enumerate() {
         put(
             frame,
             Paragraph::new(l),
@@ -1005,22 +1045,29 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
                 .collect();
             wrap(spans, width, VRAM_LABEL_W, VRAM_LABEL_W)
         }
-        _ => Vec::new(),
+        Some(Err(e)) => wrap(
+            vec![label("by kind "), missing(e)],
+            width,
+            VRAM_LABEL_W,
+            VRAM_LABEL_W,
+        ),
+        None => Vec::new(),
     };
     let clk = |m: &Metric<(u32, u32)>| metric(m, |(c, mx)| format!("{c}/{mx}"));
     let rows: Vec<Vec<Span<'static>>> = vec![
-        vec![
-            label("phys  "),
-            metric(&g.physical, |[u, ..]| format!("{} used", bytes(*u))),
-            sep(),
-            metric(&g.physical, |[_, f, ..]| format!("{} free", bytes(*f))),
-            sep(),
-            metric(&g.physical, |[_, _, r, _]| {
-                format!("{} reserved", bytes(*r))
-            }),
-            sep(),
-            metric(&g.physical, |[.., t]| format!("{} total (NVML)", bytes(*t))),
-        ],
+        match &g.physical {
+            Ok([u, f, r, t]) => vec![
+                label("phys  "),
+                text(format!("{} used", bytes(*u))),
+                sep(),
+                text(format!("{} free", bytes(*f))),
+                sep(),
+                text(format!("{} reserved", bytes(*r))),
+                sep(),
+                text(format!("{} total (NVML)", bytes(*t))),
+            ],
+            Err(e) => vec![label("phys  "), missing(e)],
+        },
         vec![
             label("clk   gfx "),
             clk(&g.clock_graphics),
@@ -1110,6 +1157,23 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
 /// os spans que começam com espaço (separadores e rótulos como "  SM "); o espaço da quebra
 /// some e a continuação começa com `indent` espaços. `first` é o recuo da primeira linha.
 fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<Line<'static>> {
+    // Um span mais largo que a linha vira um por palavra (cada palavra é um ponto de quebra).
+    let spans = spans.into_iter().flat_map(|sp| {
+        if sp.width() <= usize::from(width) {
+            return vec![sp];
+        }
+        let style = sp.style;
+        let mut parts = Vec::new();
+        for (i, w) in sp.content.split(' ').enumerate() {
+            let t = if i == 0 {
+                w.to_string()
+            } else {
+                format!(" {w}")
+            };
+            parts.push(Span::styled(t, style));
+        }
+        parts
+    });
     let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
     for sp in spans {
         if groups.is_empty() || sp.content.starts_with(char::is_whitespace) {
@@ -1147,11 +1211,18 @@ fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<L
         let g = if empty { trimmed(&g) } else { g };
         let w: usize = g.iter().map(Span::width).sum();
         if !empty && used + w > width {
-            lines.push(Line::from(std::mem::take(&mut cur)));
             let g = trimmed(&g);
+            // Só separador (ex.: o do fim da lista de fans): não abre uma linha vazia.
+            if g.is_empty() {
+                continue;
+            }
+            lines.push(Line::from(std::mem::take(&mut cur)));
             used = usize::from(indent) + g.iter().map(Span::width).sum::<usize>();
             cur.push(pad(indent));
             cur.extend(g);
+            continue;
+        }
+        if g.is_empty() {
             continue;
         }
         used += w;
@@ -1282,9 +1353,102 @@ fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<
 
 // --- Memória ---
 
+/// Linhas de texto da caixa de memória, já quebradas na largura.
+struct MemText {
+    legend: Vec<Line<'static>>,
+    session: Vec<Line<'static>>,
+    pools: Vec<Line<'static>>,
+}
+
+impl MemText {
+    /// Altura da caixa: RAM, legenda, commit, sessão, pagefile, pools e as bordas.
+    fn height(&self) -> u16 {
+        (3 + self.legend.len() + self.session.len() + self.pools.len() + 2) as u16
+    }
+}
+
+const RAM_LABEL_W: u16 = 8;
+
+/// Partes da RAM como o Task Manager: (em uso, modificada, standby, livre).
+fn ram_parts(m: &Memory) -> Option<(u64, u64, u64, u64, u64)> {
+    let (used, total, sb, md) = (
+        *m.used.as_ref().ok()?,
+        *m.total.as_ref().ok()?,
+        *m.standby.as_ref().ok()?,
+        *m.modified.as_ref().ok()?,
+    );
+    // Em uso = usado - modificada; disponível = standby + livre.
+    let in_use = used.saturating_sub(md);
+    let free = total.saturating_sub(used).saturating_sub(sb);
+    Some((in_use, md, sb, free, total))
+}
+
+fn mem_text(st: &State, width: u16) -> Option<MemText> {
+    let m = st.fast.as_ref()?.memory.as_ref().ok()?;
+    let inner = width.saturating_sub(2);
+    let legend = match ram_parts(m) {
+        Some((in_use, md, sb, free, _)) => {
+            let spans: Vec<Span<'static>> = [
+                ("in use", in_use, RAM_IN_USE),
+                ("modified", md, RAM_MODIFIED),
+                ("standby", sb, RAM_STANDBY),
+                ("free", free, DIM),
+            ]
+            .into_iter()
+            .flat_map(|(name, v, c)| {
+                [
+                    Span::styled("  ■ ", Style::new().fg(c)),
+                    label(&format!("{name} ")),
+                    text(short_bytes(v)),
+                ]
+            })
+            .collect();
+            wrap(spans, inner, RAM_LABEL_W, RAM_LABEL_W)
+        }
+        None => match m.standby.as_ref().err().or(m.modified.as_ref().err()) {
+            Some(e) => wrap(
+                vec![label("cache "), missing(e)],
+                inner,
+                RAM_LABEL_W,
+                RAM_LABEL_W,
+            ),
+            None => Vec::new(),
+        },
+    };
+    let gb = |v: f64| bytes(v as u64);
+    let session = wrap(
+        vec![
+            label("session RAM "),
+            minmax(st.session.ram, gb),
+            label("   commit "),
+            minmax(st.session.commit, gb),
+        ],
+        inner,
+        0,
+        8,
+    );
+    let pools = wrap(
+        vec![
+            label("kernel pools"),
+            label("   paged "),
+            metric(&m.paged_pool, |v| bytes(*v)),
+            label("   non-paged "),
+            metric(&m.nonpaged_pool, |v| bytes(*v)),
+        ],
+        inner,
+        0,
+        8,
+    );
+    Some(MemText {
+        legend,
+        session,
+        pools,
+    })
+}
+
 fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mem = st.fast.as_ref().map(|f| &f.memory);
-    let Some(Ok(m)) = mem else {
+    let (Some(Ok(m)), Some(t)) = (mem, mem_text(st, area.width)) else {
         empty_box(frame, area, "mem", mem);
         return;
     };
@@ -1292,61 +1456,51 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let ram = m.used.clone().and_then(|u| Ok((u, m.total.clone()?)));
-    let gb = |v: f64| bytes(v as u64);
     ram_bar(frame, inner, m, &ram);
-    bar_line(frame, inner, 2, "commit  ", &m.commit);
-    line(
-        frame,
-        vec![
-            label("session RAM "),
-            minmax(st.session.ram, gb),
-            label("   commit "),
-            minmax(st.session.commit, gb),
-        ],
-        inner.x,
-        inner.y + 3,
-        inner.width,
-        inner,
-    );
-    if inner.height > 4 {
-        let y = inner.y + 4;
-        line(frame, vec![label("pagefile ")], inner.x, y, 9, inner);
-        let t = metric(&m.pagefile_usage, |v| format!(" {}%", num(*v, 1)));
-        let tw = (t.width() as u16).min(inner.width / 2);
+    let mut y = 1u16;
+    let lines = |frame: &mut Frame<'_>, ls: Vec<Line<'static>>, y: &mut u16| {
+        for l in ls {
+            put(
+                frame,
+                Paragraph::new(l),
+                Rect::new(inner.x, inner.y + *y, inner.width, 1),
+                inner,
+            );
+            *y += 1;
+        }
+    };
+    lines(frame, t.legend, &mut y);
+    bar_line(frame, inner, y, "commit  ", &m.commit);
+    y += 1;
+    lines(frame, t.session, &mut y);
+    if y < inner.height {
+        let row = inner.y + y;
+        line(frame, vec![label("pagefile ")], inner.x, row, 9, inner);
+        let pt = metric(&m.pagefile_usage, |v| format!(" {}%", num(*v, 1)));
+        let tw = (pt.width() as u16).min(inner.width / 2);
         let bw = inner.width.saturating_sub(9 + tw);
         if let Ok(v) = &m.pagefile_usage {
             frame.render_widget(
                 Meter { value: v / 100.0 },
-                Rect::new(inner.x + 9, y, bw, 1).intersection(inner),
+                Rect::new(inner.x + 9, row, bw, 1).intersection(inner),
             );
         }
         put(
             frame,
-            Paragraph::new(t),
-            Rect::new(inner.x + 9 + bw, y, tw, 1),
+            Paragraph::new(pt),
+            Rect::new(inner.x + 9 + bw, row, tw, 1),
             inner,
         );
     }
-    line(
-        frame,
-        vec![
-            label("kernel pools   paged "),
-            metric(&m.paged_pool, |v| bytes(*v)),
-            label("   non-paged "),
-            metric(&m.nonpaged_pool, |v| bytes(*v)),
-        ],
-        inner.x,
-        inner.y + 5,
-        inner.width,
-        inner,
-    );
+    y += 1;
+    lines(frame, t.pools, &mut y);
 }
 
 const RAM_IN_USE: Color = Color::Rgb(78, 184, 176);
 const RAM_MODIFIED: Color = Color::Rgb(224, 138, 60);
 const RAM_STANDBY: Color = Color::Rgb(92, 120, 170);
 
-/// RAM como o Task Manager: em uso, modificada, standby (cache) e livre, com legenda (linha 1).
+/// Barra da RAM (linha 0): cortada como o Task Manager, ou só o usado sem a divisão do cache.
 fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64)>) {
     if area.height == 0 {
         return;
@@ -1359,7 +1513,7 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
             num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
         )
     });
-    let label_w = 8u16.min(area.width);
+    let label_w = RAM_LABEL_W.min(area.width);
     let text_w = (t.width() as u16).min(area.width / 2);
     line(
         frame,
@@ -1371,54 +1525,19 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
     );
     let bar_w = area.width.saturating_sub(label_w + text_w);
     let bar = Rect::new(area.x + label_w, area.y, bar_w, 1).intersection(area);
-    let pad = || Span::raw(" ".repeat(usize::from(label_w)));
-    match (ram, &m.standby, &m.modified) {
-        (Ok((used, total)), Ok(sb), Ok(md)) => {
-            // Em uso = usado - modificada; disponível = standby + livre.
-            let in_use = used.saturating_sub(*md);
-            let free = total.saturating_sub(*used).saturating_sub(*sb);
-            frame.render_widget(
-                Segmented {
-                    parts: &[
-                        (in_use, RAM_IN_USE),
-                        (*md, RAM_MODIFIED),
-                        (*sb, RAM_STANDBY),
-                    ],
-                    total: *total,
-                },
-                bar,
-            );
-            if area.height > 1 {
-                let mut legend = vec![pad()];
-                for (name, v, c) in [
-                    ("in use", in_use, RAM_IN_USE),
-                    ("modified", *md, RAM_MODIFIED),
-                    ("standby", *sb, RAM_STANDBY),
-                    ("free", free, DIM),
-                ] {
-                    legend.push(Span::styled("■ ", Style::new().fg(c)));
-                    legend.push(label(&format!("{name} ")));
-                    legend.push(text(format!("{}  ", short_bytes(v))));
-                }
-                line(frame, legend, area.x, area.y + 1, area.width, area);
-            }
-        }
-        (Ok((u, t)), sb, md) => {
-            // Sem a divisão do cache: barra simples do usado e a causa embaixo.
+    match (ram_parts(m), ram) {
+        (Some((in_use, md, sb, _, total)), _) => frame.render_widget(
+            Segmented {
+                parts: &[(in_use, RAM_IN_USE), (md, RAM_MODIFIED), (sb, RAM_STANDBY)],
+                total,
+            },
+            bar,
+        ),
+        (None, Ok((u, t))) => {
             let v = if *t > 0 { *u as f64 / *t as f64 } else { 0.0 };
             frame.render_widget(Meter { value: v }, bar);
-            if let Some(e) = sb.as_ref().err().or(md.as_ref().err()) {
-                line(
-                    frame,
-                    vec![pad(), label("cache "), missing(e)],
-                    area.x,
-                    area.y + 1,
-                    area.width,
-                    area,
-                );
-            }
         }
-        (Err(_), _, _) => {}
+        (None, Err(_)) => {}
     }
     put(
         frame,
@@ -1544,7 +1663,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Span::styled(names.join(", "), Style::new().fg(NEUTRAL)),
             ],
             inner.x,
-            inner.y + inner.height - 1,
+            inner.y + inner.height.saturating_sub(1),
             inner.width,
             inner,
         );
@@ -1633,29 +1752,41 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let temps = st.slow.as_ref().map(|s| &s.disk_temps);
-    const NAME_W: u16 = 26;
-    const INFO_W: u16 = 54;
+    // Atividade (5), resposta (8), leitura e escrita (9 cada) e temperatura (2 + "! failed").
+    const INFO_W: u16 = 41;
     // Depois do nome: barramento (7), tipo (4), capacidade (6 + espaço), flags (4) e 2 espaços.
     const LEFT_W: u16 = 24;
-    let spark_w = inner.width.saturating_sub(NAME_W + LEFT_W + INFO_W);
+    // O nome encolhe antes de tudo (até 12 colunas); a atividade fica com a sobra. As colunas
+    // nunca se sobrepõem: sem largura, o lado direito é que perde as últimas colunas.
+    let name_w = inner
+        .width
+        .saturating_sub(LEFT_W + INFO_W + 4)
+        .clamp(12, 26);
+    let spark_w = inner.width.saturating_sub(name_w + LEFT_W + INFO_W);
+    let info_x = inner.x + name_w + LEFT_W + spark_w;
+    let info_w = inner
+        .width
+        .saturating_sub(name_w + LEFT_W + spark_w)
+        .min(INFO_W);
+    let nw = usize::from(name_w);
     // Cabeçalho nas mesmas posições das colunas de cada linha.
-    let info_x = inner.x + inner.width.saturating_sub(INFO_W);
+    let head = if nw > 14 { "drive / model" } else { "drive" };
     line(
         frame,
         vec![label(&format!(
-            "{:<26}{:<7}{:<4}{:>6} {:<4}  ",
-            "drive / model", "bus", "typ", "cap", "flg"
+            "{head:<nw$}{:<7}{:<4}{:>6} {:<4}  ",
+            "bus", "typ", "cap", "flg"
         ))],
         inner.x,
         inner.y,
-        NAME_W + LEFT_W,
+        name_w + LEFT_W,
         inner,
     );
-    if spark_w > 0 {
+    if spark_w >= 6 {
         line(
             frame,
             vec![label("active")],
-            inner.x + NAME_W + LEFT_W,
+            inner.x + name_w + LEFT_W,
             inner.y,
             spark_w,
             inner,
@@ -1664,29 +1795,33 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     line(
         frame,
         vec![label(&format!(
-            "{:>5}{:>8}{:>11}{:>11}  temp",
+            "{:>5}{:>8}{:>9}{:>9}  temp",
             "act", "resp", "read", "write"
         ))],
         info_x,
         inner.y,
-        INFO_W,
+        info_w,
         inner,
     );
-    let rows = inner.height.saturating_sub(1);
-    for (i, (d, member)) in order.iter().enumerate() {
+    let rows = usize::from(inner.height.saturating_sub(1));
+    // Não cabem todos: a última linha avisa quantos ficaram de fora (nada some sem aviso).
+    let shown = if order.len() > rows {
+        rows.saturating_sub(1)
+    } else {
+        order.len()
+    };
+    if shown < order.len() && rows > 0 {
+        line(
+            frame,
+            vec![label(&format!("+{} more", order.len() - shown))],
+            inner.x,
+            inner.y + 1 + shown as u16,
+            inner.width,
+            inner,
+        );
+    }
+    for (i, (d, member)) in order.iter().take(shown).enumerate() {
         let y = inner.y + 1 + i as u16;
-        if i as u16 >= rows {
-            // Não cabe: avisa quantos ficaram de fora (nada some sem aviso).
-            line(
-                frame,
-                vec![label(&format!("+{} more", order.len() - i))],
-                inner.x,
-                y - 1,
-                inner.width,
-                inner,
-            );
-            break;
-        }
         let letters = if d.letters.is_empty() {
             format!("d{}", d.number)
         } else {
@@ -1710,8 +1845,8 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         {
             name = format!("{letters} {model} ({members} members)");
         }
-        let name: String = if name.chars().count() > usize::from(NAME_W) - 1 {
-            let mut s: String = name.chars().take(usize::from(NAME_W) - 2).collect();
+        let name: String = if name.chars().count() > nw - 1 {
+            let mut s: String = name.chars().take(nw - 2).collect();
             s.push('…');
             s
         } else {
@@ -1732,14 +1867,14 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             frame,
             vec![
                 Span::styled(
-                    format!("{name:<26}"),
+                    format!("{name:<nw$}"),
                     Style::new().fg(if *member { LABEL } else { TEXT }),
                 ),
                 label(&format!("{bus:<7}{typ:<4}{cap:>6} {flags:<4}  ")),
             ],
             inner.x,
             y,
-            NAME_W + LEFT_W,
+            name_w + LEFT_W,
             inner,
         );
         if spark_w > 0
@@ -1747,7 +1882,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         {
             frame.render_widget(
                 Graph::new(s.values(), GraphColor::Value),
-                Rect::new(inner.x + NAME_W + LEFT_W, y, spark_w, 1).intersection(inner),
+                Rect::new(inner.x + name_w + LEFT_W, y, spark_w, 1).intersection(inner),
             );
         }
         let same = |t: &&crate::model::DiskTemp| t.model == d.model.as_ref().ok().cloned();
@@ -1767,28 +1902,27 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             Some(Err(e)) => missing(e),
             None => label(""),
         };
-        let info = vec![
-            metric(&d.active, |v| format!("{:>4}%", num(*v, 0))),
-            metric(&d.response, |v| format!(" {:>5}ms", num(v * 1000.0, 1))),
-            metric(&d.read, |v| {
-                format!(" {:>10}", format!("{}/s", short_bytes(*v as u64)))
-            }),
-            metric(&d.write, |v| {
-                format!(" {:>10}", format!("{}/s", short_bytes(*v as u64)))
-            }),
-            Span::raw("  "),
-            t,
-        ];
-        let x = inner.x + inner.width.saturating_sub(INFO_W);
-        line(frame, info, x, y, INFO_W, inner);
+        // As quatro vêm do mesmo IOCTL: falhando juntas, a causa aparece uma vez só.
+        let info = match (&d.active, &d.response, &d.read, &d.write) {
+            (Err(e), Err(_), Err(_), Err(_)) => vec![missing(e), Span::raw("  "), t],
+            _ => vec![
+                metric(&d.active, |v| format!("{:>4}%", num(*v, 0))),
+                metric(&d.response, |v| format!(" {:>5}ms", num(v * 1000.0, 1))),
+                metric(&d.read, |v| {
+                    format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                }),
+                metric(&d.write, |v| {
+                    format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                }),
+                Span::raw("  "),
+                t,
+            ],
+        };
+        line(frame, info, info_x, y, info_w, inner);
     }
     // Causas das falhas de temperatura, inteiras (a coluna só tem espaço para "! failed").
-    let first = inner.y + 1 + order.len() as u16;
-    for (k, (number, cause)) in temp_failures(st).into_iter().enumerate() {
-        let y = first + k as u16;
-        if y >= inner.y + inner.height {
-            break;
-        }
+    let mut y = inner.y + 1 + shown as u16 + u16::from(shown < order.len());
+    for (number, cause) in temp_failures(st) {
         let name = order.iter().find(|(d, _)| d.number == number).map_or_else(
             || format!("disk {number}"),
             |(d, _)| {
@@ -1799,17 +1933,22 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 }
             },
         );
-        line(
-            frame,
-            vec![
-                Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
-                Span::styled(printable(&cause), Style::new().fg(FAIL)),
-            ],
-            inner.x,
-            y,
-            inner.width,
-            inner,
-        );
+        let spans = vec![
+            Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
+            Span::styled(printable(&cause), Style::new().fg(FAIL)),
+        ];
+        for l in wrap(spans, inner.width, 0, 4) {
+            if y >= inner.y + inner.height {
+                return;
+            }
+            put(
+                frame,
+                Paragraph::new(l),
+                Rect::new(inner.x, y, inner.width, 1),
+                inner,
+            );
+            y += 1;
+        }
     }
 }
 
@@ -1832,6 +1971,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let pipe_failed = matches!(fps.pipe, Err(Missing::Fail(_)));
     // Sem jogo em foco: "idle", e os gráficos continuam com o histórico (parado até voltar).
     let g = fps.game.as_ref().ok();
+    let rtss_failed = matches!(fps.rtss, Err(Missing::Fail(_)));
     let (title, source) = match g {
         Some(g) => {
             let res = g
@@ -1851,6 +1991,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             };
             (title, source)
         }
+        None if rtss_failed => ("game · RTSS unavailable".to_string(), ""),
         None => ("game · idle".to_string(), ""),
     };
     let block = boxed(&title, source);
@@ -1858,6 +1999,10 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     let mut lines = match (g, &fps.game) {
         (Some(g), _) => game_lines(g, st.interval_ms),
+        (None, Err(_)) if rtss_failed => vec![
+            Line::from(vec![label("RTSS "), metric(&fps.rtss, Clone::clone)]),
+            Line::from(label("graphs keep the last game until r")),
+        ],
         (None, Err(e)) => vec![
             Line::from(vec![label("idle: "), missing(e)]),
             Line::from(vec![
@@ -1881,7 +2026,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .flat_map(|l| wrap(l.spans, inner.width, 0, 2))
         .collect();
     let info_h = lines.len() as u16;
-    let idle = || label("idle");
+    let idle = || label(if rtss_failed { "-" } else { "idle" });
     let [graphs, info] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(info_h)]).areas(inner);
     put(frame, Paragraph::new(lines), info, info);

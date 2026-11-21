@@ -169,8 +169,9 @@ impl Widget for Graph<'_> {
                         }
                     }
                 };
-                // Célula inteira dentro da parte de kernel: o mesmo tom, mais escuro.
-                let color = if k >= base + 4 { darker(color) } else { color };
+                // Pelo menos metade da célula na parte de kernel: o mesmo tom, mais escuro (com a
+                // célula inteira, kernel baixo nunca apareceria na grade por núcleo).
+                let color = if k >= base + 2 { darker(color) } else { color };
                 let y = if self.invert { row } else { h - 1 - row };
                 if let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + y as u16)) {
                     cell.set_char(ch).set_fg(color);

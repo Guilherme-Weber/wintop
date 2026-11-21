@@ -253,6 +253,7 @@ fn read_one(d: &mut Inventory, st: &mut State) {
 fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
     // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura.
     if d.ssd == Ok(false) && meta.awake() == Some(false) {
+        st.smart_fails = 0;
         st.value = neutral("asleep");
         return;
     }
@@ -309,6 +310,8 @@ fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
                     return;
                 }
             }
+            // Falha persistente: volta ao ritmo normal do SMART.
+            st.smart_fails = 0;
             st.value = fail(format!("SMART: {e}"));
         }
     }

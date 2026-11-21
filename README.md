@@ -8,9 +8,24 @@ de jogos.
 
 ## Estado
 
-Em desenvolvimento. Concluída a Etapa 0 (base do projeto e prova de viabilidade de cada fonte de
-dados, descrita em [docs/spike-etapa0.md](docs/spike-etapa0.md)). O inventário completo de
-métricas está em [docs/metricas.md](docs/metricas.md).
+Em desenvolvimento. Concluídas as etapas de base e provas de viabilidade
+([docs/spike-etapa0.md](docs/spike-etapa0.md)), coletores nativos, fontes elevadas (PawnIO e
+temperatura dos discos), FPS pelo RTSS, motor de coleta e a aba geral da interface. As abas de
+processos, GPU e sensores, a configuração e o empacotamento ainda estão por vir. O inventário
+completo de métricas está em [docs/metricas.md](docs/metricas.md), e as diferenças conhecidas em
+relação ao Gerenciador de Tarefas em [docs/divergencias.md](docs/divergencias.md).
+
+## Uso
+
+```powershell
+wintop            # interface
+wintop --check    # diagnóstico de todas as fontes, sem interface
+wintop --version
+```
+
+Na interface: `1` a `4` trocam de aba, `+` e `-` ajustam o intervalo de atualização (passos de
+100 ms), `r` zera os mínimos e máximos da sessão, `d` recolhe os membros do Storage Space e `q`
+(ou `Esc`, `Ctrl+C`) sai. A interface é em inglês.
 
 ## Requisitos
 

@@ -300,9 +300,9 @@ pub struct Game {
     pub gpu_time: Metric<(f64, f64)>,
     /// "GPU" ou "CPU": quem limita o frame.
     pub bound: Metric<&'static str>,
-    /// Frametimes mais recentes em µs (por frame no modo exato; amostras de 250 ms no
-    /// aproximado), do mais antigo ao mais novo: o gráfico de frametime.
-    pub recent_us: Vec<u32>,
+    /// Pior frametime (ms) desde a publicação anterior: o gráfico de frametime usa este (a
+    /// janela de 1 s repetiria o mesmo engasgo em várias publicações). `None`: sem frames novos.
+    pub peak_ms: Option<f64>,
 }
 
 /// Estado do RTSS e do jogo (thread do RTSS, a cada 250 ms).

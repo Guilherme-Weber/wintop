@@ -100,6 +100,10 @@ impl CpuCollector {
         };
         let per_logical =
             array.and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok));
+        let kernel_per_logical = match (&per_logical, kernel_per_logical) {
+            (Ok(u), Ok(k)) if u.len() != k.len() => fail("kernel instances differ from usage"),
+            (_, k) => k,
+        };
         let freq_mhz = match (pdh_val(&self.perf), &self.base_mhz) {
             (Ok(p), Ok(b)) => Ok(p / 100.0 * f64::from(*b)),
             (Err(e), _) => Err(e),

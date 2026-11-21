@@ -216,7 +216,7 @@ fn game() -> Fps {
             lows: Ok((98.0, 61.0)),
             gpu_time: Ok((5.2, 6.8)),
             bound: Ok("GPU"),
-            recent_us: (0..400).map(|i| 6_000 + (i * 37 % 5_000)).collect(),
+            peak_ms: Some(11.4),
         }),
     }
 }
@@ -318,8 +318,12 @@ fn terminal_minusculo_nao_quebra() {
     // Inclui larguras em que a grade de lógicos, as barras e a rede não cabem (achado da
     // revisão: escrita fora do buffer e por cima das caixas vizinhas).
     for (w, h) in [
+        (3, 0),
         (1, 1),
         (10, 3),
+        (100, 30),
+        (120, 40),
+        (140, 40),
         (30, 8),
         (200, 5),
         (30, 20),

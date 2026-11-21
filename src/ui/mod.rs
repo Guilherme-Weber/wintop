@@ -55,6 +55,7 @@ fn event_loop(
     let mut st = view::State::new(engine.interval_ms());
     let mut seen = Seen::default();
     let mut dirty = true;
+    let mut last_second = (u16::MAX, 0, 0);
     while !stop.load(Ordering::SeqCst) {
         let u = engine.updates(&mut seen);
         if let Some(f) = u.fast {
@@ -71,8 +72,9 @@ fn event_loop(
         }
         // Relógio da barra de abas: redesenha quando o segundo muda.
         let now = clock();
-        if now != st.clock {
-            st.clock = now;
+        if now != last_second {
+            last_second = now;
+            st.clock = format!("{:02}:{:02}:{:02}", now.0, now.1, now.2);
             dirty = true;
         }
         if dirty {
@@ -130,11 +132,11 @@ fn event_loop(
     Ok(())
 }
 
-/// Hora local "HH:MM:SS" para a barra de abas.
-fn clock() -> String {
+/// Hora local (hora, minuto, segundo) para a barra de abas.
+fn clock() -> (u16, u16, u16) {
     // SAFETY: sem pré-condições; devolve a estrutura por valor.
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
+    (t.wHour, t.wMinute, t.wSecond)
 }
 
 #[cfg(test)]

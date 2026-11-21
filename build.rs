@@ -31,7 +31,7 @@ fn main() {
 
     let mut res = winresource::WindowsResource::new();
     res.set_manifest_file("wintop.exe.manifest");
-    res.set("FileDescription", "wintop - monitor de sistema em terminal");
+    res.set("FileDescription", "wintop - terminal system monitor");
     res.set("ProductName", "wintop");
     if let Err(e) = res.compile_for("wintop") {
         panic!("falha ao embutir o manifesto: {e}");

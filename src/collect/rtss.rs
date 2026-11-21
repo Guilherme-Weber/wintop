@@ -334,8 +334,6 @@ const INSTANCES: usize = 8;
 /// Buffer de leitura por instância: 512 registros de 8 bytes por leitura (mensagens maiores
 /// chegam em partes, com ERROR_MORE_DATA).
 const BUF: usize = 4 * 1024;
-/// Frametimes mais recentes enviados à interface (o gráfico tem no máximo ~2 por coluna).
-const RECENT_FRAMES: usize = 512;
 /// Frames guardados por app: 1000 FPS × 60 s.
 const MAX_FRAMES: usize = 60_000;
 /// Conclusões de leitura atendidas por período: acima disso o pipe espera o próximo período
@@ -665,6 +663,8 @@ pub struct RtssCollector {
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
     lows: LowsCache,
+    /// Momento da publicação anterior do jogo (para o pior frame desde então).
+    published: Option<Instant>,
 }
 
 impl RtssCollector {
@@ -684,6 +684,7 @@ impl RtssCollector {
             exact: HashMap::new(),
             approx: HashMap::new(),
             lows: None,
+            published: None,
         }
     }
 
@@ -910,10 +911,18 @@ impl RtssCollector {
             lows,
             gpu_time,
             bound,
-            recent_us: ring.map_or_else(Vec::new, |r| {
-                let n = r.frames.len().saturating_sub(RECENT_FRAMES);
-                r.frames.iter().skip(n).map(|(_, us)| *us).collect()
-            }),
+            peak_ms: {
+                let since = self.published.replace(now);
+                ring.and_then(|r| {
+                    r.frames
+                        .iter()
+                        .rev()
+                        .take_while(|(t, _)| since.is_none_or(|s| *t > s))
+                        .map(|(_, us)| *us)
+                        .max()
+                })
+                .map(|us| f64::from(us) / 1000.0)
+            },
         }
     }
 }

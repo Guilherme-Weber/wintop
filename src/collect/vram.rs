@@ -182,11 +182,15 @@ impl VramCollector {
                 *per_process.entry(pid).or_default() += *v as u64;
             }
         }
-        let adapter_used = adapter
+        let mine: Vec<u64> = adapter
             .iter()
             .filter(|(n, _)| n.to_ascii_lowercase().starts_with(luid))
             .map(|(_, v)| *v as u64)
-            .sum();
+            .collect();
+        if mine.is_empty() {
+            return fail("adapter has no PDH instance");
+        }
+        let adapter_used = mine.iter().sum();
         let list: Vec<(u32, u64)> = per_process.into_iter().collect();
         Ok(breakdown(&list, adapter_used, total, &process_names()))
     }

@@ -184,14 +184,14 @@ impl Engine {
                         }
                     }));
                 })
-                .expect("criar a thread de coleta rápida")
+                .expect("failed to create the fast collection thread")
         };
         // Evento manual de parada da thread do RTSS: acorda a espera do pipe na hora.
         // SAFETY: evento sem nome; o handle passa a ter dono logo abaixo.
         let stop_event = Arc::new(unsafe {
             OwnedHandle::from_raw_handle(
                 CreateEventW(None, true, false, None)
-                    .expect("criar o evento de parada")
+                    .expect("failed to create the stop event")
                     .0,
             )
         });
@@ -201,7 +201,7 @@ impl Engine {
             std::thread::Builder::new()
                 .name("rtss".into())
                 .spawn(move || rtss_thread(&sh, HANDLE(stop.as_raw_handle())))
-                .expect("criar a thread do RTSS")
+                .expect("failed to create the RTSS thread")
         };
         let slow = {
             let sh = Arc::clone(&shared);
@@ -229,7 +229,7 @@ impl Engine {
                         }
                     }));
                 })
-                .expect("criar a thread de coleta lenta")
+                .expect("failed to create the slow collection thread")
         };
         Self {
             shared,
