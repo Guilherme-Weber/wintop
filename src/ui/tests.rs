@@ -459,3 +459,23 @@ fn sem_jogo_fica_idle_com_os_graficos() {
     assert!(out.contains("min 144 · max 144"), "{out}");
     assert!(out.contains("no 3D game in focus"), "{out}");
 }
+
+#[test]
+fn causa_longa_de_falha_quebra_sem_cortar() {
+    // Causa que cabe sozinha na linha, mas não junto do rótulo (achado da revisão).
+    let mut st = filled();
+    let cause = "SMART: no temperature sensor (native or SMART 194/190)";
+    if let Some(s) = &mut st.slow
+        && let Ok(list) = &mut s.disk_temps
+    {
+        for t in list.iter_mut().filter(|t| t.number == 0) {
+            t.celsius = Err(Missing::Fail(cause.into()));
+        }
+    }
+    for (w, h) in [(140, 48), (160, 48), (210, 52)] {
+        let out = render(&mut st, w, h);
+        let flat: String = out.split('\n').collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("194/190)"), "{w}x{h}:\n{out}");
+        assert!(flat.contains("! E: temp: SMART:"), "{out}");
+    }
+}

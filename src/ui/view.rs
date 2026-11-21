@@ -435,7 +435,8 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     let [mem, net] = Layout::vertical([Constraint::Length(mem_h), Constraint::Min(4)]).areas(left);
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
     // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
-    let disk_rows = (disk_order(st).len() + temp_failures(st).len()) as u16;
+    let disk_rows =
+        (disk_order(st).len() + temp_failure_lines(st, right.width.saturating_sub(2)).len()) as u16;
     let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
@@ -560,13 +561,11 @@ fn failing_sources(st: &State) -> usize {
         n += usize::from(f.disks.as_ref().is_err_and(fail));
         n += usize::from(f.nics.as_ref().is_err_and(fail));
         n += usize::from(f.gpus.as_ref().is_err_and(fail));
+        n += usize::from(f.own.as_ref().is_err_and(fail));
     }
     if let Some(s) = &st.slow {
         n += usize::from(s.gpus.as_ref().is_err_and(fail));
         n += usize::from(s.disk_temps.as_ref().is_err_and(fail));
-    }
-    if let Some(f) = &st.fast {
-        n += usize::from(f.own.as_ref().is_err_and(fail));
     }
     if let Some(f) = &st.fps {
         n += usize::from(f.rtss.as_ref().is_err_and(fail));
@@ -1157,29 +1156,13 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
 /// os spans que começam com espaço (separadores e rótulos como "  SM "); o espaço da quebra
 /// some e a continuação começa com `indent` espaços. `first` é o recuo da primeira linha.
 fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<Line<'static>> {
-    // Um span mais largo que a linha vira um por palavra (cada palavra é um ponto de quebra).
-    let spans = spans.into_iter().flat_map(|sp| {
-        if sp.width() <= usize::from(width) {
-            return vec![sp];
-        }
-        let style = sp.style;
-        let mut parts = Vec::new();
-        for (i, w) in sp.content.split(' ').enumerate() {
-            let t = if i == 0 {
-                w.to_string()
-            } else {
-                format!(" {w}")
-            };
-            parts.push(Span::styled(t, style));
-        }
-        parts
-    });
-    let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+    let starts_group = |sp: &Span<'_>| sp.content.starts_with(char::is_whitespace);
+    let mut groups: std::collections::VecDeque<Vec<Span<'static>>> = Default::default();
     for sp in spans {
-        if groups.is_empty() || sp.content.starts_with(char::is_whitespace) {
-            groups.push(Vec::new());
+        if groups.is_empty() || starts_group(&sp) {
+            groups.push_back(Vec::new());
         }
-        if let Some(g) = groups.last_mut() {
+        if let Some(g) = groups.back_mut() {
             g.push(sp);
         }
     }
@@ -1201,32 +1184,79 @@ fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<L
         }
         out
     };
+    // O grupo em palavras (cada palavra vira um grupo); `None` se já é uma palavra só.
+    let words = |g: &[Span<'static>]| -> Option<Vec<Vec<Span<'static>>>> {
+        let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+        // Espaço visto (inclusive no fim de um span): a próxima palavra abre um grupo com ele.
+        let mut space = false;
+        for sp in g {
+            for (i, w) in sp.content.split(' ').enumerate() {
+                if i > 0 {
+                    space = true;
+                }
+                if w.is_empty() {
+                    continue;
+                }
+                let new_group = std::mem::take(&mut space);
+                let t = if new_group {
+                    format!(" {w}")
+                } else {
+                    w.to_string()
+                };
+                let part = Span::styled(t, sp.style);
+                if out.is_empty() || new_group {
+                    out.push(vec![part]);
+                } else if let Some(last) = out.last_mut() {
+                    last.push(part);
+                }
+            }
+        }
+        (out.len() > 1).then_some(out)
+    };
     let width = usize::from(width);
     let pad = |n: u16| Span::raw(" ".repeat(usize::from(n)));
     let mut lines = Vec::new();
     let mut cur = vec![pad(first)];
     let mut used = usize::from(first);
     let mut empty = true;
-    for g in groups {
+    while let Some(g) = groups.pop_front() {
         let g = if empty { trimmed(&g) } else { g };
-        let w: usize = g.iter().map(Span::width).sum();
-        if !empty && used + w > width {
-            let g = trimmed(&g);
-            // Só separador (ex.: o do fim da lista de fans): não abre uma linha vazia.
-            if g.is_empty() {
-                continue;
-            }
-            lines.push(Line::from(std::mem::take(&mut cur)));
-            used = usize::from(indent) + g.iter().map(Span::width).sum::<usize>();
-            cur.push(pad(indent));
-            cur.extend(g);
-            continue;
-        }
         if g.is_empty() {
             continue;
         }
-        used += w;
-        empty = false;
+        let w: usize = g.iter().map(Span::width).sum();
+        if used + w <= width {
+            used += w;
+            empty = false;
+            cur.extend(g);
+            continue;
+        }
+        // Não cabe nem a partir do recuo de uma linha nova: quebra por palavra.
+        let start = if lines.is_empty() && empty {
+            first
+        } else {
+            indent
+        };
+        let tw: usize = trimmed(&g).iter().map(Span::width).sum();
+        if usize::from(start) + tw > width
+            && let Some(ws) = words(&g)
+        {
+            for w in ws.into_iter().rev() {
+                groups.push_front(w);
+            }
+            continue;
+        }
+        if empty {
+            // Linha vazia e uma palavra só maior que a largura: entra cortada.
+            used += w;
+            empty = false;
+            cur.extend(g);
+            continue;
+        }
+        lines.push(Line::from(std::mem::take(&mut cur)));
+        let g = trimmed(&g);
+        used = usize::from(indent) + g.iter().map(Span::width).sum::<usize>();
+        cur.push(pad(indent));
         cur.extend(g);
     }
     if !empty {
@@ -1921,35 +1951,46 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         line(frame, info, info_x, y, info_w, inner);
     }
     // Causas das falhas de temperatura, inteiras (a coluna só tem espaço para "! failed").
-    let mut y = inner.y + 1 + shown as u16 + u16::from(shown < order.len());
-    for (number, cause) in temp_failures(st) {
-        let name = order.iter().find(|(d, _)| d.number == number).map_or_else(
-            || format!("disk {number}"),
-            |(d, _)| {
-                if d.letters.is_empty() {
-                    format!("d{number}")
-                } else {
-                    d.letters.join(" ")
-                }
-            },
-        );
-        let spans = vec![
-            Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
-            Span::styled(printable(&cause), Style::new().fg(FAIL)),
-        ];
-        for l in wrap(spans, inner.width, 0, 4) {
-            if y >= inner.y + inner.height {
-                return;
-            }
-            put(
-                frame,
-                Paragraph::new(l),
-                Rect::new(inner.x, y, inner.width, 1),
-                inner,
-            );
-            y += 1;
+    let first = inner.y + 1 + shown as u16 + u16::from(shown < order.len());
+    for (i, l) in temp_failure_lines(st, inner.width).into_iter().enumerate() {
+        let y = first + i as u16;
+        if y >= inner.y + inner.height {
+            break;
         }
+        put(
+            frame,
+            Paragraph::new(l),
+            Rect::new(inner.x, y, inner.width, 1),
+            inner,
+        );
     }
+}
+
+/// Causas das falhas de temperatura, uma por disco, quebradas em `width` colunas.
+fn temp_failure_lines(st: &State, width: u16) -> Vec<Line<'static>> {
+    let disks = st.fast.as_ref().and_then(|f| f.disks.as_ref().ok());
+    temp_failures(st)
+        .into_iter()
+        .flat_map(|(number, cause)| {
+            let name = disks
+                .and_then(|l| l.iter().find(|d| d.number == number))
+                .map_or_else(
+                    || format!("disk {number}"),
+                    |d| {
+                        if d.letters.is_empty() {
+                            format!("d{number}")
+                        } else {
+                            d.letters.join(" ")
+                        }
+                    },
+                );
+            let spans = vec![
+                Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
+                Span::styled(printable(&cause), Style::new().fg(FAIL)),
+            ];
+            wrap(spans, width, 0, 4)
+        })
+        .collect()
 }
 
 // --- Jogo ---
