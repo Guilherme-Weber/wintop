@@ -13,6 +13,13 @@ Coluna Prova: **Spike** = provado em Rust na Etapa 0 (`docs/spike-etapa0.md`); *
 conferido pelo PowerShell (mesma API, sem código Rust ainda); **E1**..**E6** = etapa que
 implementa e prova.
 
+**Idioma da interface:** inglês americano (números com ponto decimal). Os estados neutros desta
+lista aparecem traduzidos na interface (ex.: "desconectada" → "disconnected", "em repouso" →
+"asleep", "parado" → "stopped"). Uma opção de português do Brasil pode entrar no futuro.
+
+**Etapa 1 (2026-11-20):** as linhas E1 de CPU, memória, discos, rede e GPU foram provadas pelo
+`wintop --check` na máquina de desenvolvimento (135 OK, 3 neutras, 0 falhas).
+
 Todas as séries com histórico guardam **mínimo e máximo da sessão** (tecla para zerar), como o
 Afterburner. Todas as leituras de temperatura de disco e o PCIe do NVML rodam na **thread lenta**.
 
@@ -23,7 +30,7 @@ Afterburner. Todas as leituras de temperatura de disco e o PCIe do NVML rodam na
 | Nome do processador | CPUID (0x80000002-4, se a folha máxima permitir) | | | Spike |
 | Uso total (%) | PDH `\Processor Information(_Total)\% Processor Utility`, limitado a 0-100 | | | E1 |
 | Uso por processador lógico (grade dimensionada pela CPU real; 16 = 4×4 na máquina de desenvolvimento) | PDH `\Processor Information(*)\% Processor Utility` | | | E1 |
-| Parcela de kernel (opcional) | `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`; KernelTime inclui IdleTime | | | E1 |
+| Parcela de kernel (opcional) | `GetSystemTimes` (total do sistema): `(kernel - idle) / (kernel + user)`; KernelTime inclui IdleTime | | | E1 |
 | Frequência atual | PDH `% Processor Performance` × frequência base | | | E1 |
 | Frequência base | `CallNtPowerInformation(ProcessorInformation)` | | | E1 |
 | Sockets, núcleos, lógicos, L1/L2/L3 | `GetLogicalProcessorInformationEx` | | | E1 |
@@ -51,8 +58,8 @@ Afterburner. Todas as leituras de temperatura de disco e o PCIe do NVML rodam na
 | Fabricante e modelo | `StorageDeviceProperty` (VendorId + ProductId) | | | Spike |
 | Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | Spike |
 | SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
-| Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | | Spike |
-| Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "vários pools: associação pendente" (com mais de um pool) | Spike (1 pool, 5 membros) |
+| Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s) | Spike |
+| Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "vários pools: associação pendente" (com mais de um pool); "em repouso" (como a capacidade) | Spike (1 pool, 5 membros) |
 | Letras das unidades | nome da instância PDH (`"7 c:"`); membros do pool não têm letra | | | PS |
 | Disco do sistema / arquivo de paginação | volume do Windows e do pagefile → número do disco | | | E1 |
 | Tempo ativo (%) | PDH `\PhysicalDisk(*)\% Idle Time` → `100 - idle`, limitado a 0-100 | | | PS |
@@ -77,8 +84,8 @@ Afterburner. Todas as leituras de temperatura de disco e o PCIe do NVML rodam na
 | Nome, driver, VBIOS | NVML | | | Spike |
 | Uso (%) | NVML `utilization.gpu` | | | Spike |
 | Atividade da memória (%) | NVML `utilization.memory` | | | Spike |
-| VRAM dedicada usada / total (igual ao Task Manager) | PDH `\GPU Adapter Memory(*)\Dedicated Usage`; total do NVML | | | E1 |
-| VRAM compartilhada | PDH `\GPU Adapter Memory(*)\Shared Usage` | | | E1 |
+| VRAM dedicada usada / total (igual ao Task Manager) | PDH `\GPU Adapter Memory(*)\Dedicated Usage` da instância `luid_0x<alto>_0x<baixo>_phys_N` (LUID pelo DXGI, casando fabricante/dispositivo/subsistema PCI com o NVML); total do NVML | | "várias GPUs iguais: associação pendente" | E1 |
+| VRAM compartilhada | PDH `\GPU Adapter Memory(*)\Shared Usage`; limite pelo DXGI (`SharedSystemMemory`) | | | E1 |
 | VRAM física (NVML: usada, livre, reservada) | NVML `memory_info` (v2, com `reserved`) | | | Spike |
 | Temperatura e limite de slowdown | NVML | | | Spike |
 | Clocks (gráfico, SM, memória, vídeo) e máximo | NVML | | | Spike |

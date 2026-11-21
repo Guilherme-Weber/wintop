@@ -11,6 +11,10 @@ rust-version = "1.100"
 [dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
@@ -18,15 +22,14 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_Power",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
-
-# Etapa 0: só os spikes (examples/) usam; passa a [dependencies] na Etapa 1.
-[dev-dependencies]
 nvml-wrapper = "0.13"
 
 [build-dependencies]
