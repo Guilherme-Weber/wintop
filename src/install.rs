@@ -52,9 +52,20 @@ pub fn install_dir() -> Result<PathBuf, String> {
     Ok(known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles)?.join("wintop"))
 }
 
-fn shortcut_path() -> Result<PathBuf, String> {
-    Ok(known_folder(&windows::Win32::UI::Shell::FOLDERID_Programs)?.join("wintop.lnk"))
+/// Pasta do Menu Iniciar do usuário: (pasta pai, nome) para o `userfile` (é do usuário e
+/// redirecionável sem elevação: nada de caminho direto como administrador).
+fn programs() -> Result<(PathBuf, String), String> {
+    let p = known_folder(&windows::Win32::UI::Shell::FOLDERID_Programs)?;
+    let name = p
+        .file_name()
+        .ok_or("no Start menu folder name")?
+        .to_string_lossy()
+        .to_string();
+    let parent = p.parent().ok_or("no Start menu parent")?.to_path_buf();
+    Ok((parent, name))
 }
+
+const LNK: &str = "wintop.lnk";
 
 /// `path` é um link (junction, symlink): o instalador não segue links.
 fn is_link(path: &Path) -> bool {
@@ -364,9 +375,20 @@ pub fn install() -> Result<(), String> {
         "scheduled task \"{TASK}\" created (runs {} elevated)",
         exe.display()
     );
-    let lnk = shortcut_path()?;
-    create_shortcut(&lnk, &exe)?;
-    println!("Start menu shortcut: {}", lnk.display());
+    // O atalho é gerado na pasta protegida e copiado para o Menu Iniciar pelo `userfile`
+    // (sem seguir links nem redirecionamentos da pasta do usuário).
+    let tmp = dir.join("wintop.lnk.tmp");
+    if tmp.exists() || is_link(&tmp) {
+        std::fs::remove_file(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    }
+    create_shortcut(&tmp, &exe)?;
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("{}: {e}", tmp.display()));
+    let _ = std::fs::remove_file(&tmp);
+    let (base, name) = programs()?;
+    let menu = crate::userfile::UserDir::open(&base, &name, false)?
+        .ok_or("Start menu folder not found")?;
+    menu.write_bytes(LNK, &bytes?)?;
+    println!("Start menu shortcut: {}", menu.file(LNK).display());
     Ok(())
 }
 
@@ -379,9 +401,10 @@ pub fn uninstall() -> Result<(), String> {
         Ok(()) => println!("scheduled task \"{TASK}\" removed"),
         Err(e) => println!("scheduled task: {e}"),
     }
-    let lnk = shortcut_path()?;
-    if lnk.exists() {
-        std::fs::remove_file(&lnk).map_err(|e| format!("{}: {e}", lnk.display()))?;
+    let (base, name) = programs()?;
+    if let Some(menu) = crate::userfile::UserDir::open(&base, &name, false)?
+        && menu.remove(LNK)?
+    {
         println!("shortcut removed");
     }
     let dir = install_dir()?;
@@ -393,7 +416,8 @@ pub fn uninstall() -> Result<(), String> {
             |c| c.to_string_lossy().to_lowercase(),
         )
     };
-    if canon(&me).starts_with(&canon(&dir)) {
+    // Por componentes (`wintop2` não está dentro de `wintop`).
+    if Path::new(&canon(&me)).starts_with(Path::new(&canon(&dir))) {
         println!(
             "{} is in use by this process: delete it after closing wintop",
             dir.display()

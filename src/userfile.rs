@@ -62,17 +62,51 @@ fn norm(p: &str) -> String {
     p.trim_end_matches('\\').to_lowercase()
 }
 
-/// Abre `path` sem seguir reparse points e confere que o handle é dele mesmo (não de um
-/// redirecionamento) e que não é um reparse point.
+/// Falha de abertura: "não existe" (decidido pelo código do `CreateFileW`, sem `exists()`, que
+/// segue links) ou qualquer outra recusa.
+enum OpenError {
+    NotFound,
+    Refused(String),
+}
+
+impl From<OpenError> for String {
+    fn from(e: OpenError) -> Self {
+        match e {
+            OpenError::NotFound => "not found".into(),
+            OpenError::Refused(s) => s,
+        }
+    }
+}
+
+/// Abre `path` sem seguir reparse points e confere: é dele mesmo (não um redirecionamento),
+/// não é link, é um arquivo de disco do tipo pedido (pasta ou arquivo) e, se arquivo, sem
+/// outros nomes (hardlink). Só caminho local absoluto; o handle não expõe o token elevado se o
+/// nome for de um pipe (SQOS anônimo).
 fn open(
     path: &Path,
     access: u32,
     share: FILE_SHARE_MODE,
     disposition: FILE_CREATION_DISPOSITION,
     dir: bool,
-) -> Result<Checked, String> {
+    single_name: bool,
+) -> Result<Checked, OpenError> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_TYPE_DISK, GetFileType, SECURITY_ANONYMOUS,
+        SECURITY_SQOS_PRESENT,
+    };
+    let refuse = |m: String| OpenError::Refused(m);
+    if !crate::win::is_local_absolute(path) {
+        return Err(refuse(format!(
+            "{} is not a local path (refused)",
+            path.display()
+        )));
+    }
     let w = wide(&path.to_string_lossy());
-    let mut flags: FILE_FLAGS_AND_ATTRIBUTES = FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL;
+    let mut flags: FILE_FLAGS_AND_ATTRIBUTES = FILE_FLAG_OPEN_REPARSE_POINT
+        | FILE_ATTRIBUTE_NORMAL
+        | SECURITY_SQOS_PRESENT
+        | SECURITY_ANONYMOUS;
     if dir {
         flags |= FILE_FLAG_BACKUP_SEMANTICS;
     }
@@ -88,23 +122,54 @@ fn open(
             None,
         )
     }
-    .map_err(|e| format!("{}: {e}", path.display()))?;
+    .map_err(|e| {
+        if e.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+            || e.code() == ERROR_PATH_NOT_FOUND.to_hresult()
+        {
+            OpenError::NotFound
+        } else {
+            refuse(format!("{}: {e}", path.display()))
+        }
+    })?;
     // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
     let handle = unsafe { crate::win::own(h) };
     let c = Checked { handle };
+    // SAFETY: handle válido.
+    if unsafe { GetFileType(c.raw()) } != FILE_TYPE_DISK {
+        return Err(refuse(format!(
+            "{} is not a disk file (refused)",
+            path.display()
+        )));
+    }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: handle válido; estrutura local.
     unsafe { GetFileInformationByHandle(c.raw(), &raw mut info) }
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| refuse(format!("{}: {e}", path.display())))?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Err(format!("{} is a link (refused)", path.display()));
+        return Err(refuse(format!("{} is a link (refused)", path.display())));
     }
-    let got = final_path(c.raw())?;
+    let is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    if is_dir != dir {
+        return Err(refuse(format!(
+            "{} is not a {} (refused)",
+            path.display(),
+            if dir { "folder" } else { "file" }
+        )));
+    }
+    // Leitura e gravação: o arquivo não pode ter outros nomes (seria ler ou escrever o alvo
+    // por outro caminho); apagar um nome é seguro.
+    if !dir && single_name && info.nNumberOfLinks > 1 {
+        return Err(refuse(format!(
+            "{} has other names (hardlink, refused)",
+            path.display()
+        )));
+    }
+    let got = final_path(c.raw()).map_err(refuse)?;
     if got != norm(&path.to_string_lossy()) {
-        return Err(format!(
+        return Err(refuse(format!(
             "{} resolves elsewhere ({got}): refused",
             path.display()
-        ));
+        )));
     }
     Ok(c)
 }
@@ -146,11 +211,13 @@ pub struct UserDir {
 }
 
 impl UserDir {
-    /// `base` (ex.: `AppData\Roaming`) precisa ser do usuário atual; `name` é criada se faltar.
-    pub fn open(base: &Path, name: &str, create: bool) -> Result<Self, String> {
+    /// `base` (ex.: `AppData\Roaming`) precisa ser do usuário atual; `name` é criada se faltar
+    /// (`create`). `Ok(None)`: sem criar, a subpasta não existe (a base passou em tudo).
+    pub fn open(base: &Path, name: &str, create: bool) -> Result<Option<Self>, String> {
         // Sem FILE_SHARE_DELETE: ninguém renomeia nem troca a pasta enquanto ela está aberta.
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-        let b = open(base, GENERIC_READ.0, share, OPEN_EXISTING, true)?;
+        let b =
+            open(base, GENERIC_READ.0, share, OPEN_EXISTING, true, true).map_err(String::from)?;
         let user = crate::win::user_sid().ok_or("could not read the user SID")?;
         let own = owner(&b)?;
         if own != user {
@@ -162,15 +229,25 @@ impl UserDir {
         let path = base.join(name);
         if create {
             let w = wide(&path.to_string_lossy());
-            // SAFETY: caminho terminado em zero; pasta já existente não é erro aqui.
+            // SAFETY: caminho terminado em zero; pasta já existente não é erro aqui (o que
+            // existir no lugar é conferido na abertura abaixo).
             let _ = unsafe { CreateDirectoryW(PCWSTR(w.as_ptr()), None) };
         }
-        let dir = open(&path, GENERIC_READ.0, share, OPEN_EXISTING, true)?;
-        Ok(Self {
+        let dir = match open(&path, GENERIC_READ.0, share, OPEN_EXISTING, true, true) {
+            Ok(d) => d,
+            Err(OpenError::NotFound) if !create => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Some(Self {
             _base: b,
             dir,
             path,
-        })
+        }))
+    }
+
+    /// Como `open`, criando a subpasta se faltar.
+    pub fn create(base: &Path, name: &str) -> Result<Self, String> {
+        Self::open(base, name, true)?.ok_or_else(|| "folder not created".into())
     }
 
     pub fn file(&self, name: &str) -> PathBuf {
@@ -180,10 +257,18 @@ impl UserDir {
     /// Lê `name` (no máximo `max` bytes); `Ok(None)` se não existe.
     pub fn read(&self, name: &str, max: u64) -> Result<Option<String>, String> {
         let p = self.file(name);
-        if !p.exists() {
-            return Ok(None);
-        }
-        let c = open(&p, GENERIC_READ.0, FILE_SHARE_READ, OPEN_EXISTING, false)?;
+        let c = match open(
+            &p,
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            false,
+            true,
+        ) {
+            Ok(c) => c,
+            Err(OpenError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let _ = &self.dir;
         // SAFETY: o handle conferido passa para o File (dono único).
         let f = unsafe { File::from_raw_handle(c.handle.as_raw_handle()) };
@@ -201,6 +286,30 @@ impl UserDir {
 
     /// Grava `name` atomicamente: temporário novo e exclusivo, trocado pelo próprio handle.
     pub fn write(&self, name: &str, text: &str) -> Result<(), String> {
+        self.write_bytes(name, text.as_bytes())
+    }
+
+    /// Apaga `name` sem seguir links (um link no lugar é apagado como link). `Ok(false)`: não
+    /// existia.
+    pub fn remove(&self, name: &str) -> Result<bool, String> {
+        let p = self.file(name);
+        let c = match open(
+            &p,
+            DELETE.0,
+            FILE_SHARE_MODE(0),
+            OPEN_EXISTING,
+            false,
+            false,
+        ) {
+            Ok(c) => c,
+            Err(OpenError::NotFound) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        delete_on_close(c.raw());
+        Ok(true)
+    }
+
+    pub fn write_bytes(&self, name: &str, data: &[u8]) -> Result<(), String> {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = self.file(&format!("{name}.{}.{n}.tmp", std::process::id()));
@@ -210,13 +319,15 @@ impl UserDir {
             FILE_SHARE_MODE(0),
             CREATE_NEW,
             false,
-        )?;
+            true,
+        )
+        .map_err(String::from)?;
         let r = (|| -> Result<(), String> {
             // SAFETY: handle conferido e só nosso; o File não o fecha (forget abaixo).
             let mut f = std::mem::ManuallyDrop::new(unsafe {
                 File::from_raw_handle(c.handle.as_raw_handle())
             });
-            f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(data).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
             rename_over(c.raw(), &self.file(name))
         })();
@@ -283,7 +394,7 @@ mod tests {
     fn grava_e_le_pelo_handle() {
         let b = roaming();
         let n = name("rw");
-        let d = UserDir::open(&b, &n, true).expect("pasta do usuário");
+        let d = UserDir::create(&b, &n).expect("pasta do usuário");
         assert_eq!(d.read("config.toml", 1024).expect("leitura"), None);
         d.write("config.toml", "a = 1\n").expect("gravação");
         d.write("config.toml", "a = 2\n").expect("substitui");
@@ -318,13 +429,48 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&st.stderr)
         );
-        let r = UserDir::open(&b, &n, true);
+        let r = UserDir::create(&b, &n);
         // Remove a junction (rmdir não segue o link) e o alvo.
         let _ = std::fs::remove_dir(b.join(&n));
         let empty = std::fs::read_dir(&target).expect("alvo").next().is_none();
         let _ = std::fs::remove_dir_all(&target);
         assert!(r.is_err(), "junction seguida");
         assert!(empty, "nada gravado no alvo");
+    }
+
+    #[test]
+    fn hardlink_arquivo_no_lugar_da_pasta_e_unc_sao_recusados() {
+        let b = roaming();
+        // Hardlink: o config com outro nome não é lido (poderia ser um arquivo protegido).
+        let n = name("hard");
+        let d = UserDir::create(&b, &n).expect("pasta");
+        d.write("config.toml", "a = 1\n").expect("gravação");
+        std::fs::hard_link(d.file("config.toml"), d.file("outro.toml")).expect("hardlink");
+        assert!(d.read("config.toml", 1024).is_err(), "hardlink lido");
+        // `remove` apaga o nome, não o alvo.
+        assert!(d.remove("outro.toml").expect("remove"));
+        assert!(!d.remove("outro.toml").expect("remove"), "já não existe");
+        assert!(d.read("config.toml", 1024).expect("leitura").is_some());
+        drop(d);
+        let _ = std::fs::remove_dir_all(b.join(&n));
+        // Arquivo no lugar da pasta.
+        let f = name("arquivo");
+        std::fs::write(b.join(&f), "x").expect("arquivo");
+        assert!(
+            UserDir::create(&b, &f).is_err(),
+            "arquivo aceito como pasta"
+        );
+        assert!(UserDir::open(&b, &f, false).is_err());
+        let _ = std::fs::remove_file(b.join(&f));
+        // Sem a pasta e sem criar: Ok(None), sem aviso.
+        assert!(
+            UserDir::open(&b, &name("nada"), false)
+                .expect("base ok")
+                .is_none()
+        );
+        // Base que não é caminho local (UNC, pipe): recusada antes de qualquer abertura.
+        assert!(UserDir::open(Path::new(r"\127.0.0.1\c$"), "wintop", false).is_err());
+        assert!(UserDir::open(Path::new(r"\.\pipe\x"), "wintop", false).is_err());
     }
 
     #[test]

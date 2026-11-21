@@ -181,9 +181,9 @@ fn load_in(base: Option<PathBuf>, dir_name: &str, create: bool) -> Loaded {
         return l;
     };
     let dir = match crate::userfile::UserDir::open(&base, dir_name, create) {
-        Ok(d) => d,
-        // Sem a pasta no modo só leitura: padrões, sem aviso (ainda não foi criada).
-        Err(_) if !create && !base.join(dir_name).exists() => return l,
+        Ok(Some(d)) => d,
+        // Sem a pasta no modo só leitura (a base passou nas checagens): padrões, sem aviso.
+        Ok(None) => return l,
         Err(e) => {
             l.warnings
                 .push(format!("config: {e} (defaults, not saved)"));
@@ -323,7 +323,7 @@ impl Loaded {
             doc.insert("rtss", Item::Table(t));
         }
         let text = doc.to_string();
-        crate::userfile::UserDir::open(&base, &self.dir, true)?.write(FILE, &text)?;
+        crate::userfile::UserDir::create(&base, &self.dir)?.write(FILE, &text)?;
         self.config = c.clone();
         Ok(())
     }
