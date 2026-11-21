@@ -75,7 +75,8 @@ pub(super) fn parse(b: &[u8], base: usize) -> Result<Vec<Raw>, String> {
     let mut out = Vec::new();
     let mut off = 0usize;
     loop {
-        let e = b.get(off..off + ENTRY).ok_or_else(oob)?;
+        let end = off.checked_add(ENTRY).ok_or_else(oob)?;
+        let e = b.get(off..end).ok_or_else(oob)?;
         let pid = u64_at(e, PID).ok_or_else(oob)? as u32;
         let len = usize::from(u16::from_le_bytes([e[NAME_LEN], e[NAME_LEN + 1]]));
         let ptr = u64_at(e, NAME_PTR).ok_or_else(oob)? as usize;
@@ -121,6 +122,25 @@ pub(super) fn parse(b: &[u8], base: usize) -> Result<Vec<Raw>, String> {
     }
 }
 
+/// Um processo da lista atual (sem abrir o processo).
+fn raw_of(pid: u32) -> Result<Option<Raw>, String> {
+    let mut c = ProcCollector::new();
+    Ok(c.query()?.into_iter().find(|r| r.pid == pid))
+}
+
+/// Nome atual do processo `pid`.
+pub fn name_of(pid: u32) -> Result<Option<String>, String> {
+    Ok(raw_of(pid)?.map(|r| r.name))
+}
+
+/// Working set privado do processo `pid` (o do próprio wintop no Windows 10, onde o
+/// `PROCESS_MEMORY_COUNTERS_EX2` não existe).
+pub(super) fn private_ws_of(pid: u32) -> Result<u64, String> {
+    raw_of(pid)?
+        .map(|r| r.mem)
+        .ok_or_else(|| format!("process {pid} not in the process list"))
+}
+
 fn system_time() -> Result<u64, String> {
     let (mut i, mut k, mut u) = (
         FILETIME::default(),
@@ -157,6 +177,12 @@ impl ProcCollector {
     /// Sem leitura anterior (a aba acabou de abrir): as taxas só existem a partir da 2ª.
     pub(super) fn primed(&self) -> bool {
         self.prev_sys.is_some()
+    }
+
+    /// Tempo desde a última leitura (`MAX` sem leitura).
+    pub(super) fn since_last(&self) -> std::time::Duration {
+        self.prev_sys
+            .map_or(std::time::Duration::MAX, |(_, t)| t.elapsed())
     }
 
     /// Esquece as leituras (aba fechada: a próxima abertura começa do zero).
@@ -256,6 +282,48 @@ impl ProcCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PID reaproveitado (instante de criação diferente): não herda o tempo do processo antigo.
+    #[test]
+    fn pid_reaproveitado_nao_herda_o_tempo() {
+        let mut c = ProcCollector::new();
+        c.read().expect("1ª leitura");
+        let me = std::process::id();
+        // O "antigo" dono do PID tinha tempo 0 e outro instante de criação.
+        let (create, ..) = c.prev[&me];
+        c.prev.insert(me, (create.wrapping_add(1), 0, 0, 0));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let list = c.read().expect("2ª leitura");
+        let p = list
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("o próprio processo");
+        assert_eq!((p.cpu, p.io_read, p.io_write), (0.0, 0.0, 0.0), "{p:?}");
+    }
+
+    /// Carga conhecida: 512 MB privados tocados aparecem no working set privado do processo
+    /// (igual ao que o próprio wintop mede de si pela outra API).
+    #[test]
+    #[ignore = "mede memória real: rodar sozinho (--test-threads=1)"]
+    fn memoria_conhecida() {
+        const MB: u64 = 1 << 20;
+        let me = std::process::id();
+        let before = private_ws_of(me).expect("antes");
+        let mut v = vec![0u8; 512 << 20];
+        for i in (0..v.len()).step_by(4096) {
+            v[i] = 1;
+        }
+        let after = private_ws_of(me).expect("depois");
+        std::hint::black_box(&v);
+        let grew = (after.saturating_sub(before)) / MB;
+        println!("working set privado: +{grew} MB (esperado ~512)");
+        assert!((500..=540).contains(&grew), "{grew}");
+        let mut own = super::super::own::OwnCollector::new();
+        let o = own.read().expect("consumo próprio");
+        let ws = o.private_ws.expect("ws privado");
+        let diff = ws.abs_diff(after) as f64 / after as f64;
+        assert!(diff < 0.05, "OwnCollector {ws} × lista {after}");
+    }
 
     /// Monta uma entrada com o nome logo depois da parte fixa.
     fn entry(pid: u64, name: &str, next: u32, base: usize, at: usize) -> Vec<u8> {

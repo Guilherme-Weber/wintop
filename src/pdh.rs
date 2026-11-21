@@ -140,17 +140,27 @@ impl Query {
             PdhGetFormattedCounterArrayW(h, FMT, &raw mut size, &raw mut count, Some(items))
         })?;
         let fits = buf.len() * 8 / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-        let mut out = Vec::with_capacity(count as usize);
-        for i in 0..(count as usize).min(fits) {
+        let n = (count as usize).min(fits);
+        let mut out = Vec::with_capacity(n);
+        let mut first_err = None;
+        for i in 0..n {
             // SAFETY: `i < count` itens escritos pelo PDH, dentro do buffer (`fits`).
             let item = unsafe { &*items.add(i) };
             // SAFETY: o PDH aponta o nome para uma string terminada em zero dentro do buffer.
             let name = unsafe { item.szName.to_string() }.unwrap_or_default();
-            if let Ok(v) = valid(&item.FmtValue) {
-                out.push((name, v));
+            match valid(&item.FmtValue) {
+                Ok(v) => out.push((name, v)),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
             }
         }
-        Ok(out)
+        // Instâncias existem, mas nenhuma com dado válido (ex.: reset do driver): o status real,
+        // não uma lista vazia que pareceria "nenhuma instância".
+        match first_err {
+            Some(e) if out.is_empty() => Err(e),
+            _ => Ok(out),
+        }
     }
 }
 

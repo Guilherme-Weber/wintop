@@ -19,7 +19,8 @@ use crate::win::{own, wide};
 /// desalinhados caem na leitura byte a byte. Campos diferentes (ex.: `dwTime0`, `dwTime1`,
 /// `dwFrames`) podem vir de instantes diferentes; quem lê valida a coerência.
 pub struct SharedView {
-    _handle: OwnedHandle,
+    /// `None` só na visão de teste sobre um buffer local (nada a desmapear).
+    _handle: Option<OwnedHandle>,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
 }
@@ -47,7 +48,7 @@ impl SharedView {
             )
         };
         let mut me = Self {
-            _handle: handle,
+            _handle: Some(handle),
             view,
             len: 0,
         };
@@ -129,9 +130,33 @@ impl SharedView {
 
 impl Drop for SharedView {
     fn drop(&mut self) {
+        if self._handle.is_none() {
+            return;
+        }
         // SAFETY: a view foi obtida em `open` e não é usada depois daqui (o handle fecha sozinho).
         unsafe {
             let _ = UnmapViewOfFile(self.view);
+        }
+    }
+}
+
+#[cfg(test)]
+impl SharedView {
+    /// Visão sobre um buffer local (testes dos parsers). O buffer é vazado: vive até o fim do
+    /// processo de teste, como uma região mapeada.
+    pub fn from_bytes(b: &[u8]) -> Self {
+        let words: &'static mut [u64] =
+            Box::leak(vec![0u64; b.len().div_ceil(8)].into_boxed_slice());
+        // SAFETY: o buffer tem pelo menos `b.len()` bytes e é só nosso.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.as_ptr(), words.as_mut_ptr().cast::<u8>(), b.len());
+        }
+        Self {
+            _handle: None,
+            view: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: words.as_mut_ptr().cast(),
+            },
+            len: b.len(),
         }
     }
 }

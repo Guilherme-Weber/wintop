@@ -444,7 +444,7 @@ fn falha_de_temperatura_mostra_a_causa_inteira() {
     }
     let out = render(&mut st, 160, 48);
     assert!(out.contains("! failed"), "{out}");
-    assert!(out.contains(&format!("! E: temp: {cause}")), "{out}");
+    assert!(out.contains(&format!("! E: temperature: {cause}")), "{out}");
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn causa_longa_de_falha_quebra_sem_cortar() {
         let out = render(&mut st, w, h);
         let flat: String = out.split('\n').collect::<Vec<_>>().join(" ");
         assert!(flat.contains("194/190)"), "{w}x{h}:\n{out}");
-        assert!(flat.contains("! E: temp: SMART:"), "{out}");
+        assert!(flat.contains("! E: temperature: SMART:"), "{out}");
     }
 }
 
@@ -745,4 +745,44 @@ fn sensores_em_tela_larga_nao_cortam_nomes() {
 {out}"
         );
     }
+}
+
+#[test]
+fn sensores_com_texto_longo_e_causas_medias_nao_somem() {
+    let mut st = filled();
+    let mut f = fast(5);
+    if let Ok(g) = &mut f.gpus {
+        g[0].throttle = Ok(vec!["power cap", "HW slowdown", "SW thermal", "sync boost"]);
+        g[0].temp_slowdown = fail("not supported by this GPU in NVML (0x3)");
+    }
+    st.push_fast(f);
+    st.set_tab(view::Tab::Sensors);
+    for (w, h) in [(158, 30), (120, 24), (90, 40), (200, 20), (60, 60)] {
+        let out = render(&mut st, w, h);
+        let flat: String = out
+            .lines()
+            .map(|l| l.trim_matches('"').trim_matches('│').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!out.contains('…'), "{w}x{h}\n{out}");
+        let complete = flat.contains("sync boost") && flat.contains("(0x3)");
+        // Sem altura para tudo, o aviso diz quantos ficaram de fora.
+        assert!(
+            complete || out.contains("more (taller terminal)"),
+            "{w}x{h}\n{out}"
+        );
+    }
+}
+
+#[test]
+fn disco_removido_some_da_aba_sensores() {
+    let mut st = tab_state(view::Tab::Sensors);
+    let mut f = fast(7);
+    if let Ok(d) = &mut f.disks {
+        d.retain(|d| d.number != 7);
+    }
+    st.push_fast(f);
+    let out = render(&mut st, 160, 40);
+    assert!(!out.contains("Disk 7"), "{out}");
+    assert!(out.contains("Disk 0"), "{out}");
 }

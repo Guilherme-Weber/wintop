@@ -156,6 +156,8 @@ pub(super) struct VramCollector {
     non_local: Slot,
     committed: Slot,
     adapter: Slot,
+    /// PID → nome, refeito pelo Toolhelp só quando aparece um PID desconhecido com VRAM.
+    pub(super) names: HashMap<u32, String>,
 }
 
 impl VramCollector {
@@ -175,6 +177,7 @@ impl VramCollector {
             non_local,
             committed,
             adapter,
+            names: HashMap::new(),
         }
     }
 
@@ -216,14 +219,19 @@ impl VramCollector {
     }
 
     /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML);
-    /// `names`: PID → nome. Chamar depois de `collect`.
+    /// `names`: PID → nome da lista de processos, quando a aba a coletou (senão, o cache).
+    /// Chamar depois de `collect`.
     pub(super) fn read(
         &mut self,
         luid: &str,
         total: u64,
-        names: &HashMap<u32, String>,
+        names: Option<&HashMap<u32, String>>,
     ) -> Metric<VramBreakdown> {
         let per_process = self.per_process(&self.local, luid).or_else(fail)?;
+        if names.is_none() && per_process.keys().any(|p| !self.names.contains_key(p)) {
+            self.names = process_names();
+        }
+        let names = names.unwrap_or(&self.names);
         let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;
         let mine: Vec<u64> = adapter
             .iter()

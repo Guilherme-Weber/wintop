@@ -113,6 +113,9 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 format!("{} logical: {}", v.len(), list.join(" "))
             });
             r.line("Kernel share", &c.kernel, |v| pct(*v));
+            r.line("Kernel per logical processor", &c.kernel_per_logical, |v| {
+                format!("{} logical", v.len())
+            });
             r.line("Current speed", &c.freq_mhz, |v| format!("{v:.0} MHz"));
             r.line("Processes / threads / handles", &c.counts, |n| {
                 format!("{} / {} / {}", n.processes, n.threads, n.handles)

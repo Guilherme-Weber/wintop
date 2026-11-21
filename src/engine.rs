@@ -174,7 +174,7 @@ impl Engine {
                 .name("coleta-rapida".into())
                 .spawn(move || {
                     // Cada coletor já roda sob catch_unwind; este cobre o resto da thread.
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let r = catch_unwind(AssertUnwindSafe(|| {
                         let mut c = FastCollectors::new(nvml_fast);
                         if sh.stopping.load(Ordering::Relaxed) {
                             return;
@@ -199,6 +199,12 @@ impl Engine {
                             }
                         }
                     }));
+                    // Pânico fora dos coletores: a falha aparece (a tela não congela no último dado).
+                    if r.is_err() {
+                        let mut st = sh.lock();
+                        st.fast = Some(Fast::failed("fast collection thread panicked"));
+                        st.fast_seq += 1;
+                    }
                 })
                 .expect("failed to create the fast collection thread")
         };
@@ -225,7 +231,7 @@ impl Engine {
             std::thread::Builder::new()
                 .name("coleta-lenta".into())
                 .spawn(move || {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let r = catch_unwind(AssertUnwindSafe(|| {
                         let mut c = SlowCollectors::new(nvml_slow);
                         let mut next = Instant::now();
                         loop {
@@ -245,6 +251,12 @@ impl Engine {
                             }
                         }
                     }));
+                    // Pânico fora dos coletores: a falha aparece (a tela não congela no último dado).
+                    if r.is_err() {
+                        let mut st = sh.lock();
+                        st.slow = Some(Slow::failed("slow collection thread panicked"));
+                        st.slow_seq += 1;
+                    }
                 })
                 .expect("failed to create the slow collection thread")
         };

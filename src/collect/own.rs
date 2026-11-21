@@ -8,7 +8,7 @@ use windows::Win32::System::ProcessStatus::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
 
-use crate::model::{Metric, OwnUsage, fail};
+use crate::model::{Metric, Missing, OwnUsage, fail};
 use crate::win::filetime;
 
 pub struct OwnCollector {
@@ -97,8 +97,11 @@ impl OwnCollector {
                     )
                 };
                 match r {
+                    // Windows 10: o working set privado sai da lista de processos (sem abrir
+                    // nada; ~1 ms por coleta).
                     Ok(()) => (
-                        fail(format!("private working set needs Windows 11 22H2+ ({e2})")),
+                        super::procs::private_ws_of(std::process::id())
+                            .map_err(|e| Missing::Fail(format!("{e} (EX2: {e2})"))),
                         Ok(ex.PrivateUsage as u64),
                     ),
                     Err(e) => (

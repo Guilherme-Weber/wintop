@@ -159,7 +159,10 @@ fn is_pool_member(layout: &[u8]) -> bool {
     if u32_at(layout, L_STYLE) != Some(STYLE_GPT) {
         return false;
     }
-    let count = u32_at(layout, L_COUNT).unwrap_or(0) as usize;
+    // O número de partições não passa do que cabe no buffer (entrada corrompida não vira um
+    // laço de bilhões de voltas).
+    let fits = layout.len().saturating_sub(L_ENTRIES) / P_SIZE;
+    let count = (u32_at(layout, L_COUNT).unwrap_or(0) as usize).min(fits);
     (0..count).any(|i| {
         let t = L_ENTRIES + i * P_SIZE + P_GPT_TYPE;
         layout.get(t..t + 16) == Some(&SPACES_PROTECTIVE[..])
@@ -654,6 +657,63 @@ impl DiskCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contagem_de_particoes_corrompida_nao_trava() {
+        let mut l = vec![0u8; L_ENTRIES + P_SIZE];
+        l[L_STYLE..L_STYLE + 4].copy_from_slice(&STYLE_GPT.to_le_bytes());
+        l[L_COUNT..L_COUNT + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let t = std::time::Instant::now();
+        assert!(!is_pool_member(&l));
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// Carga conhecida: 256 MB gravados sem cache (`FILE_FLAG_NO_BUFFERING` +
+    /// `WRITE_THROUGH`) na pasta temporária; o disco dela mostra pelo menos isso de escrita.
+    #[test]
+    #[ignore = "mede carga real de disco: rodar sozinho (--test-threads=1)"]
+    fn escrita_conhecida_no_disco() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        const MB: usize = 1 << 20;
+        let dir = std::env::temp_dir();
+        let letter =
+            crate::win::drive_letter(&dir.to_string_lossy()).expect("letra da pasta temporária");
+        let mut c = DiskCollector::new();
+        c.read().expect("1ª leitura");
+        let t0 = std::time::Instant::now();
+        let path = dir.join(format!("wintop_disk_{}.bin", std::process::id()));
+        {
+            // Buffer alinhado a 4 KiB (exigência do NO_BUFFERING).
+            let raw = vec![7u8; MB + 4096];
+            let off = raw.as_ptr().align_offset(4096);
+            let block = &raw[off..off + MB];
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(0x2000_0000 | 0x8000_0000) // NO_BUFFERING | WRITE_THROUGH
+                .open(&path)
+                .expect("arquivo sem cache");
+            for _ in 0..256 {
+                f.write_all(block).expect("gravação");
+            }
+        }
+        let list = c.read().expect("2ª leitura");
+        let secs = t0.elapsed().as_secs_f64();
+        let _ = std::fs::remove_file(&path);
+        let d = list
+            .iter()
+            .find(|d| d.letters.iter().any(|l| l.starts_with(letter)))
+            .expect("disco da pasta temporária");
+        let written = d.write.clone().expect("escrita") * secs / MB as f64;
+        println!(
+            "disco {} ({letter}:): ~{written:.0} MB gravados em {secs:.2} s",
+            d.number
+        );
+        assert!(written >= 250.0, "{written} MB");
+        assert!(d.active.clone().expect("atividade") > 0.0);
+    }
 
     fn perf(read: u64, idle: u64, reads: u32, time: u64, query: u64) -> Vec<u8> {
         let mut b = vec![0u8; PERF_SIZE];

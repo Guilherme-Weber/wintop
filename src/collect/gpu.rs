@@ -382,7 +382,11 @@ impl GpuSlowCollector {
 
     /// `detail`: aba GPU visível (lista de processos por GPU, com as engines coletadas aqui).
     /// `names`: PID → nome (da lista de processos, quando já coletada; senão o Toolhelp).
-    pub fn read(&mut self, detail: bool, names: &HashMap<u32, String>) -> Metric<Vec<GpuSlow>> {
+    pub fn read(
+        &mut self,
+        detail: bool,
+        names: Option<&HashMap<u32, String>>,
+    ) -> Metric<Vec<GpuSlow>> {
         let nvml = self
             .nvml
             .as_ref()
@@ -429,7 +433,13 @@ impl GpuSlowCollector {
                         let l = luid.clone()?;
                         collected.clone().or_else(fail)?;
                         let mem = self.vram.per_process_detail(&l).or_else(fail)?;
-                        Ok(gpu_procs(&mem, rows, &l, names))
+                        let list = gpu_procs(&mem, rows, &l, names.unwrap_or(&self.vram.names));
+                        // Engines em falha e nenhum processo com VRAM: a lista vazia esconderia
+                        // a causa.
+                        match rows {
+                            Err(e) if list.is_empty() => Err(e.clone()),
+                            _ => Ok(list),
+                        }
                     });
                     GpuSlow {
                         index,

@@ -57,25 +57,31 @@ fn event_loop(
     let mut dirty = true;
     let mut last_second = (u16::MAX, 0, 0);
     while !stop.load(Ordering::SeqCst) {
+        // Cada redesenho também acorda o terminal (que conta no orçamento de CPU): as fontes
+        // fora de fase esperam o próximo tick da coleta rápida quando a tela não depende delas.
         let u = engine.updates(&mut seen);
+        let overview = st.tab == view::Tab::Overview;
         if let Some(f) = u.fast {
             st.push_fast(f);
             dirty = true;
         }
         if let Some(s) = u.slow {
             st.push_slow(s);
-            dirty = true;
+            // Na aba Geral (temperaturas, PCIe) espera o tick; nas outras é o dado da aba.
+            dirty |= !overview;
         }
         if let Some(s) = u.fps {
             st.push_fps(s);
-            dirty = true;
+            // O número de FPS muda a cada 250 ms, mas só aparece na aba Geral.
+            dirty |= overview;
         }
-        // Relógio da barra de abas: redesenha quando o segundo muda.
+        // Relógio da barra de abas: o tick da coleta já redesenha a cada segundo; só com um
+        // intervalo maior o relógio pede redesenho próprio.
         let now = clock();
         if now != last_second {
             last_second = now;
             st.clock = format!("{:02}:{:02}:{:02}", now.0, now.1, now.2);
-            dirty = true;
+            dirty |= st.interval_ms > 1000;
         }
         if dirty {
             terminal.draw(|f| view::draw(f, &mut st))?;

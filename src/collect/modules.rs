@@ -51,13 +51,30 @@ pub fn classify<'a>(modules: impl Iterator<Item = &'a str>) -> Vec<&'static str>
     out
 }
 
-/// Runtimes do processo `pid`. `hooked`: PIDs com o hook do RTSS (recusados sem abrir).
-pub fn runtimes(pid: u32, hooked: &[u32]) -> Metric<Vec<&'static str>> {
+/// Runtimes do processo `pid`, que a interface mostrava com o nome `name`. `hooked`: PIDs com
+/// o hook do RTSS na última amostra da thread do RTSS.
+///
+/// Antes de abrir: (1) `hooked`; (2) a Shared Memory do RTSS relida agora (um jogo que abriu
+/// depois da última amostra); (3) o PID ainda é o mesmo processo (PID reaproveitado por um
+/// jogo novo). Qualquer dúvida = não abre. Fica o caso de um jogo que o RTSS não engancha
+/// (perfil excluído): por isso a leitura é só sob demanda, nunca automática.
+pub fn runtimes(pid: u32, name: &str, hooked: &[u32]) -> Metric<Vec<&'static str>> {
+    const SKIP: &str = "skipped: 3D app hooked by RTSS (anticheat safety)";
     if hooked.contains(&pid) {
-        return neutral("skipped: 3D app hooked by RTSS (anticheat safety)");
+        return neutral(SKIP);
     }
     if pid <= 4 {
         return neutral("protected");
+    }
+    match super::rtss::hooked_now() {
+        Ok(now) if now.contains(&pid) => return neutral(SKIP),
+        Ok(_) => {}
+        Err(e) => return neutral(format!("skipped: {e} (anticheat safety)")),
+    }
+    match super::procs::name_of(pid) {
+        Ok(Some(n)) if n == name => {}
+        Ok(_) => return neutral("process changed: select it again"),
+        Err(e) => return fail(e),
     }
     // ERROR_PARTIAL_COPY: o processo ainda está carregando módulos; uma nova tentativa basta.
     let mut last = String::new();
@@ -114,16 +131,28 @@ mod tests {
     #[test]
     fn processo_com_hook_nem_e_aberto() {
         assert_eq!(
-            runtimes(1234, &[1234]),
+            runtimes(1234, "game.exe", &[1234]),
             neutral("skipped: 3D app hooked by RTSS (anticheat safety)")
         );
-        assert_eq!(runtimes(4, &[]), neutral("protected"));
+        assert_eq!(runtimes(4, "System", &[]), neutral("protected"));
     }
 
+    fn my_name() -> String {
+        super::super::procs::name_of(std::process::id())
+            .expect("lista")
+            .expect("o próprio processo")
+    }
+
+    /// Com o RTSS aberto: o próprio processo (sem hook) é lido; com outro nome, recusado.
     #[test]
+    #[ignore = "hardware: precisa do RTSS aberto"]
     fn o_proprio_processo() {
-        let r = runtimes(std::process::id(), &[]).expect("módulos do próprio processo");
+        let r = runtimes(std::process::id(), &my_name(), &[]).expect("módulos do próprio processo");
         // O executável de teste não carrega runtime de GPU.
         assert!(!r.contains(&"CUDA"), "{r:?}");
+        assert_eq!(
+            runtimes(std::process::id(), "outro.exe", &[]),
+            neutral("process changed: select it again")
+        );
     }
 }

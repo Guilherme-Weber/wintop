@@ -561,9 +561,20 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .and_then(|l| l.first())
         .map(|g| g.vram.clone());
     let r0 = Rect::new(inner.x, inner.y, inner.width, 1);
-    match (&vram, &gpu) {
-        (Some(Ok(b)), Some(g)) => vram_bar(frame, r0, b, game, &g.dedicated),
-        (Some(Err(e)), _) => note(frame, r0, missing(e)),
+    let fast_gpu_err = st
+        .fast
+        .as_ref()
+        .and_then(|f| f.gpus.as_ref().err().cloned());
+    match (&vram, &gpu, &fast_gpu_err) {
+        (Some(Ok(b)), Some(g), _) => vram_bar(frame, r0, b, game, &g.dedicated),
+        (Some(Err(e)), _, _) | (_, _, Some(e)) => {
+            note(frame, r0, label("VRAM "));
+            note(
+                frame,
+                Rect::new(inner.x + 5, inner.y, inner.width.saturating_sub(5), 1),
+                missing(e),
+            );
+        }
         _ => note(frame, r0, label("VRAM: waiting")),
     }
     if let Some(g) = &gpu {
@@ -588,9 +599,19 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             inner,
         );
     }
-    // Detalhe do selecionado embaixo (2 linhas); a tabela fica com o meio.
+    // Detalhe do selecionado embaixo (linhas quebradas, nada cortado); a tabela fica com o
+    // meio. A seleção é resolvida antes, para o detalhe ser do processo que vai aparecer.
     let table_y = inner.y + 3;
-    let table_h = inner.height.saturating_sub(3 + 3);
+    let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
+    let estimate = usize::from(inner.height.saturating_sub(3 + 1 + 3));
+    let (first_sel, _) = st.gpu_cursor.resolve(&pids, estimate);
+    let detail = gpu_detail(
+        st,
+        first_sel.and_then(|i| rows.get(i).copied()),
+        inner.width,
+    );
+    let detail_h = (detail.len() as u16).clamp(2, inner.height.saturating_sub(5).max(2));
+    let table_h = inner.height.saturating_sub(3 + 1 + detail_h);
     let widths = fit(&GPU_COLS, inner.width);
     put(
         frame,
@@ -599,7 +620,6 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         inner,
     );
     let body_h = usize::from(table_h.saturating_sub(1));
-    let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
     let (sel, offset) = st.gpu_cursor.resolve(&pids, body_h);
     let procs: std::collections::HashMap<u32, &Proc> = match &st.procs {
         Some(Ok(l)) => l.iter().map(|p| (p.pid, p)).collect(),
@@ -654,45 +674,11 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             inner,
         );
     }
-    // Detalhe: engines do selecionado (todas) e runtimes.
-    let detail_y = inner.y + inner.height - 2;
-    let sel_p = sel.and_then(|i| rows.get(i));
-    let mut l1 = vec![];
-    let mut l2 = vec![];
-    if let Some(p) = sel_p {
-        l1.push(text(format!("{} ({})", printable(&p.name), p.pid)).add_modifier(Modifier::BOLD));
-        l1.push(label("  engines "));
-        match &p.engines {
-            Ok(list) if list.iter().any(|(_, v)| *v >= 0.05) => {
-                let parts: Vec<String> = list
-                    .iter()
-                    .filter(|(_, v)| *v >= 0.05)
-                    .map(|(k, v)| format!("{} {}%", printable(k), num(*v, 1)))
-                    .collect();
-                l1.push(text(parts.join(" · ")));
-            }
-            Ok(_) => l1.push(label("idle")),
-            Err(e) => l1.push(missing(e)),
-        }
-        l2.push(label("runtimes "));
-        match st
-            .runtimes
-            .get(&p.pid)
-            .filter(|(n, _)| n == &p.name)
-            .map(|(_, r)| r)
-        {
-            Some(Ok(r)) if r.is_empty() => l2.push(label("none of the known GPU runtimes")),
-            Some(Ok(r)) => l2.push(text(r.join(", "))),
-            Some(Err(e)) => l2.push(missing(e)),
-            None => l2.push(label(
-                "press enter to read the loaded modules (never on RTSS-hooked apps)",
-            )),
-        }
-    }
-    for (k, spans) in [l1, l2].into_iter().enumerate() {
+    let detail_y = inner.y + inner.height - detail_h;
+    for (k, l) in detail.into_iter().take(usize::from(detail_h)).enumerate() {
         put(
             frame,
-            Paragraph::new(Line::from(spans)),
+            Paragraph::new(l),
             Rect::new(inner.x, detail_y + k as u16, inner.width, 1),
             inner,
         );
@@ -707,6 +693,55 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         Rect::new(inner.x, detail_y - 1, inner.width, 1),
         inner,
     );
+}
+
+/// Detalhe da aba GPU: engines do selecionado (todas), runtimes e a falha da lista de
+/// processos (sem ela, a coluna "CPU% · RAM" fica com "-"), quebrados em `width`.
+fn gpu_detail(st: &State, sel: Option<&GpuProc>, width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if let Some(p) = sel {
+        let mut l1 =
+            vec![text(format!("{} ({})", printable(&p.name), p.pid)).add_modifier(Modifier::BOLD)];
+        l1.push(label("  engines"));
+        match &p.engines {
+            Ok(list) if list.iter().any(|(_, v)| *v >= 0.05) => {
+                for (i, (k, v)) in list.iter().filter(|(_, v)| *v >= 0.05).enumerate() {
+                    let sepr = if i == 0 { " " } else { " · " };
+                    l1.push(text(format!("{sepr}{} {}%", printable(k), num(*v, 1))));
+                }
+            }
+            Ok(_) => l1.push(label(" idle")),
+            Err(e) => {
+                l1.push(Span::raw(" "));
+                l1.push(missing(e));
+            }
+        }
+        out.extend(super::wrap(l1, width, 0, 2));
+        let mut l2 = vec![label("runtimes ")];
+        match st
+            .runtimes
+            .get(&p.pid)
+            .filter(|(n, _)| n == &p.name)
+            .map(|(_, r)| r)
+        {
+            Some(Ok(r)) if r.is_empty() => l2.push(label("none of the known GPU runtimes")),
+            Some(Ok(r)) => l2.push(text(r.join(", "))),
+            Some(Err(e)) => l2.push(missing(e)),
+            None => l2.push(label(
+                "press enter to read the loaded modules (never on RTSS-hooked apps)",
+            )),
+        }
+        out.extend(super::wrap(l2, width, 0, 2));
+    }
+    if let Some(Err(e)) = &st.procs {
+        out.extend(super::wrap(
+            vec![label("CPU% · RAM "), missing(e)],
+            width,
+            0,
+            2,
+        ));
+    }
+    out
 }
 
 // --- Sensores ---
@@ -872,7 +907,14 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
     let disks = "Disks";
     match st.slow.as_ref().map(|s| &s.disk_temps) {
         Some(Ok(list)) => {
-            for t in list {
+            // Disco que saiu da coleta rápida (USB removido): a leitura velha da lenta não
+            // aparece.
+            let present = |n: u32| {
+                f.disks
+                    .as_ref()
+                    .map_or(true, |l| l.iter().any(|d| d.number == n))
+            };
+            for t in list.iter().filter(|t| present(t.number)) {
                 // Só exibe a leitura do disco certo (o modelo confere com o da coleta rápida).
                 let model = f
                     .disks
@@ -941,15 +983,41 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         let cw = (inner.width.saturating_sub(gap * (ncols as u16 - 1))) / ncols as u16;
         (cw, fit(&SENSOR_COLS, cw))
     };
-    let first = {
-        let (cw, w) = geometry(1);
-        sensor_layout(&rows, h, split, |i| cause_lines(&rows[i], cw, &w).len())
-    };
-    let (cw, widths) = geometry(first.len().clamp(1, fits));
-    let layout = sensor_layout(&rows, h, split, |i| {
-        cause_lines(&rows[i], cw, &widths).len()
-    });
-    let ncols = layout.len().clamp(1, fits);
+    // Repete até o número de colunas parar de mudar (cada passo só aumenta; teto em `fits`).
+    let mut ncols = 1;
+    let (mut cw, mut widths, mut layout);
+    loop {
+        (cw, widths) = geometry(ncols);
+        layout = sensor_layout(&rows, h, split, |i| {
+            sensor_lines(&rows[i], cw, &widths, st)
+                .len()
+                .saturating_sub(1)
+        });
+        let want = layout.len().clamp(1, fits);
+        if want <= ncols {
+            break;
+        }
+        ncols = want;
+    }
+    // Não cabem nem com as colunas mais estreitas: a última linha avisa quantos ficaram fora.
+    let hidden: usize = layout
+        .iter()
+        .skip(ncols)
+        .flatten()
+        .filter(|it| matches!(it, SensorItem::Row(_)))
+        .count();
+    if hidden > 0
+        && let Some(last) = layout.get_mut(ncols - 1)
+    {
+        // A linha do aviso sai da última coluna: o que estava nela também conta.
+        let keep = h.saturating_sub(1).min(last.len());
+        let dropped = last[keep..]
+            .iter()
+            .filter(|it| matches!(it, SensorItem::Row(_)))
+            .count();
+        last.truncate(keep);
+        last.push(SensorItem::More(hidden + dropped));
+    }
     for (col_i, items) in layout.iter().enumerate().take(ncols) {
         let x = inner.x + col_i as u16 * (cw + gap);
         put(
@@ -962,6 +1030,10 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             let at = Rect::new(x, inner.y + 1 + y as u16, cw, 1);
             let r = match item {
                 SensorItem::Blank => continue,
+                SensorItem::More(n) => {
+                    note(frame, at, label(&format!("+{n} more (taller terminal)")));
+                    continue;
+                }
                 SensorItem::Title(i, cont) => {
                     let t = if *cont {
                         format!("{} (cont.)", printable(&rows[*i].group))
@@ -980,14 +1052,19 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     continue;
                 }
                 SensorItem::Cause(i, k) => {
-                    if let Some(l) = cause_lines(&rows[*i], cw, &widths).into_iter().nth(*k) {
+                    if let Some(l) = sensor_lines(&rows[*i], cw, &widths, st)
+                        .into_iter()
+                        .nth(*k + 1)
+                    {
                         put(frame, Paragraph::new(l), at, inner);
                     }
                     continue;
                 }
                 SensorItem::Row(i) => &rows[*i],
             };
-            sensor_line(frame, at, inner, r, &widths, st);
+            if let Some(l) = sensor_lines(r, cw, &widths, st).into_iter().next() {
+                put(frame, Paragraph::new(l), at, inner);
+            }
         }
     }
 }
@@ -999,8 +1076,10 @@ pub(super) enum SensorItem {
     /// Título do grupo do sensor `i`; `true` = continuação de outra coluna.
     Title(usize, bool),
     Row(usize),
-    /// Linha `k` da causa (longa) da falha do sensor `i`, embaixo dele.
+    /// Linha `k` (a partir da 2ª) do sensor `i`: nome ou valor longo quebrado.
     Cause(usize, usize),
+    /// Sensores que não couberam (só na última coluna).
+    More(usize),
 }
 
 /// Espaço das colunas de valor, mínimo e máximo (com as folgas).
@@ -1013,17 +1092,68 @@ fn value_room(widths: &[Option<u16>]) -> usize {
         .saturating_sub(1)
 }
 
-/// Sensor sem valor cuja causa não cabe nas colunas de valor: a causa inteira vai para as
-/// linhas de baixo (quebrada por palavra, nunca cortada).
-fn cause_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>]) -> Vec<Line<'static>> {
-    let (SensorValue::Num(Err(m), ..) | SensorValue::Text(Err(m))) = &r.value else {
-        return Vec::new();
-    };
-    let span = missing(m);
-    if span.width() <= value_room(widths) {
-        return Vec::new();
+/// O valor do sensor como texto (número com unidade, texto, estado ou falha).
+fn value_span(r: &SensorRow) -> Span<'static> {
+    match &r.value {
+        SensorValue::Num(m, unit, dec) => metric(m, |v| format!("{} {unit}", num(*v, *dec))),
+        SensorValue::Text(m) => metric(m, Clone::clone),
     }
-    super::wrap(vec![span], cw, 2, 2)
+}
+
+/// Todas as linhas de um sensor, nada cortado: na forma comum, uma linha (nome, valor, mínimo,
+/// máximo). Nome mais largo que a coluna: o nome quebra nas linhas de cima e os valores vêm na
+/// última. Valor (ou causa) mais largo que as colunas de valor: vai inteiro para as linhas de
+/// baixo, quebrado por palavra.
+fn sensor_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>], st: &State) -> Vec<Line<'static>> {
+    let (value, lo, hi) = match &r.value {
+        SensorValue::Num(_, unit, dec) => {
+            let f = |v: f64| format!("{} {unit}", num(v, *dec));
+            let mm = r
+                .key()
+                .and_then(|k| st.session.sensors.get(&k).copied())
+                .and_then(super::MinMax::get);
+            let (lo, hi) = mm.map_or((String::new(), String::new()), |(a, b)| (f(a), f(b)));
+            (value_span(r), lo, hi)
+        }
+        SensorValue::Text(_) => (value_span(r), String::new(), String::new()),
+    };
+    let name = printable(&r.name);
+    let name_w = usize::from(widths[0].unwrap_or(0));
+    let mut out = Vec::new();
+    let name_fits = Span::raw(name.as_str()).width() <= name_w;
+    if !name_fits {
+        out.extend(super::wrap(vec![text(name.clone())], cw, 0, 2));
+    }
+    let shown_name = if name_fits { name } else { String::new() };
+    let room = value_room(widths);
+    if value.width() > room {
+        if name_fits {
+            out.push(Line::from(Span::styled(shown_name, Style::new().fg(TEXT))));
+        }
+        out.extend(super::wrap(vec![value], cw, 2, 2));
+    } else if value.width() > usize::from(widths[1].unwrap_or(0)) {
+        // Valor que não cabe na coluna dele ocupa também as de mínimo e máximo.
+        out.push(Line::from(vec![
+            Span::styled(
+                cell(&shown_name, name_w as u16, false),
+                Style::new().fg(TEXT),
+            ),
+            Span::raw(" "),
+            Span::styled(cell(&value.content, room as u16, true), value.style),
+        ]));
+    } else {
+        out.push(row(
+            &SENSOR_COLS,
+            widths,
+            vec![
+                plain(shown_name),
+                (value.content.to_string(), value.style),
+                dim(lo),
+                dim(hi),
+            ],
+        ));
+    }
+    out
 }
 
 /// Distribui os sensores em colunas de `h` linhas (puro, para teste).
@@ -1069,56 +1199,4 @@ pub(super) fn sensor_layout(
         }
     }
     cols
-}
-
-fn sensor_line(
-    frame: &mut Frame<'_>,
-    at: Rect,
-    inner: Rect,
-    r: &SensorRow,
-    widths: &[Option<u16>],
-    st: &State,
-) {
-    let (value, lo, hi) = match &r.value {
-        SensorValue::Num(m, unit, dec) => {
-            let f = |v: f64| format!("{} {unit}", num(v, *dec));
-            let mm = r
-                .key()
-                .and_then(|k| st.session.sensors.get(&k).copied())
-                .and_then(super::MinMax::get);
-            let v = metric(m, |v| f(*v));
-            let (lo, hi) = mm.map_or((String::new(), String::new()), |(a, b)| (f(a), f(b)));
-            (v, lo, hi)
-        }
-        SensorValue::Text(m) => (metric(m, Clone::clone), String::new(), String::new()),
-    };
-    // Valor com falha (texto longo) ocupa as colunas de valor, mínimo e máximo; se nem assim
-    // couber, a linha fica só com o nome e a causa vai para as linhas de baixo.
-    let room = value_room(widths);
-    let cells = if value.width() > room {
-        Line::from(Span::styled(printable(&r.name), Style::new().fg(TEXT)))
-    } else if value.width() > usize::from(widths[1].unwrap_or(0)) {
-        let mut l = vec![Span::styled(
-            cell(&printable(&r.name), widths[0].unwrap_or(0), false),
-            Style::new().fg(TEXT),
-        )];
-        l.push(Span::raw(" "));
-        l.push(Span::styled(
-            cell(&value.content, room as u16, true),
-            value.style,
-        ));
-        Line::from(l)
-    } else {
-        row(
-            &SENSOR_COLS,
-            widths,
-            vec![
-                plain(printable(&r.name)),
-                (value.content.to_string(), value.style),
-                dim(lo),
-                dim(hi),
-            ],
-        )
-    };
-    put(frame, Paragraph::new(cells), at, inner);
 }

@@ -9,7 +9,7 @@
 //! - 1% e 0,1% low = 1000 / S quando os engasgos são >= 1% dos frames (N <= 100).
 //!
 //! Uso: `cargo run --release --example fps_probe -- [--fps 100] [--stutter-every 100]
-//! [--stutter-ms 50] [--vram-mb 256] [--seconds 30]`
+//! [--stutter-ms 50] [--vram-mb 256] [--seconds 30] [--freeze-at 8 --freeze-ms 1500]`
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,9 @@ struct Args {
     stutter_ms: f64,
     vram_mb: u32,
     seconds: f64,
+    /// Um congelamento único de `freeze_ms` aos `freeze_at` segundos (0 = nenhum).
+    freeze_at: f64,
+    freeze_ms: f64,
 }
 
 fn num<T: std::str::FromStr>(key: &str, val: &str) -> T {
@@ -59,6 +62,8 @@ fn args() -> Args {
         stutter_ms: 50.0,
         vram_mb: 256,
         seconds: 30.0,
+        freeze_at: 0.0,
+        freeze_ms: 0.0,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     for p in v.chunks(2) {
@@ -69,6 +74,8 @@ fn args() -> Args {
             "--stutter-ms" => a.stutter_ms = num(&p[0], val),
             "--vram-mb" => a.vram_mb = num(&p[0], val),
             "--seconds" => a.seconds = num(&p[0], val),
+            "--freeze-at" => a.freeze_at = num(&p[0], val),
+            "--freeze-ms" => a.freeze_ms = num(&p[0], val),
             o => panic!("unknown argument {o}"),
         }
     }
@@ -226,6 +233,7 @@ fn main() -> windows::core::Result<()> {
         let end = start + Duration::from_secs_f64(a.seconds);
         let mut next = start;
         let mut frame: u64 = 0;
+        let mut frozen = false;
         let mut msg = MSG::default();
         while Instant::now() < end {
             while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -236,7 +244,12 @@ fn main() -> windows::core::Result<()> {
                 DispatchMessageW(&raw const msg);
             }
             frame += 1;
-            let ms = if frame.is_multiple_of(u64::from(a.stutter_every.max(1))) {
+            let freeze =
+                a.freeze_ms > 0.0 && !frozen && (next - start).as_secs_f64() >= a.freeze_at;
+            frozen |= freeze;
+            let ms = if freeze {
+                a.freeze_ms
+            } else if frame.is_multiple_of(u64::from(a.stutter_every.max(1))) {
                 a.stutter_ms
             } else {
                 t

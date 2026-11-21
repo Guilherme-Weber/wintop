@@ -120,7 +120,7 @@ aberto antes do wintop)"** até o jogo reiniciar.
 | API 3D | `dwFlags & 0xFFFF` | | | Spike |
 | Resolução | `dwResolutionX/Y` (v2.20+) | | | Spike |
 | FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (pipe e SHM) |
-| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock); E6 (fps_probe, frametime pelo pipe: 10-50 ms programados = 8,5-50,3 ms medidos, diferença do jitter do próprio probe) |
+| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock); E6 (fps_probe, frametime pelo pipe: 10-50 ms programados = 8,5-50,3 ms medidos, diferença do jitter do próprio probe); congelamento de 1,5 s: FPS cai já nas amostras de 250 ms (68 → 46 → 20) e depois "sem frames no último segundo"; probe aberto antes: "aprox.", FPS 92,14 × 92,59 |
 | 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s); E6 (fps_probe: 1% low 19,96 e 0,1% low 19,90 × 20,00 esperado; FPS 92,62 × 92,59) |
 | Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
 | RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 (só no modo normal; o `--check` não inicia o RTSS nem cria o pipe) |
@@ -129,7 +129,7 @@ aberto antes do wintop)"** até o jogo reiniciar.
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Nome, PID, CPU %, memória (working set privado, como a coluna "Memory" do Task Manager; commit privado), threads, handles, I/O de leitura/escrita por segundo | `NtQuerySystemInformation(SystemProcessInformation)` (uma chamada, sem abrir nenhum processo; thread lenta, só com a aba Processos ou GPU visível); CPU = Δ(kernel + user) ÷ Δ tempo do sistema | | "waiting for the first collection" (aba recém-aberta) | E6 (carga conhecida: 1 lógico ocupado = 6,25% × 6,25% esperado; 64 MB gravados = 64,0 MB) |
+| Nome, PID, CPU %, memória (working set privado, como a coluna "Memory" do Task Manager; commit privado), threads, handles, I/O de leitura/escrita por segundo | `NtQuerySystemInformation(SystemProcessInformation)` (uma chamada, sem abrir nenhum processo; thread lenta, só com a aba Processos ou GPU visível); CPU = Δ(kernel + user) ÷ Δ tempo do sistema | | "waiting for the first collection" (aba recém-aberta) | E6 (carga conhecida: 1 lógico ocupado = 6,25% × 6,25% esperado; 64 MB gravados = 64,0 MB; 512 MB alocados = +512 MB de working set privado) |
 
 ## Sensores (aba)
 
@@ -144,4 +144,4 @@ seções acima; nenhuma fonte nova. Prova: E6 (aba conferida em tela cheia).
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Estado de cada fonte (OK, falha e motivo) | coletores | | | E1 (`wintop --check`) |
-| Consumo do próprio wintop (CPU, RAM) | `GetProcessTimes` ÷ tempo total do sistema (`GetSystemTimes`); `GetProcessMemoryInfo` (`PROCESS_MEMORY_COUNTERS_EX2`: working set privado = coluna "Memory" do Task Manager, e memória confirmada) | | | E4 (= contadores do Windows: 0,015% × 0,014% em 120 s; 25,8 MB × 25,8 MB) |
+| Consumo do próprio wintop (CPU, RAM) | `GetProcessTimes` ÷ tempo total do sistema (`GetSystemTimes`); `GetProcessMemoryInfo` (`PROCESS_MEMORY_COUNTERS_EX2`: working set privado = coluna "Memory" do Task Manager, e memória confirmada; antes do Windows 11 22H2 o working set privado vem da lista de processos) | | | E4 (= contadores do Windows: 0,015% × 0,014% em 120 s; 25,8 MB × 25,8 MB) |

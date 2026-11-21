@@ -13,7 +13,7 @@ mod own;
 mod pawnio;
 #[cfg(test)]
 mod probe_tests;
-mod procs;
+pub mod procs;
 pub mod rtss;
 mod vram;
 
@@ -196,13 +196,28 @@ impl SlowCollectors {
                 took: start.elapsed(),
             };
         }
+        // Aba trocada entre Processos e GPU logo depois de uma leitura: a taxa precisa de uma
+        // janela mínima (senão o tempo do sistema nem avançou um tick e a CPU sai 0%).
+        if want_procs
+            && let Some(left) = TAB_WARMUP.checked_sub(self.procs.since_last())
+            && nap(left, stop)
+        {
+            return Slow {
+                gpus: fail("stopping"),
+                disk_temps: fail("stopping"),
+                procs: None,
+                took: start.elapsed(),
+            };
+        }
         let procs = want_procs.then(|| guarded("process", || self.procs.read()));
-        // Nomes dos processos: da lista recém-lida (aba aberta) ou de um snapshot do Toolhelp.
-        let names: std::collections::HashMap<u32, String> = match &procs {
-            Some(Ok(list)) => list.iter().map(|p| (p.pid, p.name.clone())).collect(),
-            _ => vram::process_names(),
+        // Nomes dos processos: da lista recém-lida (aba aberta); senão o cache do coletor.
+        let names: Option<std::collections::HashMap<u32, String>> = match &procs {
+            Some(Ok(list)) => Some(list.iter().map(|p| (p.pid, p.name.clone())).collect()),
+            _ => None,
         };
-        let gpus = run("GPU PCIe", &mut self.gpu, |g| g.read(view.gpu, &names));
+        let gpus = run("GPU PCIe", &mut self.gpu, |g| {
+            g.read(view.gpu, names.as_ref())
+        });
         let disk_temps = run("disk temperature", &mut self.disk_temp, |c| c.read(stop));
         Slow {
             gpus,

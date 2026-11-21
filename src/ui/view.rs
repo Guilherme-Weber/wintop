@@ -265,7 +265,7 @@ impl State {
         };
         let (pid, name) = (rows[i].pid, rows[i].name.clone());
         let r = match self.protected_pids() {
-            Some(p) => crate::collect::modules::runtimes(pid, &p),
+            Some(p) => crate::collect::modules::runtimes(pid, &name, &p),
             None => crate::model::neutral(
                 "skipped: waiting for RTSS to list the hooked apps (anticheat safety)",
             ),
@@ -479,6 +479,14 @@ fn boxed(title: &str, right: &str) -> Block<'static> {
     b
 }
 
+/// Nome da caixa sem valor: a causa entra no título, com a cor do estado (vermelho na falha).
+fn with_failure(b: Block<'static>, e: Option<&Missing>) -> Block<'static> {
+    match e {
+        Some(e) => b.title(Line::from(vec![missing(e), Span::raw(" ")])),
+        None => b,
+    }
+}
+
 /// Desenha um parágrafo recortado a `bound`.
 fn put(frame: &mut Frame<'_>, p: Paragraph<'static>, r: Rect, bound: Rect) {
     frame.render_widget(p, r.intersection(bound));
@@ -541,7 +549,7 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
     // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
     let disk_rows =
-        (disk_order(st).len() + temp_failure_lines(st, right.width.saturating_sub(2)).len()) as u16;
+        (disk_order(st).len() + disk_notes(st, right.width.saturating_sub(2)).len()) as u16;
     let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
@@ -680,35 +688,131 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     frame.render_widget(Paragraph::new(right).right_aligned(), r);
 }
 
-/// Fontes inteiras em falha (coletor sem nenhum dado).
+/// Métrica em falha (estado neutro não conta).
+fn failed<T>(m: &Metric<T>) -> bool {
+    matches!(m, Err(Missing::Fail(_)))
+}
+
+/// Fonte em falha: o coletor inteiro, ou qualquer métrica dela (o que aparece em vermelho na
+/// tela conta no rodapé). `inner`: as métricas da fonte quando o coletor respondeu.
+fn source_failed<T>(m: &Metric<T>, inner: impl FnOnce(&T) -> bool) -> bool {
+    match m {
+        Ok(v) => inner(v),
+        Err(e) => matches!(e, Missing::Fail(_)),
+    }
+}
+
+/// Fontes com alguma falha.
 fn failing_sources(st: &State) -> usize {
-    let fail = |e: &Missing| matches!(e, Missing::Fail(_));
     let mut n = 0;
+    let mut add = |b: bool| n += usize::from(b);
     if let Some(f) = &st.fast {
-        n += usize::from(f.cpu.as_ref().is_err_and(fail));
-        n += usize::from(f.cpu_sensors.as_ref().is_err_and(fail));
-        n += usize::from(f.memory.as_ref().is_err_and(fail));
-        n += usize::from(f.disks.as_ref().is_err_and(fail));
-        n += usize::from(f.nics.as_ref().is_err_and(fail));
-        n += usize::from(f.gpus.as_ref().is_err_and(fail));
-        n += usize::from(f.own.as_ref().is_err_and(fail));
+        add(source_failed(&f.cpu, |c| {
+            failed(&c.name)
+                || failed(&c.topology)
+                || failed(&c.base_mhz)
+                || failed(&c.virtualization)
+                || failed(&c.usage)
+                || failed(&c.per_logical)
+                || failed(&c.kernel_per_logical)
+                || failed(&c.kernel)
+                || failed(&c.freq_mhz)
+                || failed(&c.counts)
+        }));
+        add(source_failed(&f.cpu_sensors, |s| {
+            failed(&s.tctl) || failed(&s.ccds) || failed(&s.package_power)
+        }));
+        add(source_failed(&f.memory, |m| {
+            failed(&m.total)
+                || failed(&m.used)
+                || failed(&m.commit)
+                || failed(&m.cached)
+                || failed(&m.standby)
+                || failed(&m.modified)
+                || failed(&m.paged_pool)
+                || failed(&m.nonpaged_pool)
+                || failed(&m.pagefile_usage)
+        }));
+        add(source_failed(&f.disks, |l| {
+            l.iter().any(|d| {
+                failed(&d.model)
+                    || failed(&d.bus)
+                    || failed(&d.ssd)
+                    || failed(&d.capacity)
+                    || failed(&d.pool_member)
+                    || failed(&d.active)
+                    || failed(&d.read)
+                    || failed(&d.write)
+                    || failed(&d.response)
+            })
+        }));
+        add(source_failed(&f.nics, |l| {
+            l.iter()
+                .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv))
+        }));
+        add(source_failed(&f.gpus, |l| {
+            l.iter().any(|g| {
+                failed(&g.name)
+                    || failed(&g.driver)
+                    || failed(&g.vbios)
+                    || failed(&g.usage)
+                    || failed(&g.mem_activity)
+                    || failed(&g.dedicated)
+                    || failed(&g.shared)
+                    || failed(&g.physical)
+                    || failed(&g.temp)
+                    || failed(&g.temp_slowdown)
+                    || failed(&g.clock_graphics)
+                    || failed(&g.clock_sm)
+                    || failed(&g.clock_mem)
+                    || failed(&g.clock_video)
+                    || failed(&g.power)
+                    || source_failed(&g.fans, |f| {
+                        f.iter().any(|x| failed(&x.percent) || failed(&x.rpm))
+                    })
+                    || failed(&g.pcie_link)
+                    || failed(&g.encoder)
+                    || failed(&g.decoder)
+                    || failed(&g.pstate)
+                    || failed(&g.throttle)
+            })
+        }));
+        add(source_failed(&f.own, |o| {
+            failed(&o.cpu) || failed(&o.private_ws) || failed(&o.commit)
+        }));
     }
+    let mut slow_gpus_failed = false;
     if let Some(s) = &st.slow {
-        n += usize::from(s.gpus.as_ref().is_err_and(fail));
-        n += usize::from(s.disk_temps.as_ref().is_err_and(fail));
+        slow_gpus_failed = s.gpus.is_err();
+        add(source_failed(&s.gpus, |l| {
+            l.iter()
+                .any(|g| failed(&g.pcie_tx) || failed(&g.pcie_rx) || failed(&g.vram))
+        }));
+        add(source_failed(&s.disk_temps, |l| {
+            l.iter().any(|t| failed(&t.celsius))
+        }));
     }
-    // Fontes das abas Processos e GPU (só quando visíveis).
-    n += usize::from(matches!(&st.procs, Some(Err(e)) if fail(e)));
+    // Fontes das abas Processos e GPU (só quando visíveis). A lista da GPU herda a falha da
+    // coleta lenta da GPU, já contada acima.
+    add(matches!(&st.procs, Some(Err(Missing::Fail(_)))));
     match &st.gpu_procs {
-        Some(Err(e)) => n += usize::from(fail(e)),
-        Some(Ok(list)) => {
-            n += usize::from(list.iter().any(|p| p.engines.as_ref().is_err_and(fail)));
-        }
-        None => {}
+        Some(Err(Missing::Fail(_))) if !slow_gpus_failed => add(true),
+        Some(Ok(list)) => add(list.iter().any(|p| failed(&p.engines))),
+        _ => {}
     }
     if let Some(f) = &st.fps {
-        n += usize::from(f.rtss.as_ref().is_err_and(fail));
-        n += usize::from(f.pipe.as_ref().is_err_and(fail));
+        add(failed(&f.rtss));
+        add(failed(&f.pipe));
+        // O jogo sem valor herda a falha do RTSS (já contada): só as métricas dele contam.
+        add(f.game.as_ref().is_ok()
+            && source_failed(&f.game, |g| {
+                failed(&g.resolution)
+                    || failed(&g.fps)
+                    || failed(&g.frametime)
+                    || failed(&g.lows)
+                    || failed(&g.gpu_time)
+                    || failed(&g.bound)
+            }));
     }
     n
 }
@@ -762,12 +866,15 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let name = c
         .name
         .as_ref()
-        .map_or_else(|e| format!("cpu · {e}"), |n| format!("cpu · {n}"));
+        .map_or_else(|_| "cpu".to_string(), |n| format!("cpu · {n}"));
     let per_len = c.per_logical.as_ref().map_or(0, Vec::len);
     // Janela real do gráfico total: 2 amostras por coluna, no intervalo atual.
     let cols = u64::from(total_width(area.width.saturating_sub(2)).saturating_sub(1));
     let secs = cols * 2 * st.interval_ms / 1000;
-    let block = boxed(&name, &format!("total {secs}s · {per_len} logical"));
+    let block = with_failure(
+        boxed(&name, &format!("total {secs}s · {per_len} logical")),
+        c.name.as_ref().err(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Linhas de sensores e topologia.
@@ -775,8 +882,9 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mut l1 = vec![
         label("speed "),
         metric(&c.freq_mhz, |v| format!("{} GHz", num(v / 1000.0, 2))),
+        Span::raw(" "),
         metric(&c.base_mhz, |m| {
-            format!(" (base {})", num(f64::from(*m) / 1000.0, 2))
+            format!("(base {})", num(f64::from(*m) / 1000.0, 2))
         }),
     ];
     match sensors {
@@ -900,7 +1008,7 @@ fn draw_core_grid(
     let rows = n.div_ceil(cols);
     let cw = area.width / cols as u16;
     let ch = area.height / rows as u16;
-    if cw < 8 || ch < 2 {
+    if cw < 9 || ch < 2 {
         // Lista compacta: todos os lógicos, quebrando linha.
         let spans: Vec<Span<'static>> = per
             .iter()
@@ -972,6 +1080,9 @@ fn engine_color(name: &str) -> Color {
     }
 }
 
+/// Largura do painel de engines e extremos da caixa da GPU.
+const PANEL_W: u16 = 30;
+
 fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let gpus = st.fast.as_ref().map(|f| &f.gpus);
     let Some(Ok(list)) = gpus else {
@@ -990,32 +1101,51 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let name = g
         .name
         .as_ref()
-        .map_or_else(|e| format!("gpu · {e}"), |n| format!("gpu · {n}"));
-    let block = boxed(&name, &format!("active: {engine}"));
+        .map_or_else(|_| "gpu".to_string(), |n| format!("gpu · {n}"));
+    let block = with_failure(
+        boxed(&name, &format!("active: {engine}")),
+        g.name.as_ref().err(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let details = gpu_details(st, &g, inner.width);
     let mut bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
     // Painel das engines e dos extremos da sessão.
-    let eng = |name: &str, m: &Metric<u32>| -> (Vec<Span<'static>>, Option<f64>) {
+    let eng = |name: &str, m: &Metric<u32>| -> Vec<(Vec<Span<'static>>, Option<f64>)> {
         let style = if name == engine {
             Style::new().fg(TITLE).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(LABEL)
         };
-        // Falha: a causa usa a linha toda (sem medidor, que mostraria um 0% falso).
+        // Falha: a causa usa a linha toda (sem medidor, que mostraria um 0% falso) e quebra
+        // em mais linhas se não couber no painel.
         match m {
-            Ok(v) => (
+            Ok(v) => vec![(
                 vec![
                     Span::styled(format!("{name:<8}"), style),
                     text(format!("{v:>3}%")),
                 ],
                 Some(f64::from(*v)),
-            ),
-            Err(e) => (
-                vec![Span::styled(format!("{name:<8}"), style), missing(e)],
-                None,
-            ),
+            )],
+            Err(e) => {
+                let words: Vec<Span<'static>> =
+                    std::iter::once(Span::styled(format!("{name:<8}"), style))
+                        .chain(e.to_string().split(' ').enumerate().map(|(i, w)| {
+                            let w = if i == 0 {
+                                format!("! {}", printable(w))
+                            } else {
+                                format!(" {}", printable(w))
+                            };
+                            let mut sp = missing(e);
+                            sp.content = w.into();
+                            sp
+                        }))
+                        .collect();
+                wrap(words, PANEL_W - 1, 0, 8)
+                    .into_iter()
+                    .map(|l| (l.spans, None))
+                    .collect()
+            }
         }
     };
     // Extremos da sessão: "min x · max y unidade" (a unidade só no fim, para caber).
@@ -1037,13 +1167,17 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         v.extend(spans);
         (v, None)
     };
-    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = vec![
+    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = [
         eng("3D", &g.usage),
         eng("encode", &g.encoder),
         eng("decode", &g.decoder),
         eng("mem act", &g.mem_activity),
-        (vec![label("session (r resets)")], None),
-    ];
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let engine_rows = rows.len();
+    rows.push((vec![label("session (r resets)")], None));
     let n0 = |v: f64| num(v, 0);
     rows.push(row("util", mm(st.session.gpu, &n0, "%")));
     rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
@@ -1057,18 +1191,18 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mut session_lines = Vec::new();
     if inner.height.saturating_sub(bottom_h) < rows.len() as u16 {
         let mut spans = vec![label("session")];
-        for (r, _) in rows.drain(5..) {
+        for (r, _) in rows.drain(engine_rows + 1..) {
             spans.push(label("   "));
             spans.extend(r);
         }
-        rows.truncate(4);
+        rows.truncate(engine_rows);
         session_lines = wrap(spans, inner.width, 0, 8);
         bottom_h += session_lines.len() as u16;
     }
     let [top, bottom] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(bottom_h)]).areas(inner);
     let [graph, panel] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(30)]).areas(top);
+        Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_W)]).areas(top);
 
     // Gráfico da engine dominante, com o nome dela no canto.
     let head = if g.usage.is_ok() {
@@ -1220,7 +1354,8 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         vec![
             label("temp  "),
             metric(&g.temp, |v| format!("{v} °C")),
-            metric(&g.temp_slowdown, |v| format!(" (slowdown {v} °C)")),
+            Span::raw(" "),
+            metric(&g.temp_slowdown, |v| format!("(slowdown {v} °C)")),
             sep(),
             label("power "),
             metric(&g.power, |(p, l)| {
@@ -1245,7 +1380,8 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
                     for (i, f) in list.iter().enumerate() {
                         v.extend([
                             label(&format!("fan{i} ")),
-                            metric(&f.percent, |p| format!("{p}% ")),
+                            metric(&f.percent, |p| format!("{p}%")),
+                            Span::raw(" "),
                             metric(&f.rpm, |r| format!("{r} rpm")),
                             sep(),
                         ]);
@@ -1468,8 +1604,8 @@ fn vram_bar(
             num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
         )
     });
-    let text_w = (t.width() as u16).min(area.width / 2);
     let label_w = VRAM_LABEL_W.min(area.width);
+    let text_w = text_room(&t, dedicated.is_err(), area.width, label_w);
     line(frame, vec![label("VRAM  ")], area.x, area.y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     let colored: Vec<(u64, Color)> = parts
@@ -1492,6 +1628,17 @@ fn vram_bar(
     );
 }
 
+/// Largura do texto ao lado de uma barra: com valor, no máximo metade da linha (a barra fica
+/// com o resto); sem valor não há barra, e a causa usa toda a largura depois do rótulo.
+fn text_room(t: &Span<'_>, missing: bool, width: u16, label_w: u16) -> u16 {
+    let w = t.width() as u16;
+    if missing {
+        w.min(width.saturating_sub(label_w))
+    } else {
+        w.min(width / 2)
+    }
+}
+
 /// Linha "rótulo ■■■■ usado/total" dentro de `area`, na linha `row`.
 fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<(u64, u64)>) {
     if row >= area.height {
@@ -1506,8 +1653,8 @@ fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<
             num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
         )
     });
-    let text_w = (t.width() as u16).min(area.width / 2);
     let label_w = (name.len() as u16 + 1).min(area.width);
+    let text_w = text_room(&t, m.is_err(), area.width, label_w);
     line(frame, vec![label(name)], area.x, y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     if let Ok((u, t)) = m {
@@ -1586,7 +1733,19 @@ fn mem_text(st: &State, width: u16) -> Option<MemText> {
                 RAM_LABEL_W,
                 RAM_LABEL_W,
             ),
-            None => Vec::new(),
+            None => wrap(
+                vec![
+                    Span::styled("  ■ ", Style::new().fg(RAM_MODIFIED)),
+                    label("modified "),
+                    metric(&m.modified, |v| short_bytes(*v)),
+                    Span::styled("  ■ ", Style::new().fg(RAM_STANDBY)),
+                    label("standby "),
+                    metric(&m.standby, |v| short_bytes(*v)),
+                ],
+                inner,
+                RAM_LABEL_W,
+                RAM_LABEL_W,
+            ),
         },
     };
     let gb = |v: f64| bytes(v as u64);
@@ -1651,7 +1810,7 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         let row = inner.y + y;
         line(frame, vec![label("pagefile ")], inner.x, row, 9, inner);
         let pt = metric(&m.pagefile_usage, |v| format!(" {}%", num(*v, 1)));
-        let tw = (pt.width() as u16).min(inner.width / 2);
+        let tw = text_room(&pt, m.pagefile_usage.is_err(), inner.width, 9);
         let bw = inner.width.saturating_sub(9 + tw);
         if let Ok(v) = &m.pagefile_usage {
             frame.render_widget(
@@ -1688,7 +1847,7 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
         )
     });
     let label_w = RAM_LABEL_W.min(area.width);
-    let text_w = (t.width() as u16).min(area.width / 2);
+    let text_w = text_room(&t, ram.is_err(), area.width, label_w);
     line(
         frame,
         vec![label("RAM     ")],
@@ -1737,16 +1896,25 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let (down, up): (Vec<_>, Vec<_>) = list
         .iter()
         .partition(|n| matches!(n.link, Err(Missing::Neutral(_))));
-    let reserved = u16::from(!down.is_empty());
+    // Placas que não cabem: a última linha avisa quantas ficaram de fora.
+    let fits = |reserved: u16| usize::from(inner.height.saturating_sub(reserved) / 3).max(1);
+    let mut reserved = u16::from(!down.is_empty());
+    let more = up.len() > fits(reserved);
+    if more && down.is_empty() {
+        reserved = 1;
+    }
+    let shown = up.len().min(fits(reserved));
     let bottom = inner.y + inner.height.saturating_sub(reserved);
-    let per = (inner.height.saturating_sub(reserved) / (up.len().max(1) as u16)).max(3);
+    let per = (inner.height.saturating_sub(reserved) / (shown.max(1) as u16)).max(3);
     const RATE_W: u16 = 34;
     let mut y = inner.y;
-    for n in up {
+    for n in up.iter().take(shown) {
         if y + 2 > bottom {
             break;
         }
-        // Cabeçalho: alias (descrição) à esquerda, link à direita.
+        // Cabeçalho: alias (descrição) à esquerda, link à direita (na largura real dele).
+        let link = Line::from(vec![label("link "), metric(&n.link, |v| bits(*v as f64))]);
+        let link_w = (link.width() as u16).min(inner.width);
         line(
             frame,
             vec![
@@ -1755,16 +1923,12 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ],
             inner.x,
             y,
-            inner.width.saturating_sub(18),
+            inner.width.saturating_sub(link_w + 1),
             inner,
         );
         put(
             frame,
-            Paragraph::new(Line::from(vec![
-                label("link "),
-                metric(&n.link, |v| bits(*v as f64)),
-            ]))
-            .right_aligned(),
+            Paragraph::new(link).right_aligned(),
             Rect::new(inner.x, y, inner.width, 1),
             inner,
         );
@@ -1801,6 +1965,21 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 continue;
             }
             let row = y + 1 + k;
+            // Taxa com falha: a causa usa a linha toda (sem gráfico de zeros).
+            if let Err(e) = m {
+                line(
+                    frame,
+                    vec![
+                        Span::styled(format!(" {arrow} "), Style::new().fg(color)),
+                        missing(e),
+                    ],
+                    inner.x,
+                    row,
+                    inner.width,
+                    inner,
+                );
+                continue;
+            }
             if let Some(s) = series {
                 let data = s.over(n_samples, scale);
                 let g = Graph::new(&data, GraphColor::Fixed(color));
@@ -1828,14 +2007,21 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         y += per;
     }
-    if !down.is_empty() {
+    if !down.is_empty() || more {
         let names: Vec<String> = down.iter().map(|n| printable(&n.alias)).collect();
-        line(
-            frame,
-            vec![
+        let mut spans = Vec::new();
+        if more {
+            spans.push(label(&format!("+{} more  ", up.len() - shown)));
+        }
+        if !names.is_empty() {
+            spans.extend([
                 label("disconnected: "),
                 Span::styled(names.join(", "), Style::new().fg(NEUTRAL)),
-            ],
+            ]);
+        }
+        line(
+            frame,
+            spans,
             inner.x,
             inner.y + inner.height.saturating_sub(1),
             inner.width,
@@ -1885,26 +2071,87 @@ fn pool_folded(st: &State, total: usize) -> bool {
     st.fold_pool.unwrap_or(total > 12)
 }
 
-/// Temperaturas de disco com falha, com a causa: (número do disco, causa).
-fn temp_failures(st: &State) -> Vec<(u32, String)> {
-    let (Some(Ok(disks)), Some(Ok(temps))) = (
-        st.fast.as_ref().map(|f| &f.disks),
-        st.slow.as_ref().map(|s| &s.disk_temps),
-    ) else {
-        return Vec::new();
+/// Marca de uma coluna estreita sem valor: "!" para falha, "?" para estado neutro.
+fn missing_mark(m: &Missing) -> String {
+    match m {
+        Missing::Fail(_) => "!".into(),
+        Missing::Neutral(_) => "?".into(),
+    }
+}
+
+/// Nome curto de um disco na tabela (letras ou `dN`).
+fn disk_label(d: &Disk) -> String {
+    if d.letters.is_empty() {
+        format!("d{}", d.number)
+    } else {
+        d.letters.join(" ")
+    }
+}
+
+/// Largura da coluna de temperatura (um estado neutro mais longo vai para as notas).
+const DISK_TEMP_W: usize = 8;
+
+/// Temperatura do disco, só se a leitura é do mesmo modelo (disco trocado no mesmo número).
+fn disk_temp<'a>(st: &'a State, d: &Disk) -> Option<&'a crate::model::DiskTemp> {
+    match st.slow.as_ref().map(|s| &s.disk_temps) {
+        Some(Ok(list)) => list
+            .iter()
+            .find(|t| t.number == d.number)
+            .filter(|t| t.model == d.model.as_ref().ok().cloned()),
+        _ => None,
+    }
+}
+
+/// Notas embaixo da tabela de discos, inteiras (as colunas não têm espaço para causas): falhas
+/// de metadados e de temperatura em vermelho, estados neutros longos em cinza, quebradas em
+/// `width` colunas. Só dos discos exibidos.
+fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut note = |name: &str, what: &str, m: &Missing| {
+        let style = Style::new().fg(if matches!(m, Missing::Fail(_)) {
+            FAIL
+        } else {
+            NEUTRAL
+        });
+        let mark = if matches!(m, Missing::Fail(_)) {
+            "! "
+        } else {
+            ""
+        };
+        let spans = vec![
+            Span::styled(format!("{mark}{name} {what}: "), style),
+            Span::styled(printable(&m.to_string()), style),
+        ];
+        out.extend(wrap(spans, width, 0, 4));
     };
-    temps
-        .iter()
-        .filter(|t| {
-            disks
-                .iter()
-                .any(|d| d.number == t.number && d.model.as_ref().ok() == t.model.as_ref())
-        })
-        .filter_map(|t| match &t.celsius {
-            Err(Missing::Fail(c)) => Some((t.number, c.clone())),
-            _ => None,
-        })
-        .collect()
+    if let Some(Err(e)) = st.slow.as_ref().map(|s| &s.disk_temps) {
+        note("disks", "temperature", e);
+    }
+    for (d, _) in disk_order(st) {
+        let name = disk_label(&d);
+        let fails: [(&str, Option<&Missing>); 5] = [
+            ("model", d.model.as_ref().err()),
+            ("bus", d.bus.as_ref().err()),
+            ("type", d.ssd.as_ref().err()),
+            ("capacity", d.capacity.as_ref().err()),
+            ("pool", d.pool_member.as_ref().err()),
+        ];
+        for (what, m) in fails {
+            match m {
+                Some(m @ Missing::Fail(_)) => note(&name, what, m),
+                // "asleep" cabe na coluna da capacidade; outro estado vai para a nota.
+                Some(m @ Missing::Neutral(n)) if n.chars().count() > 6 => note(&name, what, m),
+                _ => {}
+            }
+        }
+        if let Some(t) = disk_temp(st, &d)
+            && let Err(m) = &t.celsius
+            && (matches!(m, Missing::Fail(_)) || m.to_string().chars().count() > DISK_TEMP_W)
+        {
+            note(&name, "temperature", m);
+        }
+    }
+    out
 }
 
 fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
@@ -1925,7 +2172,6 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let temps = st.slow.as_ref().map(|s| &s.disk_temps);
     // Atividade (5), resposta (8), leitura e escrita (9 cada) e temperatura (2 + "! failed").
     const INFO_W: u16 = 41;
     // Depois do nome: barramento (7), tipo (4), capacidade (6 + espaço), flags (4) e 2 espaços.
@@ -1977,7 +2223,10 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         info_w,
         inner,
     );
-    let rows = usize::from(inner.height.saturating_sub(1));
+    // As notas (causas) têm linhas reservadas no fim da caixa: os discos que não couberem
+    // entram no "+N more", nunca as causas.
+    let notes = disk_notes(st, inner.width);
+    let rows = usize::from(inner.height.saturating_sub(1)).saturating_sub(notes.len());
     // Não cabem todos: a última linha avisa quantos ficaram de fora (nada some sem aviso).
     let shown = if order.len() > rows {
         rows.saturating_sub(1)
@@ -2026,12 +2275,21 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         } else {
             name
         };
-        let bus = d.bus.as_ref().map_or("?".into(), ToString::to_string);
+        // Sem valor: "!" para falha (a causa está nas notas), "?" para estado neutro; a
+        // capacidade de um HDD em repouso diz "asleep".
+        let bus = d
+            .bus
+            .as_ref()
+            .map_or_else(missing_mark, ToString::to_string);
         let typ = d
             .ssd
             .as_ref()
-            .map_or("?", |s| if *s { "SSD" } else { "HDD" });
-        let cap = d.capacity.as_ref().map_or("?".into(), |c| short_bytes(*c));
+            .map_or_else(missing_mark, |s| if *s { "SSD" } else { "HDD" }.to_string());
+        let cap = match &d.capacity {
+            Ok(c) => short_bytes(*c),
+            Err(Missing::Neutral(n)) if n.chars().count() <= 6 => n.clone(),
+            Err(e) => missing_mark(e),
+        };
         let flags = format!(
             "{}{}",
             if d.system { "S " } else { "" },
@@ -2059,21 +2317,11 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Rect::new(inner.x + name_w + LEFT_W, y, spark_w, 1).intersection(inner),
             );
         }
-        let same = |t: &&crate::model::DiskTemp| t.model == d.model.as_ref().ok().cloned();
-        let t = match temps {
-            Some(Ok(list)) => list
-                .iter()
-                .find(|t| t.number == d.number)
-                .filter(same)
-                .map_or_else(
-                    || label(""),
-                    |t| match &t.celsius {
-                        // A causa não cabe na coluna: vai inteira para a linha embaixo da tabela.
-                        Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(FAIL)),
-                        c => metric(c, |c| format!("{c} °C")),
-                    },
-                ),
-            Some(Err(e)) => missing(e),
+        // A causa não cabe na coluna: vai inteira para as notas embaixo da tabela.
+        let t = match disk_temp(st, d).map(|t| &t.celsius) {
+            Some(Err(Missing::Fail(_))) => Span::styled("! failed", Style::new().fg(FAIL)),
+            Some(Err(m)) if m.to_string().chars().count() > DISK_TEMP_W => label("(below)"),
+            Some(c) => metric(c, |c| format!("{c} °C")),
             None => label(""),
         };
         // As quatro vêm do mesmo IOCTL: falhando juntas, a causa aparece uma vez só.
@@ -2094,9 +2342,9 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         };
         line(frame, info, info_x, y, info_w, inner);
     }
-    // Causas das falhas de temperatura, inteiras (a coluna só tem espaço para "! failed").
+    // Notas (causas inteiras), nas linhas reservadas.
     let first = inner.y + 1 + shown as u16 + u16::from(shown < order.len());
-    for (i, l) in temp_failure_lines(st, inner.width).into_iter().enumerate() {
+    for (i, l) in notes.into_iter().enumerate() {
         let y = first + i as u16;
         if y >= inner.y + inner.height {
             break;
@@ -2108,33 +2356,6 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             inner,
         );
     }
-}
-
-/// Causas das falhas de temperatura, uma por disco, quebradas em `width` colunas.
-fn temp_failure_lines(st: &State, width: u16) -> Vec<Line<'static>> {
-    let disks = st.fast.as_ref().and_then(|f| f.disks.as_ref().ok());
-    temp_failures(st)
-        .into_iter()
-        .flat_map(|(number, cause)| {
-            let name = disks
-                .and_then(|l| l.iter().find(|d| d.number == number))
-                .map_or_else(
-                    || format!("disk {number}"),
-                    |d| {
-                        if d.letters.is_empty() {
-                            format!("d{number}")
-                        } else {
-                            d.letters.join(" ")
-                        }
-                    },
-                );
-            let spans = vec![
-                Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
-                Span::styled(printable(&cause), Style::new().fg(FAIL)),
-            ];
-            wrap(spans, width, 0, 4)
-        })
-        .collect()
 }
 
 // --- Jogo ---
@@ -2159,10 +2380,10 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let rtss_failed = matches!(fps.rtss, Err(Missing::Fail(_)));
     let (title, source) = match g {
         Some(g) => {
-            let res = g
-                .resolution
-                .as_ref()
-                .map_or(String::new(), |(x, y)| format!(" · {x}x{y}"));
+            let res = g.resolution.as_ref().map_or_else(
+                |e| format!(" · resolution: {e}"),
+                |(x, y)| format!(" · {x}x{y}"),
+            );
             let title = format!(
                 "game · {} ({} · PID {}{res})",
                 printable(&g.name),

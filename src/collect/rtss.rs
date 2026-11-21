@@ -11,7 +11,7 @@
 //! - Lows (1% e 0,1%) calculados pelo wintop numa janela de 60 s (os do RTSS só existem no
 //!   modo benchmark).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
@@ -91,6 +91,10 @@ const IGNORED: &[&str] = &[
     "openlogi-overlay.exe",
     "yourphoneappproxyhost.exe",
 ];
+/// Pausa sem frames a partir da qual o FPS passa a contar o tempo parado.
+const FREEZE_MIN_US: u64 = 50_000;
+/// Período mais longo entre amostras da thread do RTSS (sem jogo).
+const RTSS_PERIOD_MAX: Duration = Duration::from_secs(1);
 /// Idade máxima do último período de FPS para o app contar como "ativo".
 const ACTIVE_MS: u32 = 2000;
 /// Janela dos lows.
@@ -269,9 +273,13 @@ struct Ring {
 
 impl Ring {
     fn push(&mut self, at: Instant, us: u32) {
-        // O pipe aceita escrita de processos sem elevação: um cliente inundando não cresce a
-        // memória sem limite (descarta os mais antigos).
-        if self.frames.len() >= MAX_FRAMES {
+        self.push_capped(at, us, MAX_FRAMES);
+    }
+
+    /// O pipe aceita escrita de processos sem elevação: um cliente inundando não cresce a
+    /// memória sem limite (descarta os mais antigos).
+    fn push_capped(&mut self, at: Instant, us: u32, cap: usize) {
+        while self.frames.len() >= cap.max(1) {
             self.frames.pop_front();
         }
         self.frames.push_back((at, us));
@@ -310,16 +318,39 @@ impl Ring {
 
 /// Registros completos de 8 bytes; a sobra de uma mensagem partida (`ERROR_MORE_DATA`) fica em
 /// `carry`; sobra numa mensagem completa (malformada) é descartada.
-fn feed(rings: &mut HashMap<u32, Ring>, carry: &mut Vec<u8>, data: &[u8], complete: bool) {
+///
+/// `known`: índices de apps (fora dos ignorados) na última leitura da Shared Memory. Um índice
+/// ainda desconhecido (jogo que acabou de abrir, antes da próxima amostra) entra com teto
+/// pequeno, em no máximo `MAX_UNKNOWN_RINGS` filas: um cliente local inundando o pipe com
+/// índices inventados não faz a memória crescer.
+fn feed(
+    rings: &mut HashMap<u32, Ring>,
+    known: &HashSet<u32>,
+    carry: &mut Vec<u8>,
+    data: &[u8],
+    complete: bool,
+) {
     carry.extend_from_slice(data);
     let whole = carry.len() / 8 * 8;
     let now = Instant::now();
+    let mut unknown = rings.keys().filter(|i| !known.contains(i)).count();
     for rec in carry[..whole].as_chunks::<8>().0 {
         let app = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
         let us = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
         // Índice fora da Shared Memory ou frametime 0 (sem delta): registro ignorado.
-        if (app as usize) < MAX_APPS && us > 0 {
+        if (app as usize) >= MAX_APPS || us == 0 {
+            continue;
+        }
+        if known.contains(&app) {
             rings.entry(app).or_default().push(now, us);
+        } else if let Some(r) = rings.get_mut(&app) {
+            r.push_capped(now, us, UNKNOWN_FRAMES);
+        } else if unknown < MAX_UNKNOWN_RINGS {
+            unknown += 1;
+            rings
+                .entry(app)
+                .or_default()
+                .push_capped(now, us, UNKNOWN_FRAMES);
         }
     }
     carry.drain(..whole);
@@ -338,7 +369,10 @@ const BUF: usize = 4 * 1024;
 const MAX_FRAMES: usize = 60_000;
 /// Conclusões de leitura atendidas por período: acima disso o pipe espera o próximo período
 /// (um cliente inundando não prende a thread num laço).
-const MAX_SIGNALS_PER_PUMP: u32 = 4096;
+const MAX_SIGNALS_PER_PUMP: u32 = 1024;
+/// Índices ainda fora da Shared Memory: quantos e quantos frames cada (4 s a 1000 FPS).
+const MAX_UNKNOWN_RINGS: usize = 8;
+const UNKNOWN_FRAMES: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -491,7 +525,7 @@ impl Instance {
     }
 
     /// O evento sinalizou: trata uma conclusão e arma a próxima operação.
-    fn on_signal(&mut self, rings: &mut HashMap<u32, Ring>) {
+    fn on_signal(&mut self, rings: &mut HashMap<u32, Ring>, known: &HashSet<u32>) {
         // SAFETY: evento válido; a próxima operação (ou `signal`) volta a sinalizá-lo.
         unsafe {
             let _ = ResetEvent(h(&self.event));
@@ -525,11 +559,11 @@ impl Instance {
                 let got = (n as usize).min(self.buf.len());
                 match r {
                     Ok(()) => {
-                        feed(rings, &mut self.carry, &self.buf[..got], true);
+                        feed(rings, known, &mut self.carry, &self.buf[..got], true);
                         self.start_read();
                     }
                     Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                        feed(rings, &mut self.carry, &self.buf[..got], false);
+                        feed(rings, known, &mut self.carry, &self.buf[..got], false);
                         self.start_read();
                     }
                     Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
@@ -634,6 +668,14 @@ fn create_pipe() -> Result<Vec<Instance>, String> {
     Ok(instances)
 }
 
+/// PIDs com o hook do RTSS agora (leitura direta da Shared Memory, sem esperar a thread do
+/// RTSS): a última checagem antes de abrir um processo sob demanda.
+pub fn hooked_now() -> Result<Vec<u32>, String> {
+    let v = SharedView::open(SHM_NAME).ok_or("RTSS shared memory unavailable")?;
+    let (apps, _, _) = read_apps(&v)?;
+    Ok(apps.iter().map(|a| a.pid).collect())
+}
+
 // --- Coletor ---
 
 /// `Fps` com a mesma falha em tudo (pânico ou início impossível da thread).
@@ -661,11 +703,13 @@ pub struct RtssCollector {
     turn: usize,
     /// Frames do pipe por índice da Shared Memory.
     exact: HashMap<u32, Ring>,
+    /// Índices dos apps (fora dos ignorados) na última amostra: os que o pipe guarda inteiros.
+    known: HashSet<u32>,
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
     lows: LowsCache,
-    /// Momento da publicação anterior do jogo (para o pior frame desde então).
-    published: Option<Instant>,
+    /// PID e momento da publicação anterior do jogo (para o pior frame desde então).
+    published: Option<(u32, Instant)>,
 }
 
 impl RtssCollector {
@@ -683,6 +727,7 @@ impl RtssCollector {
             },
             turn: 0,
             exact: HashMap::new(),
+            known: HashSet::new(),
             approx: HashMap::new(),
             lows: None,
             published: None,
@@ -730,7 +775,7 @@ impl RtssCollector {
             }
             match armed[..n].get(idx - 1) {
                 Some(&k) => {
-                    instances[k].on_signal(&mut self.exact);
+                    instances[k].on_signal(&mut self.exact, &self.known);
                     handled += 1;
                 }
                 None => return false, // timeout ou erro
@@ -829,7 +874,14 @@ impl RtssCollector {
             }
             ring.pid = Some(a.pid);
         }
-        self.exact.retain(|i, _| apps.iter().any(|a| a.index == *i));
+        // Só os índices de apps acompanhados (os ignorados, como navegadores, não guardam 60 s
+        // de frames).
+        self.known = apps
+            .iter()
+            .filter(|a| !IGNORED.contains(&a.name.to_ascii_lowercase().as_str()))
+            .map(|a| a.index)
+            .collect();
+        self.exact.retain(|i, _| self.known.contains(i));
         self.approx
             .retain(|pid, _| apps.iter().any(|a| a.pid == *pid));
         for r in self.exact.values_mut().chain(self.approx.values_mut()) {
@@ -883,8 +935,15 @@ impl RtssCollector {
             let n = second.len() as f64;
             let (lo, hi) = min_max_ms(&second).unwrap_or((0.0, 0.0));
             let avg = sum as f64 / n / 1000.0;
+            // Congelamento em andamento: o tempo desde o último frame conta no FPS (senão um
+            // travamento de 900 ms mostraria o FPS do frame anterior a ele).
+            let gap = ring
+                .and_then(|r| r.frames.back())
+                .map_or(0, |(t, _)| now.duration_since(*t).as_micros() as u64);
+            let stalled = gap > FREEZE_MIN_US && gap as f64 > 2.0 * avg * 1000.0;
+            let span = sum + if stalled { gap } else { 0 };
             (
-                positive(1e6 * n / sum as f64),
+                positive(1e6 * n / span as f64),
                 positive(avg).map(|a| (a, lo, hi)),
             )
         };
@@ -897,7 +956,9 @@ impl RtssCollector {
             None => neutral("needs RTSS shared memory 2.21+"),
         };
         let bound = match (&gpu_time, &frametime) {
-            (Ok((active, _)), Ok((avg, _, _))) if *avg > 0.0 => Ok(if active / avg >= GPU_BOUND {
+            // Os dois tempos da mesma linha do RTSS (o frametime médio do pipe tem 1 s de
+            // inércia e inverteria o veredito numa troca de cena).
+            (Ok((active, frame)), Ok(_)) if *frame > 0.0 => Ok(if active / frame >= GPU_BOUND {
                 "GPU"
             } else {
                 "CPU"
@@ -921,7 +982,13 @@ impl RtssCollector {
             gpu_time,
             bound,
             peak_ms: {
-                let since = self.published.replace(now);
+                // Só o que chegou desde a publicação anterior deste jogo (outro jogo ou a 1ª
+                // publicação: no máximo o último período, não 60 s de histórico).
+                let floor = now.checked_sub(RTSS_PERIOD_MAX).unwrap_or(now);
+                let since = match self.published.replace((g.pid, now)) {
+                    Some((pid, t)) if pid == g.pid => Some(t.max(floor)),
+                    _ => Some(floor),
+                };
                 ring.and_then(|r| {
                     r.frames
                         .iter()
@@ -1043,22 +1110,167 @@ mod tests {
         assert!((l01 - 20.0).abs() < 1e-9);
     }
 
+    /// Shared Memory sintética com o layout do header (v2.21 por padrão).
+    fn shm(ver: u32, esize: usize, apps: &[(u32, &[u8], u32)]) -> Vec<u8> {
+        const ARR: usize = 0x100;
+        let mut b = vec![0u8; ARR + esize * apps.len().max(1)];
+        let put = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut b, 0, RTSS_SIGNATURE);
+        put(&mut b, OFF_VERSION, ver);
+        put(&mut b, OFF_APP_ENTRY_SIZE, esize as u32);
+        put(&mut b, OFF_APP_ARR_OFFSET, ARR as u32);
+        put(&mut b, OFF_APP_ARR_SIZE, apps.len() as u32);
+        put(
+            &mut b,
+            OFF_LAST_FOREGROUND_PID,
+            apps.first().map_or(0, |a| a.0),
+        );
+        for (i, (pid, name, flags)) in apps.iter().enumerate() {
+            let e = ARR + i * esize;
+            put(&mut b, e + E_PID, *pid);
+            b[e + E_NAME..e + E_NAME + name.len()].copy_from_slice(name);
+            put(&mut b, e + E_FLAGS, *flags);
+            put(&mut b, e + E_FRAME_TIME, 6944);
+            if esize >= E_RES_Y + 4 {
+                put(&mut b, e + E_RES_X, 2560);
+                put(&mut b, e + E_RES_Y, 1440);
+            }
+            if esize >= E_GPU_FRAME + 4 {
+                put(&mut b, e + E_GPU_ACTIVE, 5200);
+                put(&mut b, e + E_GPU_FRAME, 6800);
+            }
+        }
+        b
+    }
+
+    const ENTRY_V221: usize = 12416;
+
+    #[test]
+    fn shared_memory_v2_21() {
+        let b = shm(
+            V2_21,
+            ENTRY_V221,
+            &[
+                (4242, br"C:\Games\deadlock.exe", 0x6),
+                (0, b"", 0), // entrada vazia: ignorada
+                (1784, b"dwm.exe", 0x7),
+            ],
+        );
+        let (apps, fg, ver) = read_apps(&SharedView::from_bytes(&b)).expect("leitura");
+        assert_eq!(ver, V2_21);
+        assert_eq!(fg, Some(4242));
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].name, "deadlock.exe");
+        assert_eq!(apps[0].index, 0);
+        assert_eq!(
+            apps[1].index, 2,
+            "o índice é a posição no array (= dwApp do pipe)"
+        );
+        assert_eq!(apps[0].res, Some((2560, 1440)));
+        assert_eq!(apps[0].gpu, Some((5200, 6800)));
+        assert_eq!(apps[0].frametime_us, 6944);
+    }
+
+    #[test]
+    fn shared_memory_antiga_sem_campos_novos() {
+        // v2.15: sem primeiro plano, resolução e tempo de GPU; entrada no tamanho antigo.
+        let b = shm(0x0002_000F, E_FRAME_TIME + 4, &[(10, b"old.exe", 0x5)]);
+        let (apps, fg, _) = read_apps(&SharedView::from_bytes(&b)).expect("leitura");
+        assert_eq!(fg, None);
+        assert_eq!(apps[0].res, None);
+        assert_eq!(apps[0].gpu, None);
+    }
+
+    #[test]
+    fn shared_memory_invalida_e_erro() {
+        let ok = shm(V2_21, ENTRY_V221, &[(1, b"a.exe", 1)]);
+        let read = |b: &[u8]| read_apps(&SharedView::from_bytes(b)).map(|_| ());
+        // RTSS fechando.
+        let mut dead = ok.clone();
+        dead[..4].copy_from_slice(&RTSS_DEAD.to_le_bytes());
+        assert_eq!(read(&dead), Err("RTSS is shutting down".into()));
+        // Assinatura errada e versão 1.x.
+        let mut sig = ok.clone();
+        sig[..4].copy_from_slice(&0x1234u32.to_le_bytes());
+        assert!(read(&sig).is_err());
+        let mut v1 = ok.clone();
+        v1[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&0x0001_0005u32.to_le_bytes());
+        assert!(read(&v1).is_err());
+        // Entrada menor que o mínimo.
+        let mut small = ok.clone();
+        small[OFF_APP_ENTRY_SIZE..OFF_APP_ENTRY_SIZE + 4].copy_from_slice(&16u32.to_le_bytes());
+        assert!(read(&small).is_err());
+        // Array além do fim da região (e offset que estoura na multiplicação).
+        let mut far = ok.clone();
+        far[OFF_APP_ARR_OFFSET..OFF_APP_ARR_OFFSET + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read(&far).is_err());
+        let mut many = ok.clone();
+        many[OFF_APP_ARR_SIZE..OFF_APP_ARR_SIZE + 4].copy_from_slice(&200u32.to_le_bytes());
+        assert!(read(&many).is_err());
+        // Header cortado.
+        assert!(read(&ok[..10]).is_err());
+    }
+
+    #[test]
+    fn nome_com_controles_nao_chega_ao_terminal() {
+        let b = shm(V2_21, ENTRY_V221, &[(1, b"ev\x1b[2Jil\x9b.exe", 1)]);
+        let (apps, _, _) = read_apps(&SharedView::from_bytes(&b)).expect("leitura");
+        assert!(
+            !apps[0].name.chars().any(char::is_control),
+            "{:?}",
+            apps[0].name
+        );
+    }
+
+    fn all_known() -> HashSet<u32> {
+        (0..MAX_APPS as u32).collect()
+    }
+
+    #[test]
+    fn indices_desconhecidos_tem_teto() {
+        let mut rings = HashMap::new();
+        let mut carry = Vec::new();
+        let known: HashSet<u32> = [3].into_iter().collect();
+        // Um cliente inunda 200 índices inventados com 10 mil frames cada.
+        let mut data = Vec::new();
+        for app in 0..200u32 {
+            for _ in 0..50 {
+                data.extend(app.to_le_bytes());
+                data.extend(1000u32.to_le_bytes());
+            }
+        }
+        for _ in 0..200 {
+            feed(&mut rings, &known, &mut carry, &data, true);
+        }
+        let unknown: Vec<_> = rings.keys().filter(|i| !known.contains(i)).collect();
+        assert!(unknown.len() <= MAX_UNKNOWN_RINGS, "{}", unknown.len());
+        assert!(rings.values().all(|r| r.frames.len() <= MAX_FRAMES));
+        assert!(
+            rings
+                .iter()
+                .filter(|(i, _)| !known.contains(i))
+                .all(|(_, r)| r.frames.len() <= UNKNOWN_FRAMES)
+        );
+        // O índice conhecido guarda tudo.
+        assert_eq!(rings[&3].frames.len(), 200 * 50);
+    }
+
     #[test]
     fn registros_partidos_entre_mensagens() {
         let mut rings = HashMap::new();
         let mut carry = Vec::new();
         let mut rec = 7u32.to_le_bytes().to_vec();
         rec.extend(16_000u32.to_le_bytes());
-        feed(&mut rings, &mut carry, &rec[..5], false); // ERROR_MORE_DATA no meio
-        feed(&mut rings, &mut carry, &rec[5..], true);
+        feed(&mut rings, &all_known(), &mut carry, &rec[..5], false); // ERROR_MORE_DATA no meio
+        feed(&mut rings, &all_known(), &mut carry, &rec[5..], true);
         let got: Vec<u32> = rings[&7].frames.iter().map(|(_, us)| *us).collect();
         assert_eq!(got, vec![16_000]);
-        feed(&mut rings, &mut carry, &rec[..3], true); // malformada: descartada
+        feed(&mut rings, &all_known(), &mut carry, &rec[..3], true); // malformada: descartada
         assert!(carry.is_empty());
         // Índice fora da Shared Memory é ignorado.
         let mut bad = 9999u32.to_le_bytes().to_vec();
         bad.extend(1u32.to_le_bytes());
-        feed(&mut rings, &mut carry, &bad, true);
+        feed(&mut rings, &all_known(), &mut carry, &bad, true);
         assert!(!rings.contains_key(&9999));
     }
 
@@ -1068,7 +1280,7 @@ mod tests {
         let mut carry = Vec::new();
         let mut rec = 3u32.to_le_bytes().to_vec();
         rec.extend(0u32.to_le_bytes());
-        feed(&mut rings, &mut carry, &rec, true);
+        feed(&mut rings, &all_known(), &mut carry, &rec, true);
         assert!(!rings.contains_key(&3));
     }
 

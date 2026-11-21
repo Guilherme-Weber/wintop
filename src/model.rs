@@ -403,3 +403,33 @@ pub struct Slow {
     pub procs: Option<Metric<Vec<Proc>>>,
     pub took: Duration,
 }
+
+impl Fast {
+    /// Todas as fontes com a mesma falha (a thread parou).
+    pub fn failed(cause: &str) -> Self {
+        let m = Missing::Fail(cause.to_string());
+        Self {
+            cpu: Err(m.clone()),
+            cpu_sensors: Err(m.clone()),
+            memory: Err(m.clone()),
+            disks: Err(m.clone()),
+            nics: Err(m.clone()),
+            gpus: Err(m.clone()),
+            own: Err(m),
+            took: Duration::ZERO,
+        }
+    }
+}
+
+impl Slow {
+    /// Todas as fontes com a mesma falha (a thread parou).
+    pub fn failed(cause: &str) -> Self {
+        let m = Missing::Fail(cause.to_string());
+        Self {
+            gpus: Err(m.clone()),
+            disk_temps: Err(m.clone()),
+            procs: Some(Err(m)),
+            took: Duration::ZERO,
+        }
+    }
+}

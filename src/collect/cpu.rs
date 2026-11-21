@@ -259,7 +259,7 @@ pub(crate) fn parse_topology(b: &[u8]) -> Option<Topology> {
     while off + 8 <= b.len() {
         let rel = u32_at(off)?;
         let size = u32_at(off + 4)? as usize;
-        if size < 8 || off + size > b.len() {
+        if size < 8 || off.checked_add(size).is_none_or(|end| end > b.len()) {
             break;
         }
         let rec = &b[off..off + size];

@@ -258,8 +258,8 @@ impl PawnIo {
         }
     }
 
-    fn smn(&self, addr: u32) -> Result<u32, String> {
-        let _lock = self.lock()?;
+    /// Leitura SMN com `Access_PCI` já seguro por quem chama (`lock`).
+    fn smn_locked(&self, addr: u32) -> Result<u32, String> {
         self.call(c"ioctl_read_smn", u64::from(addr))
             .map(|v| v as u32)
     }
@@ -437,32 +437,38 @@ impl PawnIoCollector {
                 last_energy,
             } => (pio, support, *joules_per_count, last_energy),
         };
-        let tctl = pio
-            .smn(SMN_THM_TCON_CUR_TMP)
-            .map(tctl_from_raw)
-            .or_else(fail);
+        // Um `Access_PCI` para todas as leituras SMN da coleta: menos disputa com outros
+        // monitores, e Tctl e CCDs ficam coerentes (ou todos lidos, ou a mesma causa).
+        let lock = pio.lock();
+        let smn = |addr: u32| -> Result<u32, String> {
+            lock.as_ref().map_err(Clone::clone)?;
+            pio.smn_locked(addr)
+        };
+        let tctl = smn(SMN_THM_TCON_CUR_TMP).map(tctl_from_raw).or_else(fail);
         let ccds = match support.ccd_base {
             None => neutral("not validated on this CPU family"),
             Some(base) => {
                 let mut list = Vec::new();
                 let mut err = None;
                 for c in 0..support.ccds {
-                    match pio.smn(base + c * 4) {
+                    match smn(base + c * 4) {
                         Ok(raw) => {
                             if let Some(t) = ccd_from_raw(raw) {
                                 list.push((c + 1, t));
                             }
                         }
-                        Err(e) => err = Some(e),
+                        Err(e) => err = Some(format!("CCD{}: {e}", c + 1)),
                     }
                 }
+                // Um CCD que falhou não some calado: a causa aparece no lugar da lista.
                 match (list.is_empty(), err) {
-                    (false, _) => Ok(list),
-                    (true, Some(e)) => fail(e),
+                    (_, Some(e)) => fail(e),
+                    (false, None) => Ok(list),
                     (true, None) => fail("no valid CCD sensor"),
                 }
             }
         };
+        drop(lock);
         let package_power = match pio.msr(MSR_PKG_ENERGY_STAT) {
             Err(e) => fail(e),
             Ok(raw) => {
