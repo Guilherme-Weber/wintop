@@ -38,8 +38,8 @@ impl CpuCollector {
             Ok(q) => q.add(p),
             Err(e) => Err(e.clone()),
         };
-        let total = add(r"\Processor Information(_Total)\% Processor Utility");
-        let per = add(r"\Processor Information(*)\% Processor Utility");
+        let total = add(r"\Processor Information(_Total)\% Processor Time");
+        let per = add(r"\Processor Information(*)\% Processor Time");
         let perf = add(r"\Processor Information(_Total)\% Processor Performance");
         let topology = topology();
         let base_mhz = base_mhz(topology.as_ref().map_or(1, |t| t.logical));

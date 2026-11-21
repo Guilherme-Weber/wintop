@@ -180,8 +180,8 @@ mod tests {
     fn contador_ingles_e_curinga() {
         let q = Query::open();
         let qq = q.as_ref().expect("abrir consulta");
-        let total = qq.add(r"\Processor Information(_Total)\% Processor Utility");
-        let per = qq.add(r"\Processor Information(*)\% Processor Utility");
+        let total = qq.add(r"\Processor Information(_Total)\% Processor Time");
+        let per = qq.add(r"\Processor Information(*)\% Processor Time");
         let bad = qq.add(r"\Objeto Inexistente\Contador");
         assert!(bad.is_err());
         qq.collect().expect("1ª coleta");
