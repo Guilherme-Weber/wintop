@@ -157,8 +157,15 @@ fn fast(step: u32) -> Fast {
 }
 
 fn slow() -> Slow {
+    let model = |n| match n {
+        0 => "Netac SSD 512GB",
+        1 => "HGST HCC545050A7E380",
+        7 => "NE-512 Por",
+        _ => "Microsoft Storage Space Device",
+    };
     let t = |n, c, s| DiskTemp {
         number: n,
+        model: Some(model(n).to_string()),
         celsius: c,
         source: s,
     };
@@ -298,4 +305,33 @@ fn terminal_minusculo_nao_quebra() {
     ] {
         let _ = render(&mut st, w, h);
     }
+}
+
+#[test]
+fn falha_de_rede_nao_vira_desconectada() {
+    let mut st = State::new(1000);
+    let mut f = fast(5);
+    if let Ok(list) = &mut f.nics {
+        list[1].link = fail("link speed unknown");
+    }
+    st.push_fast(f);
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("! link speed unknown"), "{out}");
+    assert!(!out.contains("disconnected: Ethernet, X540"), "{out}");
+}
+
+#[test]
+fn temperatura_de_outro_disco_nao_aparece() {
+    let mut st = filled();
+    // Outro disco ocupou o número 7 (hot-plug): a temperatura lida do modelo antigo não vale.
+    if let Some(s) = &mut st.slow
+        && let Ok(list) = &mut s.disk_temps
+    {
+        for t in list.iter_mut().filter(|t| t.number == 7) {
+            t.model = Some("Outro disco".into());
+        }
+    }
+    let out = render(&mut st, 160, 48);
+    assert!(!out.contains("47 °C"), "{out}");
+    assert!(out.contains("39 °C"), "{out}");
 }

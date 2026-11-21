@@ -16,7 +16,16 @@ use std::time::Instant;
 
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 
+use std::sync::atomic::AtomicBool;
+
 use crate::model::{Fast, Metric, Slow, fail};
+
+pub use gpu::SharedNvml;
+
+/// NVML do processo (um só para as duas threads).
+pub fn shared_nvml() -> SharedNvml {
+    std::sync::Arc::new(gpu::init_nvml())
+}
 
 pub use rtss::RtssCollector;
 
@@ -71,14 +80,14 @@ fn run<C, T>(
 }
 
 impl FastCollectors {
-    pub fn new() -> Self {
+    pub fn new(nvml: SharedNvml) -> Self {
         Self {
             cpu: create("CPU", cpu::CpuCollector::new),
             pawnio: create("CPU sensor", pawnio::PawnIoCollector::new),
             memory: create("memory", memory::MemoryCollector::new),
             disk: create("disk", disk::DiskCollector::new),
             net: create("network", net::NetCollector::new),
-            gpu: create("GPU", gpu::GpuCollector::new),
+            gpu: create("GPU", || gpu::GpuCollector::new(nvml)),
             own: create("wintop usage", own::OwnCollector::new),
         }
     }
@@ -117,21 +126,18 @@ pub struct SlowCollectors {
 }
 
 impl SlowCollectors {
-    pub fn new() -> Self {
+    pub fn new(nvml: SharedNvml) -> Self {
         Self {
-            gpu: create("GPU PCIe", gpu::GpuSlowCollector::new),
+            gpu: create("GPU PCIe", || gpu::GpuSlowCollector::new(nvml)),
             disk_temp: create("disk temperature", disk_temp::DiskTempCollector::new),
         }
     }
 
-    pub fn collect(&mut self) -> Slow {
+    /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro).
+    pub fn collect(&mut self, stop: &AtomicBool) -> Slow {
         let start = Instant::now();
         let gpus = run("GPU PCIe", &mut self.gpu, gpu::GpuSlowCollector::read);
-        let disk_temps = run(
-            "disk temperature",
-            &mut self.disk_temp,
-            disk_temp::DiskTempCollector::read,
-        );
+        let disk_temps = run("disk temperature", &mut self.disk_temp, |c| c.read(stop));
         Slow {
             gpus,
             disk_temps,

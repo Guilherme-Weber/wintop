@@ -45,6 +45,8 @@ fn check(code: u32) -> Result<(), String> {
 /// `PdhCloseQuery` do `Drop` os libera), então nenhum sobrevive à consulta. Não é `Sync`
 /// (`RefCell`): cada thread de coleta tem as suas.
 pub struct Query {
+    /// Identidade única (um `Counter` de outra consulta é recusado, não lido no lugar errado).
+    id: u64,
     handle: PDH_HQUERY,
     counters: RefCell<Vec<PDH_HCOUNTER>>,
 }
@@ -53,9 +55,11 @@ pub struct Query {
 // consulta não é `Sync`, então só uma thread a usa por vez.
 unsafe impl Send for Query {}
 
-/// Índice de um contador dentro da sua `Query`.
+/// Contador: identidade da `Query` e índice dentro dela.
 #[derive(Clone, Copy, Debug)]
-pub struct Counter(usize);
+pub struct Counter(u64, usize);
+
+static NEXT_QUERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Query {
     pub fn open() -> Result<Self, String> {
@@ -63,6 +67,7 @@ impl Query {
         // SAFETY: fonte nula = dados ao vivo; `h` recebe o handle.
         check(unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut h) })?;
         Ok(Self {
+            id: NEXT_QUERY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: h,
             counters: RefCell::new(Vec::new()),
         })
@@ -77,15 +82,18 @@ impl Query {
             .map_err(|e| format!("{e} ({path})"))?;
         let mut list = self.counters.borrow_mut();
         list.push(c);
-        Ok(Counter(list.len() - 1))
+        Ok(Counter(self.id, list.len() - 1))
     }
 
     fn counter(&self, c: Counter) -> Result<PDH_HCOUNTER, String> {
+        if c.0 != self.id {
+            return Err("PDH counter from another query".into());
+        }
         self.counters
             .borrow()
-            .get(c.0)
+            .get(c.1)
             .copied()
-            .ok_or_else(|| "PDH counter from another query".into())
+            .ok_or_else(|| "PDH counter index out of range".into())
     }
 
     pub fn collect(&self) -> Result<(), String> {

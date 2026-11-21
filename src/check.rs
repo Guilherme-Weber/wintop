@@ -50,12 +50,13 @@ pub fn run() -> i32 {
             "no"
         }
     );
-    let mut fast = FastCollectors::new();
-    let mut slow = SlowCollectors::new();
+    let nvml = crate::collect::shared_nvml();
+    let mut fast = FastCollectors::new(nvml.clone());
+    let mut slow = SlowCollectors::new(nvml);
     let _ = fast.collect();
     std::thread::sleep(WARMUP);
     let f = fast.collect();
-    let s = slow.collect();
+    let s = slow.collect(&std::sync::atomic::AtomicBool::new(false));
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
     let fps = RtssCollector::new(false, false).sample();
 

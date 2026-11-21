@@ -267,6 +267,11 @@ struct Ring {
 
 impl Ring {
     fn push(&mut self, at: Instant, us: u32) {
+        // O pipe aceita escrita de processos sem elevação: um cliente inundando não cresce a
+        // memória sem limite (descarta os mais antigos).
+        if self.frames.len() >= MAX_FRAMES {
+            self.frames.pop_front();
+        }
         self.frames.push_back((at, us));
     }
 
@@ -277,6 +282,10 @@ impl Ring {
             .is_some_and(|(t, _)| now.duration_since(*t) > WINDOW)
         {
             self.frames.pop_front();
+        }
+        // Depois de um pico (menu sem limite de FPS), devolve a memória.
+        if self.frames.capacity() > 4 * self.frames.len().max(1024) {
+            self.frames.shrink_to(self.frames.len() * 2);
         }
     }
 
@@ -320,7 +329,14 @@ fn feed(rings: &mut HashMap<u32, Ring>, carry: &mut Vec<u8>, data: &[u8], comple
 // --- Pipe ---
 
 const INSTANCES: usize = 8;
-const BUF: usize = 64 * 1024;
+/// Buffer de leitura por instância: 512 registros de 8 bytes por leitura (mensagens maiores
+/// chegam em partes, com ERROR_MORE_DATA).
+const BUF: usize = 4 * 1024;
+/// Frames guardados por app: 1000 FPS × 60 s.
+const MAX_FRAMES: usize = 60_000;
+/// Conclusões de leitura atendidas por período: acima disso o pipe espera o próximo período
+/// (um cliente inundando não prende a thread num laço).
+const MAX_SIGNALS_PER_PUMP: u32 = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -670,6 +686,7 @@ impl RtssCollector {
     /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
     /// (evento manual) for sinalizado; devolve `true` nesse caso.
     pub fn pump(&mut self, deadline: Instant, stop: HANDLE) -> bool {
+        let mut handled = 0u32;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -680,22 +697,36 @@ impl RtssCollector {
                 // SAFETY: evento válido (dono: o motor, que espera esta thread terminar).
                 return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
             };
-            let armed: Vec<usize> = (0..instances.len())
-                .map(|k| (k + self.turn) % instances.len())
-                .filter(|&k| instances[k].pending != Pending::None)
-                .collect();
+            if handled >= MAX_SIGNALS_PER_PUMP {
+                // SAFETY: evento válido.
+                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
+            }
+            // O evento de parada vem primeiro (índice 0); depois os das instâncias armadas,
+            // começando por uma diferente a cada volta (justiça entre clientes).
+            let mut events = [HANDLE::default(); INSTANCES + 1];
+            let mut armed = [0usize; INSTANCES];
+            events[0] = stop;
+            let mut n = 0;
+            for i in 0..instances.len() {
+                let k = (i + self.turn) % instances.len();
+                if instances[k].pending != Pending::None {
+                    armed[n] = k;
+                    events[n + 1] = h(&instances[k].event);
+                    n += 1;
+                }
+            }
             self.turn = self.turn.wrapping_add(1);
-            // O evento de parada vem primeiro (índice 0); depois os das instâncias armadas.
-            let mut events = vec![stop];
-            events.extend(armed.iter().map(|&k| h(&instances[k].event)));
             // SAFETY: eventos válidos (no máximo 9).
-            let r = unsafe { WaitForMultipleObjects(&events, false, timeout) };
+            let r = unsafe { WaitForMultipleObjects(&events[..=n], false, timeout) };
             let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
             if idx == 0 {
                 return true;
             }
-            match armed.get(idx - 1) {
-                Some(&k) => instances[k].on_signal(&mut self.exact),
+            match armed[..n].get(idx - 1) {
+                Some(&k) => {
+                    instances[k].on_signal(&mut self.exact);
+                    handled += 1;
+                }
                 None => return false, // timeout ou erro
             }
         }
@@ -746,6 +777,11 @@ impl RtssCollector {
 
     /// Uma amostra: estado do RTSS e do jogo.
     pub fn sample(&mut self) -> Fps {
+        if let Ok(list) = &mut self.pipe {
+            for inst in list.iter_mut().filter(|i| i.pending == Pending::None) {
+                inst.start_connect();
+            }
+        }
         let pipe = match &self.pipe {
             Ok(list) => Ok((list.len(), list.iter().filter(|i| i.connected).count())),
             Err(Some(e)) => fail(e.clone()),
@@ -899,7 +935,7 @@ fn positive(v: f64) -> Metric<f64> {
     if v.is_finite() && v > 0.0 {
         Ok(v)
     } else {
-        fail("no frames in the last second")
+        neutral("no frames in the last second")
     }
 }
 
@@ -1021,6 +1057,13 @@ mod tests {
         r.prune(now);
         assert_eq!(r.frames.len(), 2); // o de t0 saiu da janela de 60 s
         assert_eq!(r.last_second(now).collect::<Vec<_>>(), vec![30_000]);
+        // Teto de frames: um cliente inundando não cresce sem limite.
+        let mut big = Ring::default();
+        for i in 0..(MAX_FRAMES + 10) {
+            big.push(now, i as u32 + 1);
+        }
+        assert_eq!(big.frames.len(), MAX_FRAMES);
+        assert_eq!(big.frames.front().map(|f| f.1), Some(11));
         assert!(r.recent(now, Duration::from_secs(2)));
         assert!(!r.recent(now + Duration::from_secs(3), Duration::from_secs(2)));
     }

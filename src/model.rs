@@ -198,7 +198,7 @@ pub struct Gpu {
 }
 
 /// Leituras da thread lenta por GPU: PCIe TX/RX em bytes/s.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GpuSlow {
     pub index: u32,
     pub pcie_tx: Metric<u64>,
@@ -217,9 +217,11 @@ pub struct CpuSensors {
 }
 
 /// Temperatura de um disco (thread lenta).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiskTemp {
     pub number: u32,
+    /// Modelo do disco lido (confere com `Disk::model` antes de exibir).
+    pub model: Option<String>,
     /// °C.
     pub celsius: Metric<i16>,
     /// De onde veio: "native", "SMART 194", "SMART 190", "pool members".
@@ -227,7 +229,7 @@ pub struct DiskTemp {
 }
 
 /// Jogo acompanhado pelo RTSS.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Game {
     pub pid: u32,
     pub name: String,
@@ -247,7 +249,7 @@ pub struct Game {
 }
 
 /// Estado do RTSS e do jogo (thread do RTSS, a cada 250 ms).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Fps {
     /// RTSS rodando (versão da Shared Memory).
     pub rtss: Metric<String>,

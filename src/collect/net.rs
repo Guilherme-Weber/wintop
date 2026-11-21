@@ -77,7 +77,16 @@ impl NetCollector {
             self.error = Some(format!("GetIfTable2: error {}", r.0));
             return;
         }
-        // SAFETY: tabela válida até FreeMibTable; `NumEntries` linhas a partir de `Table`.
+        // Libera a tabela também se algo abaixo entrar em pânico (catch_unwind do coletor).
+        struct Table(*mut MIB_IF_TABLE2);
+        impl Drop for Table {
+            fn drop(&mut self) {
+                // SAFETY: tabela devolvida por GetIfTable2, liberada uma única vez.
+                unsafe { FreeMibTable(self.0.cast()) };
+            }
+        }
+        let _guard = Table(table);
+        // SAFETY: tabela válida até o guard soltar; `NumEntries` linhas a partir de `Table`.
         let rows = unsafe {
             std::slice::from_raw_parts(
                 (&raw const (*table).Table).cast::<MIB_IF_ROW2>(),
@@ -100,8 +109,6 @@ impl NetCollector {
                 }
             })
             .collect();
-        // SAFETY: tabela devolvida por GetIfTable2; não é usada depois daqui.
-        unsafe { FreeMibTable(table.cast()) };
         found.sort_by_key(|k| from_wide(&k.row.Alias));
         self.nics = found;
         self.error = None;

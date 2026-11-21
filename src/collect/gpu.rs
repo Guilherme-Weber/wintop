@@ -122,6 +122,10 @@ fn throttle_names(r: ThrottleReasons) -> Vec<&'static str> {
         .collect()
 }
 
+/// NVML único do processo, dividido entre as threads rápida e lenta (`Nvml` é Send + Sync): um
+/// só `nvmlInit`/`nvmlShutdown`, sem corrida entre as threads no início e no fim.
+pub type SharedNvml = std::sync::Arc<Result<Nvml, String>>;
+
 /// NVML carregado de System32 por caminho absoluto.
 pub fn init_nvml() -> Result<Nvml, String> {
     let lib = win::system_dir()
@@ -144,7 +148,7 @@ struct Static {
 }
 
 pub struct GpuCollector {
-    nvml: Result<Nvml, String>,
+    nvml: SharedNvml,
     driver: Metric<String>,
     gpus: Vec<Static>,
     query: Result<Query, String>,
@@ -153,8 +157,7 @@ pub struct GpuCollector {
 }
 
 impl GpuCollector {
-    pub fn new() -> Self {
-        let nvml = init_nvml();
+    pub fn new(nvml: SharedNvml) -> Self {
         let query = Query::open();
         let add = |p: &str| match &query {
             Ok(q) => q.add(p),
@@ -163,7 +166,7 @@ impl GpuCollector {
         let dedicated = add(r"\GPU Adapter Memory(*)\Dedicated Usage");
         let shared = add(r"\GPU Adapter Memory(*)\Shared Usage");
         let adapters = dxgi_adapters();
-        let (driver, gpus) = match &nvml {
+        let (driver, gpus) = match nvml.as_ref() {
             Err(e) => (fail(e.clone()), Vec::new()),
             Ok(n) => {
                 let count = n.device_count().unwrap_or(0);
@@ -202,7 +205,11 @@ impl GpuCollector {
     }
 
     pub fn read(&mut self) -> Metric<Vec<Gpu>> {
-        let nvml = self.nvml.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
+        let nvml = self
+            .nvml
+            .as_ref()
+            .as_ref()
+            .map_err(|e| Missing::Fail(e.clone()))?;
         if self.gpus.is_empty() {
             return fail("no NVIDIA GPU in NVML");
         }
@@ -324,16 +331,20 @@ fn failed_gpu(index: u32, cause: &str) -> Gpu {
 
 /// PCIe TX/RX (thread lenta; cada leitura leva ~23 ms). NVML próprio desta thread.
 pub struct GpuSlowCollector {
-    nvml: Result<Nvml, String>,
+    nvml: SharedNvml,
 }
 
 impl GpuSlowCollector {
-    pub fn new() -> Self {
-        Self { nvml: init_nvml() }
+    pub fn new(nvml: SharedNvml) -> Self {
+        Self { nvml }
     }
 
     pub fn read(&mut self) -> Metric<Vec<GpuSlow>> {
-        let nvml = self.nvml.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
+        let nvml = self
+            .nvml
+            .as_ref()
+            .as_ref()
+            .map_err(|e| Missing::Fail(e.clone()))?;
         let count = nv(nvml.device_count())?;
         Ok((0..count)
             .map(|index| match nvml.device_by_index(index) {

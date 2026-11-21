@@ -20,7 +20,6 @@ use crate::win::filetime;
 
 pub struct CpuCollector {
     query: Result<Query, String>,
-    total: Slot,
     per: Slot,
     perf: Slot,
     name: Metric<String>,
@@ -38,16 +37,20 @@ impl CpuCollector {
             Ok(q) => q.add(p),
             Err(e) => Err(e.clone()),
         };
-        let total = add(r"\Processor Information(_Total)\% Processor Time");
         let per = add(r"\Processor Information(*)\% Processor Time");
         let perf = add(r"\Processor Information(_Total)\% Processor Performance");
         let topology = topology();
-        let base_mhz = base_mhz(topology.as_ref().map_or(1, |t| t.logical));
+        // Sem topologia, o número de lógicos vem do sistema (com 1, o buffer do
+        // CallNtPowerInformation seria pequeno demais e a frequência cairia junto).
+        let logical = topology.as_ref().map_or_else(
+            |_| std::thread::available_parallelism().map_or(64, |n| n.get() as u32),
+            |t| t.logical,
+        );
+        let base_mhz = base_mhz(logical);
         // SAFETY: sem pré-condições.
         let virt = unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) }.as_bool();
         Self {
             query,
-            total,
             per,
             perf,
             name: cpu_name().map_or_else(|| fail("CPUID has no brand string leaf"), Ok),
@@ -74,13 +77,19 @@ impl CpuCollector {
             }
             pdh::read(&self.query, slot).or_else(fail)
         };
-        let usage = pdh_val(&self.total).map(|v| v.clamp(0.0, 100.0));
-        let per_logical = match &sampled {
+        // Um contador só: a instância `_Total` vem junto com as dos lógicos.
+        let array = match &sampled {
             Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array(&self.query, &self.per)
-                .or_else(fail)
-                .and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok)),
+            Ok(()) => pdh::read_array(&self.query, &self.per).or_else(fail),
         };
+        let usage = array.as_ref().map_err(Clone::clone).and_then(|a| {
+            a.iter()
+                .find(|(n, _)| n == "_Total")
+                .map(|(_, v)| v.clamp(0.0, 100.0))
+                .map_or_else(|| fail("no _Total instance"), Ok)
+        });
+        let per_logical =
+            array.and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok));
         let freq_mhz = match (pdh_val(&self.perf), &self.base_mhz) {
             (Ok(p), Ok(b)) => Ok(p / 100.0 * f64::from(*b)),
             (Err(e), _) => Err(e),

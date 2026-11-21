@@ -1,14 +1,18 @@
-//! Motor de coleta: duas threads.
+//! Motor de coleta: três threads.
 //!
-//! - rápida: CPU, memória, discos (PDH), rede e GPU (NVML), no intervalo principal (padrão 1 s,
-//!   ajustável em passos de 100 ms);
-//! - lenta: leituras caras (PCIe do NVML; temperaturas de disco a partir da Etapa 2), a cada
-//!   `SLOW_FACTOR` intervalos.
+//! - rápida: CPU, sensores do PawnIO, memória, discos, rede, GPU e o consumo do próprio wintop,
+//!   no intervalo principal (padrão 1 s, ajustável em passos de 100 ms). A 1ª coleta é de
+//!   aquecimento (contadores de taxa) e não é publicada;
+//! - lenta: leituras caras (PCIe do NVML, temperatura dos discos), a cada `SLOW_FACTOR`
+//!   intervalos e nunca abaixo de `SLOW_FLOOR`;
+//! - RTSS: pipe de frametime + Shared Memory (250 ms com jogo, 1 s sem).
 //!
-//! Cada thread cria os próprios coletores (consultas PDH e NVML ficam na thread que as usa) e
-//! publica o último resultado. A parada é imediata: as threads esperam numa `Condvar`.
+//! Cada thread cria os próprios coletores (as consultas PDH ficam na thread que as usa); o NVML
+//! é um só, dividido entre a rápida e a lenta. Cada thread publica o último resultado com um
+//! número de sequência; quem exibe só copia o que mudou. A parada é imediata: as esperas
+//! acordam pela `Condvar` (e pelo evento de parada, no pipe).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -28,8 +32,12 @@ pub const MAX_INTERVAL_MS: u64 = 10_000;
 pub const STEP_MS: u64 = 100;
 const RTSS_GAME_PERIOD: Duration = Duration::from_millis(250);
 const RTSS_IDLE_PERIOD: Duration = Duration::from_secs(1);
-/// A thread lenta roda a cada 2 intervalos.
+/// A thread lenta roda a cada 2 intervalos, nunca abaixo de 2 s (PCIe custa ~46 ms por GPU;
+/// a 100 ms de intervalo ela rodaria 5×/s).
 const SLOW_FACTOR: u32 = 2;
+const SLOW_FLOOR: Duration = Duration::from_secs(2);
+/// Espera entre a coleta de aquecimento e a 1ª publicada.
+const WARMUP: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 struct State {
@@ -47,6 +55,8 @@ struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     interval_ms: AtomicU64,
+    /// Cópia de `State::stop` legível sem o lock (laços longos dos coletores).
+    stopping: AtomicBool,
 }
 
 impl Shared {
@@ -57,11 +67,31 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Espera `d` ou a parada. `true` = parar.
+    fn sleep(&self, d: Duration) -> bool {
+        let deadline = Instant::now() + d;
+        let mut st = self.lock();
+        loop {
+            if st.stop {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            st = self
+                .wake
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
     /// Espera a próxima coleta: `base` é o instante agendado da anterior e o período é
     /// `intervalo × factor`. Um intervalo novo (teclas `+`/`-`) vale na hora: o prazo é refeito a
     /// partir de `base` (se já passou, coleta agora). Devolve a nova base, ou `None` = parar.
-    fn wait_tick(&self, base: Instant, factor: u32) -> Option<Instant> {
-        let period = |ms: u64| Duration::from_millis(ms) * factor;
+    fn wait_tick(&self, base: Instant, factor: u32, floor: Duration) -> Option<Instant> {
+        let period = |ms: u64| (Duration::from_millis(ms) * factor).max(floor);
         let mut st = self.lock();
         // Lido com o lock: `set_interval_ms` grava com o lock, então nenhuma mudança se perde
         // entre esta leitura e a espera.
@@ -117,15 +147,28 @@ impl Engine {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             interval_ms: AtomicU64::new(clamp_interval(interval_ms)),
+            stopping: AtomicBool::new(false),
         });
+        // Um NVML para as duas threads (iniciado aqui, antes delas: sem nvmlInit simultâneo).
+        let nvml = crate::collect::shared_nvml();
         let fast = {
             let sh = Arc::clone(&shared);
+            let nvml_fast = nvml.clone();
             std::thread::Builder::new()
                 .name("coleta-rapida".into())
                 .spawn(move || {
                     // Cada coletor já roda sob catch_unwind; este cobre o resto da thread.
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        let mut c = FastCollectors::new();
+                        let mut c = FastCollectors::new(nvml_fast);
+                        if sh.stopping.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        // Aquecimento: os contadores de taxa só têm valor na 2ª leitura. A 1ª
+                        // coleta não é publicada (a tela não abre cheia de "waiting...").
+                        let _ = c.collect();
+                        if sh.sleep(WARMUP) {
+                            return;
+                        }
                         let mut next = Instant::now();
                         loop {
                             let snap = c.collect();
@@ -134,7 +177,7 @@ impl Engine {
                                 st.fast = Some(snap);
                                 st.fast_seq += 1;
                             }
-                            match sh.wait_tick(next, 1) {
+                            match sh.wait_tick(next, 1, Duration::ZERO) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -162,20 +205,24 @@ impl Engine {
         };
         let slow = {
             let sh = Arc::clone(&shared);
+            let nvml_slow = nvml;
             std::thread::Builder::new()
                 .name("coleta-lenta".into())
                 .spawn(move || {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        let mut c = SlowCollectors::new();
+                        let mut c = SlowCollectors::new(nvml_slow);
                         let mut next = Instant::now();
                         loop {
-                            let snap = c.collect();
+                            if sh.stopping.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let snap = c.collect(&sh.stopping);
                             {
                                 let mut st = sh.lock();
                                 st.slow = Some(snap);
                                 st.slow_seq += 1;
                             }
-                            match sh.wait_tick(next, SLOW_FACTOR) {
+                            match sh.wait_tick(next, SLOW_FACTOR, SLOW_FLOOR) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -243,6 +290,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.shared.lock().stop = true;
+        self.shared.stopping.store(true, Ordering::Relaxed);
         self.shared.wake.notify_all();
         // SAFETY: evento válido enquanto o motor existe.
         unsafe {
@@ -266,7 +314,11 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
         publish(rtss::failed("RTSS collector panicked on startup"));
         return;
     };
+    let mut last: Option<Fps> = None;
     loop {
+        if sh.lock().stop {
+            return;
+        }
         let Ok(snap) = catch_unwind(AssertUnwindSafe(|| c.sample())) else {
             publish(rtss::failed("RTSS collector panicked"));
             return;
@@ -276,10 +328,11 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
         } else {
             RTSS_IDLE_PERIOD
         };
-        if sh.lock().stop {
-            return;
+        // Só publica o que mudou (sem jogo, o estado se repete a cada segundo: nada a redesenhar).
+        if last.as_ref() != Some(&snap) {
+            last = Some(snap.clone());
+            publish(snap);
         }
-        publish(snap);
         match catch_unwind(AssertUnwindSafe(|| c.pump(Instant::now() + period, stop))) {
             Ok(false) => {}
             Ok(true) => return,

@@ -60,7 +60,7 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | Spike |
 | SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
 | Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s) | Spike |
-| Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "vários pools: associação pendente" (com mais de um pool); "em repouso" (como a capacidade) | Spike (1 pool, 5 membros) |
+| Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "em repouso" (como a capacidade) | Spike (1 pool, 5 membros) |
 | Letras das unidades | `GetLogicalDrives` (só unidades fixas e removíveis) + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` em `\\.\X:` → números dos discos; relido a cada 30 s; membros do pool não têm letra | | | E1 |
 | Disco do sistema / arquivo de paginação | letra do Windows (`GetSystemWindowsDirectoryW`) e dos pagefiles (`ExistingPageFiles` no registro) → disco pelas letras | | | E1 |
 | Tempo ativo (%) | `IOCTL_DISK_PERFORMANCE` (handle sem acesso; não acorda o disco): `100 - Δidle/ΔQueryTime`, limitado a 0-100. Mesma fonte do PDH `\PhysicalDisk`, sem os ~54 MB que o provedor do PDH reserva | | | E1 (= PDH na mesma janela) |
@@ -120,7 +120,7 @@ aberto antes do wintop)"** até o jogo reiniciar.
 | API 3D | `dwFlags & 0xFFFF` | | | Spike |
 | Resolução | `dwResolutionX/Y` (v2.20+) | | | Spike |
 | FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (pipe e SHM) |
-| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)" | Spike (pipe: 7435 frames do Deadlock) |
+| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock) |
 | 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s) |
 | Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
 | RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 (só no modo normal; o `--check` não inicia o RTSS nem cria o pipe) |

@@ -298,7 +298,7 @@ fn volume_letters() -> Vec<(u32, String)> {
 /// Inventário de um disco (lido na descoberta; capacidade e layout de novo se estava em repouso).
 pub(super) struct Inventory {
     pub(super) number: u32,
-    model: Metric<String>,
+    pub(super) model: Metric<String>,
     pub(super) bus: Metric<Bus>,
     pub(super) ssd: Metric<bool>,
     capacity: Metric<u64>,
@@ -422,7 +422,9 @@ impl Inventory {
         let now = match h.ioctl(IOCTL_DISK_PERFORMANCE, None, PERF_SIZE) {
             Ok(b) => parse_perf(&b),
             Err(e) => {
-                self.lost = true;
+                if Handle::open(self.number, 0).is_none() {
+                    self.lost = true;
+                }
                 return fail(e);
             }
         };

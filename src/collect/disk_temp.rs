@@ -7,6 +7,7 @@
 //!
 //! Offsets conferidos com o MSVC (winioctl.h) na Etapa 0.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
@@ -129,7 +130,7 @@ impl DiskTempCollector {
             .collect();
     }
 
-    pub fn read(&mut self) -> Metric<Vec<DiskTemp>> {
+    pub fn read(&mut self, stop: &AtomicBool) -> Metric<Vec<DiskTemp>> {
         if self.discovered.elapsed() >= REDISCOVER || self.disks.iter().any(|(d, _)| d.lost) {
             self.rediscover();
         }
@@ -138,6 +139,10 @@ impl DiskTempCollector {
         }
         let now = Instant::now();
         for (d, st) in &mut self.disks {
+            // Cada HDD leva até ~156 ms: a parada do motor não espera a volta inteira.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             if !st.due(now) {
                 continue;
             }
@@ -174,12 +179,14 @@ impl DiskTempCollector {
                 if d.bus == Ok(Bus::Spaces) {
                     DiskTemp {
                         number: d.number,
+                        model: d.model.as_ref().ok().cloned(),
                         celsius: pool_temp(pools, &members, unknown_asleep),
                         source: "pool members",
                     }
                 } else {
                     DiskTemp {
                         number: d.number,
+                        model: d.model.as_ref().ok().cloned(),
                         celsius: st.value.clone(),
                         source: st.source,
                     }
@@ -222,7 +229,8 @@ fn read_one(d: &mut Inventory, st: &mut State) {
         d.lost = true;
         st.value = fail("disk not found");
     }
-    d.handle = held;
+    // Disco perdido: o handle velho não volta (a redescoberta abre outro).
+    d.handle = if d.lost { None } else { held };
 }
 
 fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {

@@ -74,6 +74,7 @@ pub struct State {
     send: HashMap<String, Series>,
     recv: HashMap<String, Series>,
     game_fps: Series,
+    game_pid: Option<u32>,
 }
 
 impl State {
@@ -97,6 +98,8 @@ impl State {
                 .push(g.usage.as_ref().map_or(0.0, |v| f64::from(*v) / 100.0));
         }
         if let Ok(list) = &f.disks {
+            self.disks
+                .retain(|n, _| list.iter().any(|d| d.number == *n));
             for d in list {
                 self.disks
                     .entry(d.number)
@@ -105,6 +108,8 @@ impl State {
             }
         }
         if let Ok(list) = &f.nics {
+            self.send.retain(|a, _| list.iter().any(|n| &n.alias == a));
+            self.recv.retain(|a, _| list.iter().any(|n| &n.alias == a));
             for n in list {
                 let v = |m: &Metric<f64>| m.as_ref().copied().unwrap_or(0.0);
                 self.send
@@ -122,13 +127,13 @@ impl State {
 
     /// Novo estado do RTSS (a cada 250 ms com jogo).
     pub fn push_fps(&mut self, s: Fps) {
-        let v = s
-            .game
-            .as_ref()
-            .ok()
-            .and_then(|g| g.fps.as_ref().ok().copied())
-            .unwrap_or(0.0);
-        self.game_fps.push(v);
+        if let Ok(g) = &s.game {
+            if self.game_pid != Some(g.pid) {
+                self.game_pid = Some(g.pid);
+                self.game_fps = Series::default();
+            }
+            self.game_fps.push(g.fps.as_ref().map_or(0.0, |v| *v));
+        }
         self.fps = Some(s);
     }
 }
@@ -217,8 +222,8 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let [graph_area, info] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
     let per = c.per_logical.as_ref().ok();
-    // Grade dos lógicos à direita: duas colunas de largura fixa.
-    let cores_w = if per.is_some() { 34 } else { 0 };
+    // Grade dos lógicos à direita: duas colunas de largura fixa (com a causa, se falhou).
+    let cores_w = 34;
     let [graph, cores] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(cores_w)]).areas(graph_area);
     frame.render_widget(
@@ -258,6 +263,15 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Rect::new(x + 10, y, 6, 1).intersection(cores),
             );
         }
+    } else {
+        // Uso por lógico indisponível: a causa aparece no lugar da grade.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                label("per core "),
+                metric(&c.per_logical, |_| String::new()),
+            ])),
+            cores,
+        );
     }
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
     let mut l1 = vec![
@@ -331,6 +345,14 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         return;
     };
     let Some(g) = list.first() else {
+        frame.render_widget(
+            Paragraph::new(metric::<()>(
+                &Err(Missing::Fail("NVML reported no GPU".into())),
+                |()| String::new(),
+            ))
+            .block(boxed("gpu", BORDER_GPU)),
+            area,
+        );
         return;
     };
     let name = g.name.as_ref().map_or("gpu".to_string(), |n| printable(n));
@@ -357,10 +379,9 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     bar_line(frame, bars, 0, "VRAM  ", &g.dedicated);
     bar_line(frame, bars, 1, "shared", &g.shared);
     let clock = |m: &Metric<(u32, u32)>| metric(m, |(c, _)| format!("{c} MHz"));
-    let slow = st
-        .slow
-        .as_ref()
-        .and_then(|s| s.gpus.as_ref().ok())
+    let slow_gpus = st.slow.as_ref().map(|s| &s.gpus);
+    let slow = slow_gpus
+        .and_then(|r| r.as_ref().ok())
         .and_then(|l| l.iter().find(|x| x.index == g.index));
     let mut l3 = vec![
         label("PCIe "),
@@ -368,6 +389,13 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             format!("Gen{generation} x{w}")
         }),
     ];
+    if let Some(Err(e)) = slow_gpus {
+        l3.extend([
+            sep(),
+            label("tx/rx "),
+            metric::<()>(&Err(e.clone()), |()| String::new()),
+        ]);
+    }
     if let Some(s) = slow {
         l3.extend([
             sep(),
@@ -532,7 +560,12 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let temps = st.slow.as_ref().and_then(|s| s.disk_temps.as_ref().ok());
+    let temps_all = st.slow.as_ref().map(|s| &s.disk_temps);
+    let temps = temps_all.and_then(|r| r.as_ref().ok());
+    let temps_err = match temps_all {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
     // Discos com letra (e o disco virtual) primeiro; membros do pool por último, indentados.
     let mut order: Vec<&Disk> = list.iter().filter(|d| d.pool_member != Ok(true)).collect();
     order.extend(list.iter().filter(|d| d.pool_member == Ok(true)));
@@ -573,10 +606,17 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Rect::new(inner.x + NAME_W, y, graph_w, rows).intersection(inner),
             );
         }
+        let same_model = |t: &&crate::model::DiskTemp| t.model == d.model.as_ref().ok().cloned();
         let t = temps
             .and_then(|l| l.iter().find(|t| t.number == d.number))
+            .filter(same_model)
             .map_or_else(
-                || Span::raw(""),
+                || {
+                    temps_err.clone().map_or_else(
+                        || Span::raw(""),
+                        |e| metric::<()>(&Err(e), |()| String::new()),
+                    )
+                },
                 |t| metric(&t.celsius, |c| format!("{c} °C")),
             );
         let info = Line::from(vec![
@@ -627,7 +667,9 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     // Interfaces conectadas com gráfico (2 linhas: envio e recebimento); desconectadas numa
     // linha só, no fim.
-    let (up, down): (Vec<_>, Vec<_>) = list.iter().partition(|n| n.link.is_ok());
+    let (down, up): (Vec<_>, Vec<_>) = list
+        .iter()
+        .partition(|n| matches!(n.link, Err(Missing::Neutral(_))));
     let mut y = inner.y;
     let bottom = inner.y + inner.height;
     const NAME_W: u16 = 24;
@@ -708,10 +750,16 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let g = match &fps.game {
         Ok(g) => g,
         Err(e) => {
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(metric::<()>(&Err(e.clone()), |()| String::new())),
                 Line::from(vec![label("RTSS "), metric(&fps.rtss, Clone::clone)]),
             ];
+            if let Err(Missing::Fail(_)) = &fps.pipe {
+                lines.push(Line::from(vec![
+                    label("frametime pipe "),
+                    metric(&fps.pipe, |_| String::new()),
+                ]));
+            }
             frame.render_widget(Paragraph::new(lines).block(block), area);
             return;
         }
@@ -720,7 +768,11 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         "game  {} ({}){}",
         printable(&g.name),
         g.api,
-        if g.approx { "  approx." } else { "" }
+        if g.approx {
+            "  approx. (game opened before wintop)"
+        } else {
+            ""
+        }
     );
     let block = boxed(&title, BORDER_GAME);
     let inner = block.inner(area);

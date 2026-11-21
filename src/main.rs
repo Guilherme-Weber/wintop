@@ -1,8 +1,8 @@
 //! wintop: monitor de sistema em terminal para Windows.
 //!
-//! Etapa 1: coletores nativos (CPU, memória, discos, rede, GPU), motor com duas threads e
-//! `wintop --check`. A interface (TUI) entra na Etapa 5; até lá, sem argumentos, o wintop
-//! imprime um resumo a cada coleta. Ver `docs/metricas.md`.
+//! Sem argumentos: o motor (threads rápida, lenta e do RTSS) e a TUI. `--check`: coleta duas
+//! vezes e mostra o estado de cada métrica (só diagnostica; roda com a TUI aberta). Ver
+//! `docs/metricas.md`.
 
 mod check;
 mod collect;
