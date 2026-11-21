@@ -99,6 +99,138 @@ fn check_tree(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Dono = Administradores e, com `dacl`, ACL protegida herdável: SYSTEM e Administradores com
+/// controle total, Usuários só leitura e execução. Num processo elevado, o dono padrão do que
+/// ele cria pode ser o próprio usuário (e o CREATOR OWNER herdado de Program Files daria a ele
+/// controle total: processos sem elevação poderiam trocar o executável).
+fn secure(path: &Path, dacl: bool) -> Result<(), String> {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        SetNamedSecurityInfoW,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let sddl = wide("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            None,
+        )
+    }
+    .map_err(|e| format!("SDDL: {e}"))?;
+    let mut owner = PSID::default();
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    let (mut present, mut defaulted) = (windows::core::BOOL(0), windows::core::BOOL(0));
+    // SAFETY: descritor válido; os ponteiros apontam para dentro dele.
+    let r = unsafe {
+        GetSecurityDescriptorOwner(sd, &raw mut owner, &raw mut defaulted).and_then(|()| {
+            GetSecurityDescriptorDacl(sd, &raw mut present, &raw mut acl, &raw mut defaulted)
+        })
+    };
+    let w = wide(&path.to_string_lossy());
+    let info = if dacl {
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        OWNER_SECURITY_INFORMATION
+    };
+    let set = r.map_err(|e| e.to_string()).and_then(|()| {
+        // SAFETY: caminho terminado em zero; dono e DACL válidos dentro do descritor.
+        let e = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(w.as_ptr()),
+                SE_FILE_OBJECT,
+                info,
+                Some(owner),
+                None,
+                dacl.then_some(acl.cast_const()),
+                None,
+            )
+        };
+        if e.is_ok() {
+            Ok(())
+        } else {
+            Err(format!("{}: set security: {e:?}", path.display()))
+        }
+    });
+    // SAFETY: descritor alocado pela API; liberado uma vez.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    set
+}
+
+/// Cria `path` novo (exclusivo) já com dono Administradores e acesso só de SYSTEM e
+/// Administradores: não existe instante em que o usuário seja dono (e possa mudar a ACL).
+fn create_protected(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
+    };
+    let sddl = wide("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)");
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            None,
+        )
+    }
+    .map_err(|e| format!("SDDL: {e}"))?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let w = wide(&path.to_string_lossy());
+    // SAFETY: caminho terminado em zero; atributos válidos durante a chamada.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(w.as_ptr()),
+            FILE_GENERIC_WRITE.0,
+            FILE_SHARE_MODE(0),
+            Some(&raw const sa),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    // SAFETY: descritor alocado pela API; liberado uma vez (o arquivo já tem a cópia dele).
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    let h = h.map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: handle recém-criado, só nosso; o File passa a ser o dono.
+    let mut f = unsafe { std::fs::File::from_raw_handle(h.0) };
+    f.write_all(data)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Dono = Administradores em tudo dentro de `path` (a ACL vem herdada da pasta protegida).
+fn secure_owner_tree(path: &Path) -> Result<(), String> {
+    if is_link(path) {
+        return Err(format!("{} is a link: refusing to install", path.display()));
+    }
+    secure(path, false)?;
+    if path.is_dir() {
+        for e in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
+            secure_owner_tree(&e.map_err(|e| e.to_string())?.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Problemas de ACL que deixariam alguém sem elevação trocar `path`.
 pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
     let w = wide(&path.to_string_lossy());
@@ -334,7 +466,10 @@ pub fn install() -> Result<(), String> {
     if dir.exists() {
         check_tree(&dir).map_err(|e| format!("{e} (remove {} and try again)", dir.display()))?;
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !dir.exists() {
+        std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        secure(&dir, true)?;
+    }
     check_tree(&dir)?;
     if !same_file(&me, &exe) {
         std::fs::copy(&me, &exe).map_err(|e| format!("copy to {}: {e}", exe.display()))?;
@@ -345,7 +480,8 @@ pub fn install() -> Result<(), String> {
         println!("copied to {}", dir.display());
     }
     // Depois da cópia: tudo o que o wintop elevado executa ou carrega (o exe e os módulos do
-    // PawnIO) continua protegido.
+    // PawnIO) com dono Administradores e protegido.
+    secure_owner_tree(&dir)?;
     check_tree(&dir)?;
     let user = crate::win::user_sid().ok_or("could not read the user SID")?;
     let xml = dir.join("wintop-task.xml");
@@ -357,16 +493,7 @@ pub fn install() -> Result<(), String> {
     if xml.exists() || is_link(&xml) {
         std::fs::remove_file(&xml).map_err(|e| format!("{}: {e}", xml.display()))?;
     }
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&xml)
-            .map_err(|e| format!("{}: {e}", xml.display()))?;
-        f.write_all(&utf16)
-            .map_err(|e| format!("{}: {e}", xml.display()))?;
-    }
+    create_protected(&xml, &utf16)?;
     check_tree(&xml)?;
     let r = schtasks(&["/create", "/tn", TASK, "/xml", &xml.to_string_lossy(), "/f"]);
     let _ = std::fs::remove_file(&xml);

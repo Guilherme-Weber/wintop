@@ -49,8 +49,14 @@ impede a abertura: o wintop usa os padrões, avisa no rodapé e não o regrava.
 uma tarefa agendada que executa o wintop com privilégio máximo (somente com o login do usuário,
 sem gatilhos) e um atalho no Menu Iniciar que dispara essa tarefa, sem a janela do UAC. Antes de
 criar a tarefa, o instalador confere que nenhum usuário sem elevação pode alterar a pasta ou o
-executável; caso contrário, recusa a instalação. `wintop --uninstall` remove a tarefa, o atalho
-e a cópia instalada.
+executável (a pasta recebe dono Administradores e uma ACL própria); caso contrário, recusa a
+instalação. Aberto pelo atalho, o wintop usa o console clássico do Windows (o Agendador de
+Tarefas não repassa para o Windows Terminal). `wintop --uninstall` remove a tarefa, o atalho e
+a cópia instalada.
+
+Com o atalho instalado, qualquer programa do usuário consegue abrir o wintop elevado. Por isso o
+que o wintop lê e grava na pasta do usuário (o `config.toml`) passa por verificações: links,
+redirecionamentos e caminhos que não sejam locais são recusados.
 
 ## Requisitos
 
