@@ -78,8 +78,11 @@ Add-Type -AssemblyName System.IO.Compression
 $fs = [IO.File]::Open($zip, [IO.FileMode]::CreateNew)
 try {
     $archive = [IO.Compression.ZipArchive]::new($fs, [IO.Compression.ZipArchiveMode]::Create)
-    $files = Get-ChildItem $stage -Recurse -File |
-        Sort-Object { $_.FullName.Substring($stage.Length + 1).Replace('\', '/') } -Culture ([cultureinfo]::InvariantCulture)
+    # Ordem ordinal (byte a byte): não depende da cultura da máquina (o -Culture do Sort-Object
+    # não aceita a invariante).
+    $files = [IO.FileInfo[]](Get-ChildItem $stage -Recurse -File)
+    $keys = [string[]]($files | ForEach-Object { $_.FullName.Substring($stage.Length + 1).Replace('\', '/') })
+    [Array]::Sort($keys, $files, [StringComparer]::Ordinal)
     foreach ($f in $files) {
         $rel = "$name/" + $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
         $entry = $archive.CreateEntry($rel, [IO.Compression.CompressionLevel]::Optimal)
