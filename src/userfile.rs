@@ -8,7 +8,8 @@
 //! - toda abertura usa `FILE_FLAG_OPEN_REPARSE_POINT` (um reparse point é recusado, não seguido)
 //!   e confere o caminho final do handle contra o esperado;
 //! - a pasta base (`AppData\Roaming`) tem de ter como dono o próprio usuário, ou Administradores
-//!   dentro do perfil dele (AppData apontado para uma pasta do sistema é recusado);
+//!   só no caminho padrão dentro do perfil, sem redirecionamento (AppData apontado para uma
+//!   pasta do sistema ou de Administradores é recusado);
 //! - as pastas ficam abertas sem `FILE_SHARE_DELETE` durante a operação (não podem ser trocadas
 //!   por uma junction no meio dela);
 //! - a gravação vai para um temporário novo e exclusivo (`CREATE_NEW`) e é trocada pelo próprio
@@ -206,19 +207,52 @@ fn owner(c: &Checked) -> Result<String, String> {
 /// Administradores (dono padrão do que um processo elevado cria).
 const ADMINISTRATORS: &str = "S-1-5-32-544";
 
-/// A base é do usuário: dono = o próprio usuário, ou Administradores **dentro do perfil dele**
-/// (perfis criados por imagem ou por processo elevado, como nos runners do GitHub). Fora do
-/// perfil, uma pasta de Administradores (ex.: `Program Files\wintop`) seria um redirecionamento
-/// do AppData pelo HKCU: recusada.
-fn trusted_owner(own: &str, user: &str, base: &Path, profile: Option<&Path>) -> bool {
+/// Bases padrão (sem redirecionamento) dentro do perfil: o AppData e o Menu Iniciar do usuário.
+const DEFAULT_BASES: [&str; 2] = [
+    r"AppData\Roaming",
+    r"AppData\Roaming\Microsoft\Windows\Start Menu",
+];
+
+/// A base é do usuário: dono = o próprio usuário, ou Administradores só numa base **padrão** do
+/// perfil (perfis criados por imagem ou por processo elevado, como nos runners do GitHub). Um
+/// redirecionamento pelo HKCU para outra pasta de Administradores (`Program Files\wintop`, ou
+/// uma subpasta protegida do perfil) é recusado. `base` e `profile` já normalizados (`norm`).
+fn trusted_owner(own: &str, user: &str, base: &str, profile: Option<&str>) -> bool {
     if own == user {
         return true;
     }
     let Some(profile) = profile else {
         return false;
     };
-    let p = format!("{}\\", norm(&profile.to_string_lossy()));
-    own == ADMINISTRATORS && norm(&base.to_string_lossy()).starts_with(&p)
+    own == ADMINISTRATORS
+        && DEFAULT_BASES
+            .iter()
+            .any(|d| base == norm(&format!(r"{profile}\{d}")))
+}
+
+/// Perfil do usuário normalizado pelo caminho final (nomes longos, sem `\\?\`): o
+/// `ProfileImagePath` do HKLM pode ter nome curto 8.3. Segue links de propósito: a origem
+/// (HKLM) não é do usuário, e a base é conferida contra o caminho final dela.
+fn profile_final() -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE};
+    let p = crate::win::profile_dir()?;
+    let w = wide(&p.to_string_lossy());
+    // SAFETY: caminho terminado em zero; o handle passa a ter dono logo abaixo.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(w.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
+    let h = unsafe { crate::win::own(h) };
+    final_path(HANDLE(h.as_raw_handle())).ok()
 }
 
 /// Pastas abertas e conferidas para uma operação em `<base>\<dir>`.
@@ -238,8 +272,9 @@ impl UserDir {
             open(base, GENERIC_READ.0, share, OPEN_EXISTING, true, true).map_err(String::from)?;
         let user = crate::win::user_sid().ok_or("could not read the user SID")?;
         let own = owner(&b)?;
-        let profile = crate::win::profile_dir();
-        if !trusted_owner(&own, &user, base, profile.as_deref()) {
+        // `open` já conferiu que o caminho final da base é ela mesma.
+        let based = norm(&base.to_string_lossy());
+        if own != user && !trusted_owner(&own, &user, &based, profile_final().as_deref()) {
             return Err(format!(
                 "{} is not owned by the current user ({own}): refused",
                 base.display()
@@ -493,20 +528,37 @@ mod tests {
     }
 
     #[test]
-    fn dono_administradores_so_dentro_do_perfil() {
+    fn dono_administradores_so_nas_bases_padrao() {
         let user = "S-1-5-21-1-2-3-1001";
-        let prof = Path::new(r"C:\Users\nome");
-        let roam = Path::new(r"C:\Users\nome\AppData\Roaming");
-        assert!(trusted_owner(user, user, roam, Some(prof)));
-        assert!(trusted_owner(ADMINISTRATORS, user, roam, Some(prof)));
-        // Fora do perfil (AppData redirecionado), prefixo parecido ou sem perfil: recusado.
-        let pf = Path::new(r"C:\Program Files\wintop");
-        assert!(!trusted_owner(ADMINISTRATORS, user, pf, Some(prof)));
-        let irmao = Path::new(r"C:\Users\nome2\AppData\Roaming");
-        assert!(!trusted_owner(ADMINISTRATORS, user, irmao, Some(prof)));
+        let prof = Some(r"c:\users\nome");
+        let roam = r"c:\users\nome\appdata\roaming";
+        let menu = r"c:\users\nome\appdata\roaming\microsoft\windows\start menu";
+        assert!(trusted_owner(user, user, roam, prof));
+        assert!(trusted_owner(ADMINISTRATORS, user, roam, prof));
+        assert!(trusted_owner(ADMINISTRATORS, user, menu, prof));
+        // Redirecionado: fora do perfil, para uma subpasta do perfil, outro perfil, sem perfil.
+        let fora = [
+            r"c:\program files\wintop",
+            r"c:\users\nome\appdata\roaming\protegida",
+            r"c:\users\nome\appdata",
+            r"c:\users\nome2\appdata\roaming",
+        ];
+        for b in fora {
+            assert!(!trusted_owner(ADMINISTRATORS, user, b, prof), "{b}");
+            // A pasta do próprio usuário redirecionada continua valendo.
+            assert!(trusted_owner(user, user, b, prof));
+        }
         assert!(!trusted_owner(ADMINISTRATORS, user, roam, None));
-        // Outros donos (SYSTEM, TrustedInstaller), mesmo dentro do perfil: recusados.
-        assert!(!trusted_owner("S-1-5-18", user, roam, Some(prof)));
+        // Outros donos (SYSTEM, TrustedInstaller), mesmo na base padrão: recusados.
+        assert!(!trusted_owner("S-1-5-18", user, roam, prof));
+    }
+
+    #[test]
+    fn perfil_normalizado_e_a_base_padrao_do_roaming() {
+        let p = profile_final().expect("perfil");
+        assert!(!p.starts_with(r"\\") && !p.contains('~'), "{p}");
+        let roam = norm(&roaming().to_string_lossy());
+        assert_eq!(roam, norm(&format!(r"{p}\{}", DEFAULT_BASES[0])));
     }
 
     #[test]
