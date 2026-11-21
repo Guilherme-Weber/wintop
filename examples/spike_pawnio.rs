@@ -254,7 +254,8 @@ fn open_pci_mutex() -> Result<OwnedHandle, String> {
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
-    r.map(common::own)
+    // SAFETY: CreateMutexW teve sucesso; handle válido e sem outro dono.
+    r.map(|h| unsafe { common::own(h) })
         .map_err(|e| format!("mutex Access_PCI: {e}"))
 }
 

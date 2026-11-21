@@ -24,8 +24,12 @@ pub fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Dono de um `HANDLE` do Win32: fecha no `Drop` (inclusive em caminhos de erro).
-pub fn own(h: HANDLE) -> OwnedHandle {
-    // SAFETY: `h` acabou de ser obtido, é válido e passa a ter um único dono.
+///
+/// # Safety
+/// `h` tem de ser um handle aberto, válido (nem nulo nem `INVALID_HANDLE_VALUE`) e sem outro
+/// dono: depois desta chamada só o `OwnedHandle` o fecha.
+pub unsafe fn own(h: HANDLE) -> OwnedHandle {
+    // SAFETY: garantido por quem chama (ver acima).
     unsafe { OwnedHandle::from_raw_handle(h.0) }
 }
 
@@ -53,7 +57,8 @@ pub fn is_elevated() -> bool {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
         return false;
     }
-    let _token = own(token);
+    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
+    let _token = unsafe { own(token) };
     let mut elev = TOKEN_ELEVATION::default();
     let mut len = 0u32;
     // SAFETY: buffer do tamanho de TOKEN_ELEVATION.
@@ -72,10 +77,11 @@ pub fn is_elevated() -> bool {
 
 /// Visão somente leitura de uma Shared Memory nomeada, com o tamanho real da região.
 ///
-/// A memória é escrita por outro processo enquanto lemos: toda leitura é `volatile` e byte a
-/// byte (sem exigir alinhamento), com limites conferidos contra o tamanho da região. Campos
-/// dependentes (ex.: `dwTime0`, `dwTime1`, `dwFrames`) podem vir de instantes diferentes; quem
-/// lê valida a coerência.
+/// A memória é escrita por outro processo enquanto lemos: toda leitura é `volatile`, com limites
+/// conferidos contra o tamanho da região. Campos de 32/64 bits alinhados são lidos numa única
+/// carga (atômica no x86-64: nunca metade do valor antigo e metade do novo); só offsets
+/// desalinhados caem na leitura byte a byte. Campos diferentes (ex.: `dwTime0`, `dwTime1`,
+/// `dwFrames`) podem vir de instantes diferentes; quem lê valida a coerência.
 pub struct SharedView {
     _handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
@@ -88,7 +94,8 @@ impl SharedView {
         // SAFETY: nome terminado em zero.
         let handle =
             unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(w.as_ptr())) }.ok()?;
-        let handle = own(handle);
+        // SAFETY: OpenFileMappingW teve sucesso; handle válido e sem outro dono.
+        let handle = unsafe { own(handle) };
         // SAFETY: handle válido de mapeamento; a view é liberada em Drop.
         let view = unsafe { MapViewOfFile(HANDLE(handle.as_raw_handle()), FILE_MAP_READ, 0, 0, 0) };
         if view.Value.is_null() {
@@ -129,12 +136,32 @@ impl SharedView {
         Some(out)
     }
 
+    /// Ponteiro para `[off, off+n)` se couber na região.
+    fn at(&self, off: usize, n: usize) -> Option<*const u8> {
+        (off.checked_add(n)? <= self.len).then(|| {
+            // SAFETY: `off + n <= len`: o resultado está dentro da região mapeada.
+            unsafe { self.view.Value.cast::<u8>().cast_const().add(off) }
+        })
+    }
+
     pub fn u32_at(&self, off: usize) -> Option<u32> {
-        self.read::<4>(off).map(u32::from_le_bytes)
+        let p = self.at(off, 4)?;
+        if p.cast::<u32>().is_aligned() {
+            // SAFETY: dentro da região (at) e alinhado: uma carga volátil de 32 bits.
+            Some(unsafe { p.cast::<u32>().read_volatile() })
+        } else {
+            self.read::<4>(off).map(u32::from_le_bytes)
+        }
     }
 
     pub fn u64_at(&self, off: usize) -> Option<u64> {
-        self.read::<8>(off).map(u64::from_le_bytes)
+        let p = self.at(off, 8)?;
+        if p.cast::<u64>().is_aligned() {
+            // SAFETY: dentro da região (at) e alinhado: uma carga volátil de 64 bits.
+            Some(unsafe { p.cast::<u64>().read_volatile() })
+        } else {
+            self.read::<8>(off).map(u64::from_le_bytes)
+        }
     }
 
     pub fn f32_at(&self, off: usize) -> Option<f32> {

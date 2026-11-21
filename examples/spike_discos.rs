@@ -76,7 +76,8 @@ impl Disk {
             )
         }
         .ok()
-        .map(|h| Self(common::own(h)))
+        // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
+        .map(|h| Self(unsafe { common::own(h) }))
     }
 
     fn raw(&self) -> HANDLE {
@@ -227,8 +228,17 @@ fn main() {
             }
             _ => "?",
         };
+        // Repouso primeiro, só com o handle de metadados (acesso 0): um HDD parado não recebe
+        // nenhum IOCTL que abra o disco para leitura (tamanho, layout, temperatura). No
+        // coletor, tamanho e layout são lidos uma vez na descoberta.
+        let awake = meta.awake();
+        let sleeping_hdd = awake == Some(false) && kind == "HDD";
         // Tamanho e layout exigem um handle com leitura (com acesso 0 o IOCTL falha).
-        let reader = Disk::open(n, GENERIC_READ.0);
+        let reader = if sleeping_hdd {
+            None
+        } else {
+            Disk::open(n, GENERIC_READ.0)
+        };
         let size_gib = reader
             .as_ref()
             .and_then(|r| r.ioctl(IOCTL_DISK_GET_LENGTH_INFO, None, 8).ok())
@@ -242,8 +252,6 @@ fn main() {
             })
             .is_some_and(|l| is_pool_member(&l));
 
-        // Repouso primeiro: em repouso (HDD) não há leitura de temperatura.
-        let awake = meta.awake();
         let mut info = Info {
             n,
             name,
@@ -257,7 +265,7 @@ fn main() {
         };
         if bus == BUS_SPACES {
             // disco virtual: temperatura agregada depois
-        } else if awake == Some(false) && kind == "HDD" {
+        } else if sleeping_hdd {
             info.temp_err = "em repouso (não consultado)".into();
         } else {
             let t = Instant::now();

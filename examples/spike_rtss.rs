@@ -23,8 +23,8 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, HANDLE,
-    HLOCAL, LocalFree, WAIT_OBJECT_0,
+    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -45,7 +45,8 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForMultipleObjects,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent, SetEvent,
+    WaitForMultipleObjects,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -231,10 +232,10 @@ fn select_game(apps: &[App], fg: Option<u32>) -> Option<&App> {
 /// (1% low, 0,1% low) em FPS: média dos frametimes do 1% (0,1%) mais lento. Exige ao menos
 /// 100 amostras; com menos de 1000, o 0,1% usa o pior frame.
 fn lows(samples_us: &[u32]) -> Option<(f64, f64)> {
-    if samples_us.len() < 100 {
+    let mut s: Vec<u32> = samples_us.iter().copied().filter(|&u| u > 0).collect();
+    if s.len() < 100 {
         return None;
     }
-    let mut s: Vec<u32> = samples_us.iter().copied().filter(|&u| u > 0).collect();
     s.sort_unstable_by(|a, b| b.cmp(a));
     let avg_fps = |k: usize| {
         let k = k.clamp(1, s.len());
@@ -280,7 +281,8 @@ fn user_sid() -> Option<String> {
     let mut token = HANDLE::default();
     // SAFETY: token passa a ter dono logo abaixo.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
-    let _token = common::own(token);
+    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
+    let _token = unsafe { common::own(token) };
     let mut buf = vec![0u64; 64]; // alinhado para TOKEN_USER
     let mut len = 0u32;
     // SAFETY: buffer local com o tamanho informado.
@@ -313,7 +315,8 @@ fn process_name(pid: u32) -> String {
     let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
         return "?".into();
     };
-    let h = common::own(h);
+    // SAFETY: OpenProcess teve sucesso; handle válido e sem outro dono.
+    let h = unsafe { common::own(h) };
     let mut buf = [0u16; 260];
     let mut len = buf.len() as u32;
     // SAFETY: buffer local com o tamanho informado.
@@ -335,15 +338,23 @@ fn process_name(pid: u32) -> String {
 const INSTANCES: usize = 8;
 const BUF: usize = 64 * 1024;
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Pending {
     None,
+    /// `ConnectNamedPipe` pendente.
     Connect,
+    /// Cliente conectou antes do `ConnectNamedPipe` (`ERROR_PIPE_CONNECTED`): evento sinalizado
+    /// à mão para o loop principal tratar.
+    Connected,
+    /// Rearmar a conexão no próximo ciclo (ex.: `ERROR_NO_DATA`), sem recursão.
+    Rearm,
+    /// `ReadFile` emitido (pendente ou já concluído; o evento sinaliza nos dois casos).
     Read,
 }
 
 /// Uma instância do pipe. `ov` e `buf` ficam em Box: o endereço não muda enquanto há I/O
-/// pendente.
+/// pendente. Toda conclusão passa pelo evento e é tratada no loop principal (`on_signal`), uma
+/// por vez: sem recursão e sem laço de leituras síncronas.
 struct Instance {
     pipe: OwnedHandle,
     event: OwnedHandle,
@@ -413,11 +424,13 @@ impl Instance {
                 windows::core::Error::from_thread()
             ));
         }
-        let pipe = common::own(pipe);
+        // SAFETY: handle válido recém-criado, com um único dono.
+        let pipe = unsafe { common::own(pipe) };
         // SAFETY: evento manual sem nome.
         let event = unsafe { CreateEventW(None, true, false, None) }
             .map_err(|e| format!("CreateEvent: {e}"))?;
-        let event = common::own(event);
+        // SAFETY: handle válido recém-criado, com um único dono.
+        let event = unsafe { common::own(event) };
         let ov = Box::new(OVERLAPPED {
             hEvent: h(&event),
             ..Default::default()
@@ -433,31 +446,63 @@ impl Instance {
         })
     }
 
-    fn start_connect(&mut self, stats: &mut Stats) {
+    /// OVERLAPPED zerado (Internal/Offset) para a próxima operação, com o mesmo evento.
+    fn fresh_ov(&mut self) {
+        *self.ov = OVERLAPPED {
+            hEvent: h(&self.event),
+            ..Default::default()
+        };
+    }
+
+    /// Sinaliza o próprio evento: o loop principal trata o estado `pending` no próximo ciclo.
+    fn signal(&self) {
+        // SAFETY: evento válido.
+        unsafe {
+            let _ = SetEvent(h(&self.event));
+        }
+    }
+
+    fn start_connect(&mut self) {
         self.client = None;
         self.carry.clear();
+        self.fresh_ov();
         // SAFETY: `ov` (em Box) vive até a conclusão ou o cancelamento.
         match unsafe { ConnectNamedPipe(h(&self.pipe), Some(&raw mut *self.ov)) } {
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => self.pending = Pending::Connect,
-            Ok(()) => self.on_connected(stats),
-            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => self.on_connected(stats),
+            Ok(()) => {
+                self.pending = Pending::Connected;
+                self.signal();
+            }
+            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                self.pending = Pending::Connected;
+                self.signal();
+            }
+            Err(e) if e.code() == ERROR_NO_DATA.to_hresult() => {
+                // O cliente conectou e fechou antes do ConnectNamedPipe: desconecta e rearma.
+                // SAFETY: pipe válido; sem I/O pendente.
+                unsafe {
+                    let _ = DisconnectNamedPipe(h(&self.pipe));
+                }
+                self.pending = Pending::Rearm;
+                self.signal();
+            }
             Err(e) => {
-                println!("  ConnectNamedPipe: {e}");
+                println!("  ConnectNamedPipe: {e} (instância desativada)");
                 self.pending = Pending::None;
             }
         }
     }
 
-    fn on_connected(&mut self, stats: &mut Stats) {
+    fn on_connected(&mut self) {
         let mut pid = 0u32;
         // SAFETY: pipe conectado.
         let _ = unsafe { GetNamedPipeClientProcessId(h(&self.pipe), &raw mut pid) };
         println!("  cliente conectado: PID {pid} ({})", process_name(pid));
         self.client = Some(pid);
-        self.start_read(stats);
+        self.start_read();
     }
 
-    fn reconnect(&mut self, stats: &mut Stats) {
+    fn reconnect(&mut self) {
         if let Some(pid) = self.client {
             println!("  cliente PID {pid} desconectou");
         }
@@ -465,96 +510,91 @@ impl Instance {
         unsafe {
             let _ = DisconnectNamedPipe(h(&self.pipe));
         }
-        self.start_connect(stats);
+        self.start_connect();
     }
 
-    /// Emite leituras até uma ficar pendente; conclusões imediatas são processadas aqui.
-    fn start_read(&mut self, stats: &mut Stats) {
-        loop {
-            // SAFETY: `buf` e `ov` (em Box) vivem até a conclusão ou o cancelamento.
-            let r = unsafe {
-                ReadFile(
-                    h(&self.pipe),
-                    Some(&mut self.buf),
-                    None,
-                    Some(&raw mut *self.ov),
-                )
-            };
-            match r {
-                Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-                    self.pending = Pending::Read;
-                    return;
-                }
-                Ok(()) => {
-                    if !self.complete_read(stats) {
-                        return;
-                    }
-                }
-                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                    if !self.complete_read(stats) {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    self.pending = Pending::None;
-                    return self.reconnect(stats);
-                }
-            }
-        }
-    }
-
-    /// Resultado da leitura concluída; `false` se o cliente saiu (já reconectando).
-    fn complete_read(&mut self, stats: &mut Stats) -> bool {
-        let mut n = 0u32;
-        // SAFETY: operação concluída sobre `ov`.
-        let r =
-            unsafe { GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, false) };
-        let data = &self.buf[..n as usize];
+    /// Emite uma leitura. Concluída na hora ou pendente, o evento sinaliza e o resultado é
+    /// tratado em `on_signal`.
+    fn start_read(&mut self) {
+        self.fresh_ov();
+        // SAFETY: `buf` e `ov` (em Box) vivem até a conclusão ou o cancelamento.
+        let r = unsafe {
+            ReadFile(
+                h(&self.pipe),
+                Some(&mut self.buf),
+                None,
+                Some(&raw mut *self.ov),
+            )
+        };
         match r {
-            Ok(()) => stats.feed(&mut self.carry, data, true),
-            Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                stats.feed(&mut self.carry, data, false)
+            Ok(()) => self.pending = Pending::Read,
+            Err(e)
+                if e.code() == ERROR_IO_PENDING.to_hresult()
+                    || e.code() == ERROR_MORE_DATA.to_hresult() =>
+            {
+                self.pending = Pending::Read;
             }
-            Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => return false,
             Err(_) => {
                 self.pending = Pending::None;
-                self.reconnect(stats);
-                return false;
+                self.reconnect();
             }
         }
-        true
     }
 
-    /// O evento desta instância sinalizou.
+    /// O evento desta instância sinalizou: trata uma conclusão e arma a próxima operação.
     fn on_signal(&mut self, stats: &mut Stats) {
-        match self.pending {
+        // SAFETY: evento válido. A próxima operação (ou `signal`) volta a sinalizá-lo; sem isso
+        // um evento manual parado em `None` faria o loop principal girar sem esperar.
+        unsafe {
+            let _ = ResetEvent(h(&self.event));
+        }
+        let state = std::mem::replace(&mut self.pending, Pending::None);
+        let mut n = 0u32;
+        match state {
+            Pending::None => {}
+            Pending::Rearm => self.start_connect(),
+            Pending::Connected => self.on_connected(),
             Pending::Connect => {
-                let mut n = 0u32;
                 // SAFETY: operação de conexão concluída sobre `ov`.
                 let r = unsafe {
                     GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, false)
                 };
-                self.pending = Pending::None;
                 if r.is_ok() {
-                    self.on_connected(stats)
+                    self.on_connected();
                 } else {
-                    self.reconnect(stats)
+                    self.reconnect();
                 }
             }
             Pending::Read => {
-                self.pending = Pending::None;
-                if self.complete_read(stats) {
-                    self.start_read(stats);
+                // SAFETY: leitura concluída sobre `ov` (o evento sinalizou).
+                let r = unsafe {
+                    GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, false)
+                };
+                match r {
+                    Ok(()) => {
+                        stats.feed(&mut self.carry, &self.buf[..n as usize], true);
+                        self.start_read();
+                    }
+                    Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
+                        stats.feed(&mut self.carry, &self.buf[..n as usize], false);
+                        self.start_read();
+                    }
+                    Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
+                    Err(_) => self.reconnect(),
                 }
             }
-            Pending::None => {}
         }
     }
 
-    /// Cancela I/O pendente e processa o que já tinha chegado antes do cancelamento.
-    fn shutdown(&mut self, stats: &mut Stats) {
-        if self.pending == Pending::None {
-            return;
+    /// `true` com I/O do kernel ainda pendente sobre `ov`/`buf`.
+    fn io_in_flight(&self) -> bool {
+        matches!(self.pending, Pending::Connect | Pending::Read)
+    }
+
+    /// Cancela o I/O pendente, espera a conclusão e devolve o resultado da leitura cancelada.
+    fn cancel(&mut self) -> Option<(windows::core::Result<()>, u32)> {
+        if !self.io_in_flight() {
+            return None;
         }
         let mut n = 0u32;
         // SAFETY: cancela a operação sobre `ov` e espera a conclusão antes de soltar o Box.
@@ -562,14 +602,28 @@ impl Instance {
             let _ = CancelIoEx(h(&self.pipe), Some(&raw const *self.ov));
             GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, true)
         };
-        if self.pending == Pending::Read
-            && (r.is_ok()
-                || r.as_ref()
-                    .is_err_and(|e| e.code() == ERROR_MORE_DATA.to_hresult()))
-        {
-            stats.feed(&mut self.carry, &self.buf[..n as usize], r.is_ok());
-        }
+        let was_read = self.pending == Pending::Read;
         self.pending = Pending::None;
+        was_read.then_some((r, n))
+    }
+
+    /// Cancela I/O pendente e processa o que já tinha chegado antes do cancelamento.
+    fn shutdown(&mut self, stats: &mut Stats) {
+        if let Some((r, n)) = self.cancel() {
+            let more = r
+                .as_ref()
+                .is_err_and(|e| e.code() == ERROR_MORE_DATA.to_hresult());
+            if r.is_ok() || more {
+                stats.feed(&mut self.carry, &self.buf[..n as usize], r.is_ok());
+            }
+        }
+    }
+}
+
+impl Drop for Instance {
+    /// Nunca solta `ov`/`buf` com I/O pendente no kernel (inclusive em pânico).
+    fn drop(&mut self) {
+        let _ = self.cancel();
     }
 }
 
@@ -617,16 +671,25 @@ fn run(secs: u64) {
             }
         }
     }
+    // Todas as instâncias ou nenhuma: uma vaga livre deixaria outro processo do usuário criar
+    // uma instância e receber conexões do hook (a DACL dá GW, que inclui CREATE_PIPE_INSTANCE).
+    if instances.len() < INSTANCES {
+        // SAFETY: descritor alocado por security_attributes; não é mais usado.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+        return println!(
+            "FALHA: só {} de {INSTANCES} instâncias criadas",
+            instances.len()
+        );
+    }
     // SAFETY: as instâncias já foram criadas; o descritor não é mais usado.
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
-    if instances.is_empty() {
-        return;
-    }
     let mut stats = Stats::default();
     for inst in &mut instances {
-        inst.start_connect(&mut stats);
+        inst.start_connect();
     }
     println!(
         "Pipe com {} instâncias; aguardando o RTSS por {secs} s...",
@@ -638,17 +701,27 @@ fn run(secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut last_sample = Instant::now();
     let mut last_print = Instant::now();
+    let mut turn = 0usize;
     while Instant::now() < deadline {
-        let events: Vec<HANDLE> = instances.iter().map(|i| h(&i.event)).collect();
+        let armed: Vec<usize> = (0..instances.len())
+            .map(|k| (k + turn) % instances.len())
+            .filter(|&k| instances[k].pending != Pending::None)
+            .collect();
+        turn = turn.wrapping_add(1);
         let left = deadline
             .saturating_duration_since(Instant::now())
             .as_millis();
         let timeout = left.min(250) as u32;
-        // SAFETY: eventos válidos (no máximo 64).
-        let r = unsafe { WaitForMultipleObjects(&events, false, timeout) };
-        let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-        if idx < instances.len() {
-            instances[idx].on_signal(&mut stats);
+        if armed.is_empty() {
+            std::thread::sleep(Duration::from_millis(u64::from(timeout)));
+        } else {
+            let events: Vec<HANDLE> = armed.iter().map(|&k| h(&instances[k].event)).collect();
+            // SAFETY: eventos válidos (no máximo 8).
+            let r = unsafe { WaitForMultipleObjects(&events, false, timeout) };
+            let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            if let Some(&k) = armed.get(idx) {
+                instances[k].on_signal(&mut stats);
+            }
         }
         // Fallback: amostra o frametime do jogo na Shared Memory a cada 250 ms.
         if last_sample.elapsed() >= Duration::from_millis(250) {
@@ -770,6 +843,11 @@ mod tests {
     #[test]
     fn lows_basicos() {
         assert_eq!(lows(&[16_000; 50]), None);
+        // Só zeros (ou zeros demais) não dão pânico nem lows com 1 amostra.
+        assert_eq!(lows(&[0; 200]), None);
+        let mut few = vec![0u32; 150];
+        few.push(16_000);
+        assert_eq!(lows(&few), None);
         let mut s = vec![10_000u32; 990];
         s.extend([50_000u32; 10]); // 1% de frames a 50 ms
         let (l1, l01) = lows(&s).unwrap();
