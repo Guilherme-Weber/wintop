@@ -8,9 +8,7 @@ edition = "2024"
 # A versão com que é compilado e testado (fixada em rust-toolchain.toml).
 rust-version = "1.100"
 
-# Etapa 0: só os spikes (examples/) usam; passam a [dependencies] na Etapa 1.
-[dev-dependencies]
-nvml-wrapper = "0.13"
+[dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -26,6 +24,10 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+# Etapa 0: só os spikes (examples/) usam; passa a [dependencies] na Etapa 1.
+[dev-dependencies]
+nvml-wrapper = "0.13"
 
 [build-dependencies]
 winresource = "0.1.34"
@@ -56,7 +58,15 @@ strip = true
 # Arquivo e linha de cada frame no .pdb separado, sem aumentar o executável.
 debug = "line-tables-only"
 
-# Spikes da Etapa 0 (examples/): o de PawnIO tem testes unitários da decodificação.
+# Spikes da Etapa 0 (examples/): os testes unitários da decodificação rodam com `cargo test`.
 [[example]]
 name = "spike_pawnio"
+test = true
+
+[[example]]
+name = "spike_discos"
+test = true
+
+[[example]]
+name = "spike_rtss"
 test = true

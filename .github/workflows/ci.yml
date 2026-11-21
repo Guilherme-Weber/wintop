@@ -1,17 +1,21 @@
 name: ci
 
-# Lint, testes que não dependem de hardware e auditoria de dependências. Os runners do GitHub
-# não têm GPU NVIDIA, RTSS nem PawnIO: os programas de prova (examples/) só são compilados aqui.
+# Lint, testes que não dependem de hardware, build de release e auditoria de dependências. Os
+# runners do GitHub não têm GPU NVIDIA, RTSS nem PawnIO: os programas de prova (examples/) só
+# são compilados aqui; os testes unitários deles rodam.
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # Instala a toolchain fixada em rust-toolchain.toml (com clippy e rustfmt).
+      # Sem argumento, o rustup instala a toolchain de rust-toolchain.toml (com clippy e rustfmt).
       - name: Toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -21,14 +25,19 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Testes
         run: cargo test --locked
+      # Release: LTO, CRT estático e o manifesto embutido pelo build.rs.
+      - name: Build de release
+        run: cargo build --release --locked
       # Segurança: vulnerabilidades conhecidas nas dependências travadas (RustSec).
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
       - name: Auditoria de dependências
         run: cargo audit
+      # Mesmas extensões do hook local de pre-commit.
       - name: Sem caracteres de controle nos arquivos de texto
         shell: bash
+        # git grep sai com 1 quando não acha nada (aceito) e com 2+ em erro (falha o passo).
         run: |
-          bad=$(git ls-files '*.rs' '*.md' '*.ps1' '*.toml' '*.json' '*.yml' '*.manifest' | xargs grep -lP '[\x00-\x08\x0b\x0c\x0e-\x1f]' || true)
+          bad=$(git grep -lP '[\x00-\x08\x0b\x0c\x0e-\x1f]' -- '*.rs' '*.md' '*.ps1' '*.toml' '*.json' '*.yml' '*.manifest' '*.txt') || [ $? -eq 1 ]
           if [ -n "$bad" ]; then echo "caracteres de controle em: $bad"; exit 1; fi

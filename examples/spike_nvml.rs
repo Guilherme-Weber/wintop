@@ -1,7 +1,11 @@
 //! Spike da Etapa 0: inventário do NVML na GPU (o que é suportado e quanto custa cada leitura).
 //!
-//! Carrega `nvml.dll` por caminho absoluto em System32 (processo elevado: sem busca no
-//! diretório atual). `cargo run --example spike_nvml`
+//! Carrega `nvml.dll` por caminho absoluto em System32 obtido pela API (a variável `SystemRoot`
+//! é manipulável) e com a busca de DLLs restrita a System32 (processo elevado).
+//! `cargo run --example spike_nvml`
+
+#[path = "common/mod.rs"]
+mod common;
 
 use std::fmt::Debug;
 use std::time::Instant;
@@ -19,7 +23,7 @@ fn show<T: Debug>(name: &str, f: impl FnOnce() -> Result<T, nvml_wrapper::error:
         Ok(v) => {
             let mut s = format!("{v:?}");
             if s.len() > 110 {
-                s.truncate(110);
+                s.truncate(s.floor_char_boundary(110));
                 s.push_str("...");
             }
             println!("  OK  {name:<30} {us:>6} µs  {s}");
@@ -29,16 +33,20 @@ fn show<T: Debug>(name: &str, f: impl FnOnce() -> Result<T, nvml_wrapper::error:
 }
 
 fn main() {
-    let sys = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let lib = format!(r"{sys}\System32\nvml.dll");
+    common::harden_dll_search();
+    let Some(sys) = common::system_dir() else {
+        return eprintln!("FALHA: GetSystemDirectoryW");
+    };
+    let lib = sys.join("nvml.dll");
     let t = Instant::now();
-    let nvml = match Nvml::builder().lib_path(lib.as_ref()).init() {
+    let nvml = match Nvml::builder().lib_path(lib.as_os_str()).init() {
         Ok(n) => n,
-        Err(e) => return eprintln!("FALHA: NVML ({lib}): {e}"),
+        Err(e) => return eprintln!("FALHA: NVML ({}): {e}", lib.display()),
     };
     println!(
-        "NVML iniciado em {:.1} ms ({lib})",
-        t.elapsed().as_secs_f64() * 1e3
+        "NVML iniciado em {:.1} ms ({})",
+        t.elapsed().as_secs_f64() * 1e3,
+        lib.display()
     );
     show("versão do driver", || nvml.sys_driver_version());
     show("versão do NVML", || nvml.sys_nvml_version());
@@ -68,8 +76,10 @@ fn main() {
         show("limite de potência (mW)", || d.enforced_power_limit());
         show("energia total (mJ)", || d.total_energy_consumption());
         show("nº de fans", || d.num_fans());
-        show("fan 0 (%)", || d.fan_speed(0));
-        show("fan 0 (RPM)", || d.fan_speed_rpm(0));
+        for f in 0..d.num_fans().unwrap_or(0) {
+            show(&format!("fan {f} (%)"), || d.fan_speed(f));
+            show(&format!("fan {f} (RPM)"), || d.fan_speed_rpm(f));
+        }
         show("PCIe geração atual", || d.current_pcie_link_gen());
         show("PCIe largura atual", || d.current_pcie_link_width());
         show("PCIe geração máx", || d.max_pcie_link_gen());

@@ -1,0 +1,7 @@
+# Texto com fim de linha LF no repositório (independe do core.autocrlf de quem clona).
+* text=auto eol=lf
+
+# Binários
+*.bin binary
+*.ico binary
+*.png binary

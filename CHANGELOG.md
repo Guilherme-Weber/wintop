@@ -10,3 +10,15 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 - Etapa 0: base do projeto (toolchain fixa, lints, CI, manifesto `requireAdministrator`,
   CRT estático), inventário de métricas e provas de viabilidade de cada fonte de dados
   (PawnIO, discos, RTSS, NVML) em `examples/`.
+- Instância única por sessão de usuário.
+- Código-fonte do módulo `AMDFamily17` (LGPL-2.1) em `modules/source/`.
+- Membros de Storage Spaces identificados pela partição GPT de proteção, sem WMI.
+
+### Corrigido (revisão Gemini Neon + Argon)
+
+- Manifesto de administrador só no executável principal (testes e exemplos rodam sem elevação).
+- Provas: HDD em repouso não é consultado; pipe do RTSS com várias instâncias e tratamento
+  correto de I/O overlapped; leituras de Shared Memory voláteis e com limites checados; idade do
+  aplicativo sem underflow; handles com dono (RAII); `nvml.dll` por `GetSystemDirectoryW` e busca
+  de DLLs restrita a System32; capacidades em unidade binária.
+- `.gitattributes`, permissões mínimas e build de release no CI.

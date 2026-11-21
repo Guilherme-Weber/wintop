@@ -32,7 +32,9 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-Os programas de prova de cada fonte ficam em `examples/` e exigem um terminal elevado:
+Os testes rodam num terminal comum (o manifesto de administrador vai só no executável
+principal). Os programas de prova de cada fonte ficam em `examples/` e exigem um terminal
+elevado, pelo acesso a hardware que fazem:
 
 ```powershell
 cargo run --example spike_pawnio

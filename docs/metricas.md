@@ -2,24 +2,27 @@
 
 Lista fechada do que o wintop mostra. Regra do projeto: **aberto elevado, toda métrica desta
 lista aparece**. Uma métrica sem dado é exibida em vermelho com a causa (falha); só os casos da
-coluna "Estado neutro" podem aparecer sem valor, e sempre com o texto do estado.
+coluna "Estado neutro" podem aparecer sem valor ou com valor marcado, e sempre com o texto do
+estado.
 
 Origem: captura do setup anterior (Gerenciador de Tarefas + MSI Afterburner), detalhamento de VRAM
 do gputaskman e detalhamento de disco do Gerenciador de Tarefas.
 
-Legenda da coluna Elev.: **A** = exige administrador (o wintop sempre roda elevado).
-Coluna Spike: resultado da Etapa 0 (`docs/spike-etapa0.md`); "E1".."E6" = etapa que implementa.
+Coluna Elev.: **A** = exige administrador (o wintop sempre roda elevado).
+Coluna Prova: **Spike** = provado em Rust na Etapa 0 (`docs/spike-etapa0.md`); **PS** = só
+conferido pelo PowerShell (mesma API, sem código Rust ainda); **E1**..**E6** = etapa que
+implementa e prova.
 
 Todas as séries com histórico guardam **mínimo e máximo da sessão** (tecla para zerar), como o
-Afterburner.
+Afterburner. Todas as leituras de temperatura de disco e o PCIe do NVML rodam na **thread lenta**.
 
 ## CPU
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Nome do processador | CPUID (0x80000002-4) | | | OK |
+| Nome do processador | CPUID (0x80000002-4, se a folha máxima permitir) | | | Spike |
 | Uso total (%) | PDH `\Processor Information(_Total)\% Processor Utility`, limitado a 0-100 | | | E1 |
-| Uso por thread lógico (16, grade 4×4, 60 s) | PDH `\Processor Information(*)\% Processor Utility` | | | E1 |
+| Uso por processador lógico (grade dimensionada pela CPU real; 16 = 4×4 na máquina de desenvolvimento) | PDH `\Processor Information(*)\% Processor Utility` | | | E1 |
 | Parcela de kernel (opcional) | `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`; KernelTime inclui IdleTime | | | E1 |
 | Frequência atual | PDH `% Processor Performance` × frequência base | | | E1 |
 | Frequência base | `CallNtPowerInformation(ProcessorInformation)` | | | E1 |
@@ -27,13 +30,13 @@ Afterburner.
 | Virtualização | `IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED)` | | | E1 |
 | Processos, threads, handles | `GetPerformanceInfo` | | | E1 |
 | Tempo ligado | `GetTickCount64` | | | E1 |
-| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | | **OK** (±0,2 °C do Afterburner) |
-| Temperatura por CCD | SMN `0x59954 + 4·n`, bit 11 = válido | A | | **OK** (CCD1) |
-| Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | | **OK** |
+| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | "CPU não suportada" (não AMD ou fora de 17h-1Ah) | Spike (Zen 3; ±0,1 °C do Afterburner) |
+| Temperatura por CCD | SMN por família/modelo; validado só Zen 3 Vermeer (19h, 20h-2Fh): `0x59954 + 4·n`, bit 11 = válido | A | "não validado nesta família" | Spike (Zen 3) |
+| Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | "CPU não suportada" | Spike (Zen 3) |
 
 ## Memória
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Em uso / total / % | `GlobalMemoryStatusEx` | | | E1 |
 | Confirmada / limite | `GetPerformanceInfo` (CommitTotal, CommitLimit) | | | E1 |
@@ -43,24 +46,25 @@ Afterburner.
 
 ## Discos (um painel por disco físico; membros do Storage Space sob o disco virtual)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Modelo | `IOCTL_STORAGE_QUERY_PROPERTY` / `StorageDeviceProperty` | | | **OK** (9 discos) |
-| Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | **OK** |
-| SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | **OK** |
-| Capacidade | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | | **OK** |
-| Letras das unidades | nome da instância PDH (`"7 c:"`); membros do pool não têm letra | | | E1 |
+| Fabricante e modelo | `StorageDeviceProperty` (VendorId + ProductId) | | | Spike |
+| Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | Spike |
+| SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
+| Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | | Spike |
+| Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "vários pools: associação pendente" (com mais de um pool) | Spike (1 pool, 5 membros) |
+| Letras das unidades | nome da instância PDH (`"7 c:"`); membros do pool não têm letra | | | PS |
 | Disco do sistema / arquivo de paginação | volume do Windows e do pagefile → número do disco | | | E1 |
-| Tempo ativo (%) | PDH `\PhysicalDisk(*)\% Idle Time` → `100 - idle`, limitado a 0-100 | | | E1 |
-| Leitura / escrita (B/s) | PDH `Disk Read Bytes/sec`, `Disk Write Bytes/sec` | | | E1 |
+| Tempo ativo (%) | PDH `\PhysicalDisk(*)\% Idle Time` → `100 - idle`, limitado a 0-100 | | | PS |
+| Leitura / escrita (B/s) | PDH `Disk Read Bytes/sec`, `Disk Write Bytes/sec` | | | PS |
 | Tempo médio de resposta | PDH `Avg. Disk sec/Transfer` | | | E1 |
-| Temperatura NVMe | `StorageDeviceTemperatureProperty` (52) | A | | **OK** |
-| Temperatura SATA (SSD e HDD) | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190) | A | "em repouso" (HDD parado, `GetDevicePowerState`) | **OK** |
-| Temperatura do Storage Space | máximo dos membros | A | | **OK** (por agregação) |
+| Temperatura NVMe (e alguns SATA) | `StorageDeviceTemperatureProperty` (52), primeira entrada diferente de "não reportado" | A | | Spike |
+| Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190) | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido) | Spike (repouso real ainda não testado) |
+| Temperatura do Storage Space | máximo dos membros | A | | Spike |
 
 ## Rede (uma linha por interface física)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Nome (alias) e descrição | `GetIfTable2` (`MIB_IF_ROW2.Alias`, `Description`) | | | E1 |
 | Velocidade do link | `MIB_IF_ROW2.ReceiveLinkSpeed` | | "desconectada" | E1 |
@@ -68,54 +72,59 @@ Afterburner.
 
 ## GPU (adaptador)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Nome, driver, VBIOS | NVML | | | **OK** |
-| Uso (%) | NVML `utilization.gpu` | | | **OK** |
-| Atividade da memória (%) | NVML `utilization.memory` | | | **OK** |
-| VRAM dedicada usada / total (igual ao Task Manager) | PDH `\GPU Adapter Memory(*)\Dedicated Usage`; total do NVML | | | E3 |
-| VRAM compartilhada | PDH `\GPU Adapter Memory(*)\Shared Usage` | | | E3 |
-| VRAM física (NVML: usada, livre, reservada) | NVML `memory_info` | | | **OK** |
-| Temperatura e limite de slowdown | NVML | | | **OK** |
-| Clocks (gráfico, SM, memória, vídeo) e máximo | NVML | | | **OK** |
-| Potência e limite | NVML | | | **OK** |
-| Fans (%, RPM) | NVML | | "parado" (0 RPM, modo silencioso) | **OK** |
-| PCIe: geração, largura, TX/RX | NVML (TX/RX custam ~23 ms cada: thread lenta) | | | **OK** |
-| Encoder / decoder (%) | NVML | | | **OK** |
-| P-state, motivos de throttling | NVML | | | **OK** |
+| Nome, driver, VBIOS | NVML | | | Spike |
+| Uso (%) | NVML `utilization.gpu` | | | Spike |
+| Atividade da memória (%) | NVML `utilization.memory` | | | Spike |
+| VRAM dedicada usada / total (igual ao Task Manager) | PDH `\GPU Adapter Memory(*)\Dedicated Usage`; total do NVML | | | E1 |
+| VRAM compartilhada | PDH `\GPU Adapter Memory(*)\Shared Usage` | | | E1 |
+| VRAM física (NVML: usada, livre, reservada) | NVML `memory_info` (v2, com `reserved`) | | | Spike |
+| Temperatura e limite de slowdown | NVML | | | Spike |
+| Clocks (gráfico, SM, memória, vídeo) e máximo | NVML | | | Spike |
+| Potência e limite | NVML | | | Spike |
+| Fans (%, RPM), todos os `num_fans` | NVML | | "parado" (0 RPM, modo silencioso) | Spike (2 fans) |
+| PCIe: geração, largura, TX/RX | NVML (TX/RX custam ~23 ms cada: thread lenta) | | | Spike |
+| Encoder / decoder (%) | NVML | | | Spike |
+| P-state, motivos de throttling | NVML | | | Spike |
 | Hotspot e temperatura da memória | não expostos pela RTX 5070 Ti / NVML | | fora do escopo | — |
 
 ## GPU por processo (aba GPU)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| VRAM local, não local (spill), paginada | PDH `\GPU Process Memory(*)`: `Local Usage`, `Non Local Usage`, `Total Committed` (paginada = max(committed - local - non local, 0)) | | | E6 |
+| VRAM local, não local (spill), paginada | PDH `\GPU Process Memory(*)`: `Local Usage`, `Non Local Usage`, `Total Committed` (paginada = max(committed - local - non local, 0)) | | | PS |
 | Uso por engine (3D, Copy, Video Encode, Video Decode, Compute) | PDH `\GPU Engine(*)\Utilization Percentage` (query aberta só com a aba visível) | | | E6 |
 | RAM e CPU % do processo | `SystemProcessInformation` | | | E6 |
 | Runtimes (CUDA, Vulkan, D3D11/12, OpenGL, ONNX) | **sob demanda** (tecla no processo selecionado), módulos carregados; nunca no jogo ativo | A | "protegido" (acesso negado) | E6 |
 
 ## FPS (jogo em primeiro plano, via RTSS)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+Fonte exata: pipe `\\.\pipe\RTSS_Frametime` (um registro por frame). O hook do RTSS só conecta ao
+pipe no início do jogo (hipótese principal, a confirmar). Com o jogo aberto antes do wintop, os
+valores vêm da Shared Memory (amostras a cada 250 ms) e aparecem marcados como **"aprox. (jogo
+aberto antes do wintop)"** até o jogo reiniciar.
+
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Jogo (nome, PID) | `RTSSSharedMemoryV2`: entrada com atividade recente + API 3D, primeiro plano como desempate, lista de ignorados | | "nenhum jogo 3D em foco" | **OK** (layout v2.21) |
-| API 3D | `dwFlags & 0xFFFF` | | | **OK** |
-| Resolução | `dwResolutionX/Y` (v2.20) | | | **OK** |
-| FPS | pipe `\\.\pipe\RTSS_Frametime` (frames por janela); Shared Memory como reserva | | | pipe: **pendente com jogo** |
-| Frametime atual, mínimo, máximo | pipe (por frame) | | | pendente com jogo |
-| 1% e 0,1% low | **calculado pelo wintop** (janela de 60 s); os campos do RTSS só existem no modo benchmark | | | lógica OK; dados pendentes |
-| Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21) | | "indisponível neste jogo" (valor 0) | pendente com jogo |
+| Jogo (nome, PID) | `RTSSSharedMemoryV2`: entrada ativa (período de FPS < 2 s) + API 3D + fora da lista de ignorados; primeiro plano desempata | | "nenhum jogo 3D em foco" | Spike (Deadlock; Spotify ignorado) |
+| API 3D | `dwFlags & 0xFFFF` | | | Spike |
+| Resolução | `dwResolutionX/Y` (v2.20+) | | | Spike |
+| FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (SHM); pipe pendente com jogo |
+| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)" | Spike (SHM); pipe pendente com jogo |
+| 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | cálculo testado; janela de 60 s: E3 |
+| Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
 | RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 |
 
 ## Processos (aba)
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Nome, PID, CPU %, memória (working set, privada), threads, handles, I/O de leitura/escrita | `NtQuerySystemInformation(SystemProcessInformation)` (uma chamada) | A (para ver todos) | | E6 |
 
 ## Diagnóstico
 
-| Métrica | Fonte | Elev. | Estado neutro | Spike |
+| Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Estado de cada fonte (OK, falha e motivo) | coletores | | | E1 (`wintop --check`) |
 | Consumo do próprio wintop (CPU, RAM) | `GetProcessTimes`, `GetProcessMemoryInfo` | | | E4 |
