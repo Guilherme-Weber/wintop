@@ -1055,14 +1055,21 @@ fn start_rtss() -> Result<(), String> {
         return Err(format!("invalid RTSS InstallPath {}", path.display()));
     }
     let dir = path.parent().ok_or("RTSS InstallPath has no folder")?;
+    // O RTSS roda elevado (filho do wintop): só de uma pasta que ninguém sem elevação altera.
+    crate::install::trusted_file(&path)?;
     // Diretório de trabalho = pasta do RTSS (não o do wintop, que pode ser gravável pelo
-    // usuário) e sem herdar a entrada e a saída do wintop.
+    // usuário) e sem herdar a entrada e a saída do wintop. PATH só com as pastas do sistema: o
+    // herdado vem do ambiente do usuário (HKCU\Environment), e uma DLL procurada no PATH viraria
+    // código do usuário rodando elevado.
     // Processo próprio e fora do grupo de console do wintop (Ctrl+C no wintop não o atinge).
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let sys = win::system_dir().ok_or("System32 not found")?;
+    let windir = win::windows_dir().ok_or("Windows folder not found")?;
     std::process::Command::new(&path)
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .current_dir(dir)
+        .env("PATH", format!("{};{}", sys.display(), windir.display()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

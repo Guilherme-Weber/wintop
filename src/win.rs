@@ -68,6 +68,14 @@ pub fn system_dir() -> Option<PathBuf> {
     (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
+/// Pasta do Windows pela API (como `system_dir`).
+pub fn windows_dir() -> Option<PathBuf> {
+    let mut buf = [0u16; 260];
+    // SAFETY: buffer local com o tamanho informado.
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buf)) } as usize;
+    (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+}
+
 /// Letra da unidade do Windows (ex.: `'C'`).
 pub fn windows_drive() -> Option<char> {
     let mut buf = [0u16; 260];

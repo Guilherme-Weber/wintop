@@ -168,6 +168,9 @@ impl Drop for PciLock<'_> {
 impl PawnIo {
     fn open(module: &[u8]) -> Result<Self, String> {
         let dll = install_dir()?.join("PawnIOLib.dll");
+        // Carregada no processo elevado: só de uma pasta que ninguém sem elevação altera (um
+        // PawnIO instalado numa pasta do usuário viraria código do usuário rodando elevado).
+        crate::install::trusted_file(&dll)?;
         let dll_w = wide(&dll.to_string_lossy());
         // SAFETY: caminho absoluto terminado em zero; busca restrita à pasta da DLL e System32.
         // `Library` libera a DLL quando `PawnIo` (ou um erro abaixo) a solta.

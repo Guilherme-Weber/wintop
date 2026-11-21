@@ -92,10 +92,7 @@ fn open(
     single_name: bool,
 ) -> Result<Checked, OpenError> {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_TYPE_DISK, GetFileType, SECURITY_ANONYMOUS,
-        SECURITY_SQOS_PRESENT,
-    };
+    use windows::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
     let refuse = |m: String| OpenError::Refused(m);
     if !crate::win::is_local_absolute(path) {
         return Err(refuse(format!(
@@ -135,6 +132,25 @@ fn open(
     // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
     let handle = unsafe { crate::win::own(h) };
     let c = Checked { handle };
+    match verify(&c, path, dir, single_name) {
+        Ok(()) => Ok(c),
+        Err(e) => {
+            // Criado agora e recusado (ex.: uma junction trocada no caminho depois da checagem
+            // da pasta): não fica para trás onde o processo elevado não deveria ter escrito.
+            if disposition == CREATE_NEW && access & DELETE.0 != 0 {
+                let _ = delete_on_close(c.raw());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Conferências de `open` sobre o handle já aberto.
+fn verify(c: &Checked, path: &Path, dir: bool, single_name: bool) -> Result<(), OpenError> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_TYPE_DISK, GetFileType,
+    };
+    let refuse = |m: String| OpenError::Refused(m);
     // SAFETY: handle válido.
     if unsafe { GetFileType(c.raw()) } != FILE_TYPE_DISK {
         return Err(refuse(format!(
@@ -172,7 +188,7 @@ fn open(
             path.display()
         )));
     }
-    Ok(c)
+    Ok(())
 }
 
 /// Dono do objeto aberto, em texto.
@@ -255,10 +271,30 @@ fn profile_final() -> Option<String> {
     final_path(HANDLE(h.as_raw_handle())).ok()
 }
 
+/// Arquivo-âncora novo dentro de `dir`, apagado quando o handle fecha.
+fn pin_file(dir: &Path) -> Result<Checked, String> {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = dir.join(format!(".wintop.{}.{n}.pin", std::process::id()));
+    let c = open(
+        &p,
+        GENERIC_READ.0 | DELETE.0,
+        FILE_SHARE_READ,
+        CREATE_NEW,
+        false,
+        true,
+    )
+    .map_err(String::from)?;
+    delete_on_close(c.raw()).map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(c)
+}
+
 /// Pastas abertas e conferidas para uma operação em `<base>\<dir>`.
 pub struct UserDir {
     _base: Checked,
     dir: Checked,
+    /// Âncora: arquivo aberto dentro da pasta enquanto ela está aberta (apagado ao fechar).
+    _pin: Checked,
     path: PathBuf,
 }
 
@@ -292,9 +328,15 @@ impl UserDir {
             Err(OpenError::NotFound) if !create => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        // Só uma pasta vazia vira junction (FSCTL_SET_REPARSE_POINT): com um arquivo nosso
+        // aberto dentro dela, sem FILE_SHARE_DELETE, ela não esvazia enquanto está aberta, e um
+        // arquivo criado ou trocado nela não vai parar no alvo de uma junction posta depois da
+        // conferência. A base também fica presa: a subpasta aberta não a deixa esvaziar.
+        let pin = pin_file(&path)?;
         Ok(Some(Self {
             _base: b,
             dir,
+            _pin: pin,
             path,
         }))
     }
@@ -359,7 +401,8 @@ impl UserDir {
             Err(OpenError::NotFound) => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        delete_on_close(c.raw());
+        // Falha ao marcar (ex.: arquivo somente leitura) é erro, não "removido".
+        delete_on_close(c.raw()).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(true)
     }
 
@@ -386,8 +429,9 @@ impl UserDir {
             rename_over(c.raw(), &self.file(name))
         })();
         if r.is_err() {
-            // Marca o temporário para apagar ao fechar o handle.
-            delete_on_close(c.raw());
+            // Marca o temporário para apagar ao fechar o handle (melhor esforço: o erro que
+            // vale é o da gravação).
+            let _ = delete_on_close(c.raw());
         }
         r
     }
@@ -415,17 +459,18 @@ fn rename_over(h: HANDLE, to: &Path) -> Result<(), String> {
     .map_err(|e| format!("rename to {}: {e}", to.display()))
 }
 
-fn delete_on_close(h: HANDLE) {
+/// Marca o arquivo de `h` para apagar quando o último handle fechar.
+fn delete_on_close(h: HANDLE) -> windows::core::Result<()> {
     use windows::Win32::Storage::FileSystem::{FILE_DISPOSITION_INFO, FileDispositionInfo};
     let d = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: handle aberto com DELETE; estrutura local.
     unsafe {
-        let _ = SetFileInformationByHandle(
+        SetFileInformationByHandle(
             h,
             FileDispositionInfo,
             (&raw const d).cast(),
             size_of::<FILE_DISPOSITION_INFO>() as u32,
-        );
+        )
     }
 }
 
@@ -458,10 +503,10 @@ mod tests {
         );
         // Teto de tamanho no handle.
         assert!(d.read("config.toml", 3).is_err());
-        // Nenhum temporário sobrando.
+        // Nenhum temporário sobrando (fechada a pasta, a âncora também some).
+        drop(d);
         let left: Vec<_> = std::fs::read_dir(b.join(&n)).expect("lista").collect();
         assert_eq!(left.len(), 1, "{left:?}");
-        drop(d);
         let _ = std::fs::remove_dir_all(b.join(&n));
     }
 
@@ -525,6 +570,88 @@ mod tests {
         // Base que não é caminho local (UNC, pipe): recusada antes de qualquer abertura.
         assert!(UserDir::open(Path::new(r"\127.0.0.1\c$"), "wintop", false).is_err());
         assert!(UserDir::open(Path::new(r"\.\pipe\x"), "wintop", false).is_err());
+    }
+
+    /// Transforma a pasta (vazia) numa junction para `target`, como faria um processo sem
+    /// elevação do usuário (FSCTL_SET_REPARSE_POINT; não exige privilégio).
+    fn make_junction(dir: &Path, target: &Path) -> windows::core::Result<()> {
+        use windows::Win32::Storage::FileSystem::{FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
+        use windows::Win32::System::IO::DeviceIoControl;
+        use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        const MOUNT_POINT: u32 = 0xA000_0003;
+        let sub: Vec<u16> = format!(r"\??\{}", target.display())
+            .encode_utf16()
+            .collect();
+        // PathBuffer: nome substituto + 0 + nome de exibição vazio + 0.
+        let mut path = sub.clone();
+        path.extend([0, 0]);
+        let data_len = 8 + path.len() * 2;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend(MOUNT_POINT.to_le_bytes());
+        buf.extend((data_len as u16).to_le_bytes());
+        buf.extend(0u16.to_le_bytes());
+        buf.extend(0u16.to_le_bytes()); // SubstituteNameOffset
+        buf.extend(((sub.len() * 2) as u16).to_le_bytes());
+        buf.extend(((sub.len() * 2 + 2) as u16).to_le_bytes()); // PrintNameOffset
+        buf.extend(0u16.to_le_bytes()); // PrintNameLength
+        buf.extend(path.iter().flat_map(|c| c.to_le_bytes()));
+        let w = wide(&dir.to_string_lossy());
+        // SAFETY: caminho terminado em zero; o handle passa a ter dono logo abaixo.
+        let h = unsafe {
+            CreateFileW(
+                PCWSTR(w.as_ptr()),
+                FILE_WRITE_DATA.0 | FILE_WRITE_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }?;
+        // SAFETY: CreateFileW teve sucesso.
+        let h = unsafe { crate::win::own(h) };
+        // SAFETY: handle válido; buffer local com o tamanho informado.
+        unsafe {
+            DeviceIoControl(
+                HANDLE(h.as_raw_handle()),
+                FSCTL_SET_REPARSE_POINT,
+                Some(buf.as_ptr().cast()),
+                buf.len() as u32,
+                None,
+                0,
+                None,
+                None,
+            )
+        }
+    }
+
+    /// Com a pasta aberta, ela não vira junction (o arquivo-âncora a mantém não vazia), e
+    /// gravar e trocar o arquivo dentro dela funciona; fechada, a âncora some. Sem a âncora, a
+    /// mesma pasta vazia vira junction (o teste realmente exercita o ataque).
+    #[test]
+    fn pasta_aberta_nao_vira_junction() {
+        let b = roaming();
+        let n = name("junction_tarde");
+        let target = std::env::temp_dir();
+        let d = UserDir::create(&b, &n).expect("pasta");
+        let while_open = make_junction(&b.join(&n), &target);
+        d.write("config.toml", "a = 1\n").expect("gravação");
+        d.write("config.toml", "a = 2\n").expect("troca");
+        assert_eq!(
+            d.read("config.toml", 64).expect("leitura").as_deref(),
+            Some("a = 2\n")
+        );
+        drop(d);
+        let left: Vec<_> = std::fs::read_dir(b.join(&n))
+            .expect("pasta")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        let _ = std::fs::remove_file(b.join(&n).join("config.toml"));
+        let empty_ok = make_junction(&b.join(&n), &target);
+        let _ = std::fs::remove_dir(b.join(&n));
+        assert!(while_open.is_err(), "pasta aberta virou junction");
+        assert_eq!(left, ["config.toml"], "a âncora ficou para trás");
+        empty_ok.expect("controle: a pasta vazia vira junction");
     }
 
     #[test]

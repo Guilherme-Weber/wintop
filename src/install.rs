@@ -231,6 +231,29 @@ fn secure_owner_tree(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Arquivo de outro programa que o wintop elevado executa ou carrega (RTSS.exe, PawnIOLib.dll):
+/// nem ele nem a pasta dele podem ser links ou alteráveis sem elevação (um RTSS instalado numa
+/// pasta do usuário viraria um jeito de rodar código como administrador pelo atalho sem UAC).
+pub fn trusted_file(file: &Path) -> Result<(), String> {
+    let dir = file
+        .parent()
+        .ok_or_else(|| format!("{} has no folder", file.display()))?;
+    for p in [dir, file] {
+        if is_link(p) {
+            return Err(format!("{} is a link (refused)", p.display()));
+        }
+        let problems = unsafe_acl(p)?;
+        if !problems.is_empty() {
+            return Err(format!(
+                "{} can be changed without elevation (refused): {}",
+                p.display(),
+                problems.join("; ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Problemas de ACL que deixariam alguém sem elevação trocar `path`.
 pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
     let w = wide(&path.to_string_lossy());
@@ -383,18 +406,34 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Copia `from` para `to` (pastas recursivamente).
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for e in std::fs::read_dir(from)? {
-            let e = e?;
-            copy_tree(&e.path(), &to.join(e.file_name()))?;
-        }
-        Ok(())
-    } else {
-        std::fs::copy(from, to).map(drop)
+/// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
+const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
+
+/// Copia só a lista fechada de `modules\`, sem seguir links: a pasta de origem (ex.: o zip
+/// extraído em Downloads) é do usuário, e uma junction nela faria o instalador elevado copiar
+/// arquivos protegidos para uma pasta que Usuários leem. O módulo é obrigatório.
+fn copy_modules(from: &Path, to: &Path) -> Result<(), String> {
+    if is_link(from) {
+        return Err(format!("{} is a link (refused)", from.display()));
     }
+    if !from.join(MODULE_FILES[0]).is_file() {
+        return Err(format!(
+            "{} not found: extract the whole zip next to wintop.exe",
+            from.join(MODULE_FILES[0]).display()
+        ));
+    }
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for f in MODULE_FILES {
+        let src = from.join(f);
+        if !src.exists() {
+            continue;
+        }
+        if is_link(&src) || !src.is_file() {
+            return Err(format!("{} is not a plain file (refused)", src.display()));
+        }
+        std::fs::copy(&src, to.join(f)).map_err(|e| format!("{}: {e}", src.display()))?;
+    }
+    Ok(())
 }
 
 fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
@@ -465,18 +504,16 @@ pub fn install() -> Result<(), String> {
     }
     if dir.exists() {
         check_tree(&dir).map_err(|e| format!("{e} (remove {} and try again)", dir.display()))?;
-    }
-    if !dir.exists() {
+    } else {
         std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        secure(&dir, true)?;
     }
+    // Sempre, mesmo com a pasta já existente: uma pasta criada à mão herda o CREATOR OWNER de
+    // Program Files (o que o wintop criar nela seria do usuário, com controle total).
+    secure(&dir, true)?;
     check_tree(&dir)?;
     if !same_file(&me, &exe) {
         std::fs::copy(&me, &exe).map_err(|e| format!("copy to {}: {e}", exe.display()))?;
-        let modules = here.join("modules");
-        if modules.is_dir() {
-            copy_tree(&modules, &dir.join("modules")).map_err(|e| format!("modules: {e}"))?;
-        }
+        copy_modules(&here.join("modules"), &dir.join("modules"))?;
         println!("copied to {}", dir.display());
     }
     // Depois da cópia: tudo o que o wintop elevado executa ou carrega (o exe e os módulos do
@@ -566,6 +603,31 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Programa de outro projeto que o wintop elevado executaria: numa pasta do usuário é
+    /// recusado; nas instalações reais (Program Files), aceito.
+    #[test]
+    fn arquivo_externo_so_de_pasta_protegida() {
+        let tmp = std::env::temp_dir().join(format!("wintop_trusted_{}.exe", std::process::id()));
+        std::fs::write(&tmp, b"x").expect("arquivo de teste");
+        let r = trusted_file(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "pasta temporária do usuário aceita");
+        let rtss = crate::win::reg_sz_32(r"SOFTWARE\Unwinder\RTSS", "InstallPath");
+        if let Some(p) = rtss.map(PathBuf::from).filter(|p| p.is_file()) {
+            trusted_file(&p).expect("RTSS em Program Files");
+        }
+        let pawn = crate::win::system_dir()
+            .and_then(|s| {
+                s.parent()?
+                    .parent()
+                    .map(|d| d.join(r"Program Files\PawnIO\PawnIOLib.dll"))
+            })
+            .filter(|p| p.is_file());
+        if let Some(p) = pawn {
+            trusted_file(&p).expect("PawnIO em Program Files");
+        }
+    }
 
     #[test]
     fn xml_da_tarefa() {
