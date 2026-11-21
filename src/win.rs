@@ -3,8 +3,14 @@
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
+use std::ffi::c_void;
 use windows::Win32::Foundation::{FILETIME, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Security::{
+    GetTokenInformation, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+};
 use windows::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
@@ -14,7 +20,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// Converte para UTF-16 terminado em zero.
 pub fn wide(s: &str) -> Vec<u16> {
@@ -168,6 +174,57 @@ pub fn is_elevated() -> bool {
     }
     .is_ok();
     ok && elev.TokenIsElevated != 0
+}
+
+/// SID em texto (S-1-5-...), ou `None`.
+///
+/// # Safety
+/// `sid` aponta para um SID válido durante a chamada.
+pub unsafe fn sid_string(sid: PSID) -> Option<String> {
+    let mut text = PWSTR::null();
+    // SAFETY: SID válido (garantido por quem chama); o texto é liberado com LocalFree.
+    unsafe { ConvertSidToStringSidW(sid, &raw mut text) }.ok()?;
+    // SAFETY: `text` aponta para uma string terminada em zero alocada pela API.
+    let s = unsafe { text.to_string() }.ok();
+    // SAFETY: liberado uma única vez.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+    }
+    s
+}
+
+/// SID do usuário do token atual, em texto (S-1-5-21-...).
+pub fn user_sid() -> Option<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: token passa a ter dono logo abaixo.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
+    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
+    let _token = unsafe { own(token) };
+    let mut buf = vec![0u64; 64]; // alinhado para TOKEN_USER
+    let mut len = 0u32;
+    // SAFETY: buffer local com o tamanho informado.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast::<c_void>()),
+            (buf.len() * 8) as u32,
+            &raw mut len,
+        )
+    }
+    .ok()?;
+    // SAFETY: GetTokenInformation preencheu um TOKEN_USER no início do buffer alinhado.
+    let user = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read() };
+    let mut text = PWSTR::null();
+    // SAFETY: SID válido enquanto `buf` vive; o texto é liberado com LocalFree.
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) }.ok()?;
+    // SAFETY: `text` aponta para uma string terminada em zero alocada pela API.
+    let s = unsafe { text.to_string() }.ok();
+    // SAFETY: liberado uma única vez.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+    }
+    s
 }
 
 /// `FILETIME` em unidades de 100 ns.

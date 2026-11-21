@@ -11,7 +11,8 @@ de jogos.
 Em desenvolvimento. Concluídas as etapas de base e provas de viabilidade
 ([docs/spike-etapa0.md](docs/spike-etapa0.md)), coletores nativos, fontes elevadas (PawnIO e
 temperatura dos discos), FPS pelo RTSS, motor de coleta e as quatro abas da interface (geral,
-processos, GPU por processo e sensores). A configuração e o empacotamento ainda estão por vir. O inventário
+processos, GPU por processo e sensores), configuração, temas e o atalho sem UAC. O empacotamento
+ainda está por vir. O inventário
 completo de métricas está em [docs/metricas.md](docs/metricas.md), e as diferenças conhecidas em
 relação ao Gerenciador de Tarefas em [docs/divergencias.md](docs/divergencias.md).
 
@@ -20,6 +21,8 @@ relação ao Gerenciador de Tarefas em [docs/divergencias.md](docs/divergencias.
 ```powershell
 wintop            # interface
 wintop --check    # diagnóstico de todas as fontes, sem interface
+wintop --install  # copia para Program Files e cria o atalho sem UAC (tarefa agendada)
+wintop --uninstall
 wintop --version
 ```
 
@@ -29,7 +32,25 @@ Na interface: `1` a `4` trocam de aba, `+` e `-` ajustam o intervalo de atualiza
 `Home`/`End`) selecionam; na aba Processos, `←`/`→` mudam a coluna da ordem, `i` inverte e `/`
 filtra pelo nome ou PID; na aba GPU, `Enter` lista os runtimes de GPU do processo selecionado
 (lendo os módulos carregados; nunca em aplicativos com o hook do RTSS, que podem ser jogos com
-anticheat). A interface é em inglês.
+anticheat). `t` troca o tema. A interface é em inglês.
+
+## Configuração
+
+O arquivo `%APPDATA%\wintop\config.toml` é criado na primeira execução, com comentários:
+intervalo de atualização, tema (`default`, `nord`, `gruvbox`, `dracula`, `mono`), recolhimento
+dos membros do Storage Space, lista de aplicativos que o RTSS acompanha mas não são jogos e cores
+avulsas (`[colors]`, em `#rrggbb`). As mudanças feitas na interface (`+`/`-`, `t`, `d`) são
+gravadas no próprio arquivo, preservando os comentários. Um arquivo com erro de sintaxe não
+impede a abertura: o wintop usa os padrões, avisa no rodapé e não o regrava.
+
+## Atalho sem UAC
+
+`wintop --install` copia o executável e a pasta `modules` para `C:\Program Files\wintop`, cria
+uma tarefa agendada que executa o wintop com privilégio máximo (somente com o login do usuário,
+sem gatilhos) e um atalho no Menu Iniciar que dispara essa tarefa, sem a janela do UAC. Antes de
+criar a tarefa, o instalador confere que nenhum usuário sem elevação pode alterar a pasta ou o
+executável; caso contrário, recusa a instalação. `wintop --uninstall` remove a tarefa, o atalho
+e a cópia instalada.
 
 ## Requisitos
 

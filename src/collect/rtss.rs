@@ -12,7 +12,6 @@
 //!   modo benchmark).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -22,12 +21,9 @@ use windows::Win32::Foundation::{
     ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
-};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
     PIPE_ACCESS_DUPLEX, ReadFile,
@@ -39,10 +35,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
-    WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 
 use crate::model::{Fps, Game, Metric, Missing, fail, neutral};
 use crate::shm::SharedView;
@@ -606,40 +601,6 @@ impl Drop for Instance {
     }
 }
 
-/// SID do usuário do token atual, em texto (S-1-5-21-...).
-fn user_sid() -> Option<String> {
-    let mut token = HANDLE::default();
-    // SAFETY: token passa a ter dono logo abaixo.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
-    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
-    let _token = unsafe { own(token) };
-    let mut buf = vec![0u64; 64]; // alinhado para TOKEN_USER
-    let mut len = 0u32;
-    // SAFETY: buffer local com o tamanho informado.
-    unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr().cast::<c_void>()),
-            (buf.len() * 8) as u32,
-            &raw mut len,
-        )
-    }
-    .ok()?;
-    // SAFETY: GetTokenInformation preencheu um TOKEN_USER no início do buffer alinhado.
-    let user = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read() };
-    let mut text = PWSTR::null();
-    // SAFETY: SID válido enquanto `buf` vive; o texto é liberado com LocalFree.
-    unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) }.ok()?;
-    // SAFETY: `text` aponta para uma string terminada em zero alocada pela API.
-    let s = unsafe { text.to_string() }.ok();
-    // SAFETY: liberado uma única vez.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
-    }
-    s
-}
-
 /// As 8 instâncias do pipe, ou erro. Todas ou nenhuma: uma vaga livre deixaria outro processo
 /// do usuário criar uma instância e receber conexões do hook (GW inclui CREATE_PIPE_INSTANCE).
 /// Nome do pipe que o hook do RTSS procura.
@@ -651,7 +612,7 @@ fn create_pipe() -> Result<Vec<Instance>, String> {
 
 fn create_pipe_named(name: &str) -> Result<Vec<Instance>, String> {
     let name = wide(name);
-    let sid = user_sid().ok_or("could not read the user SID")?;
+    let sid = crate::win::user_sid().ok_or("could not read the user SID")?;
     // DACL protegida: SYSTEM e Administradores com controle total; o usuário (jogo sem
     // elevação) com GRGW, sem WRITE_DAC/WRITE_OWNER. Rótulo de integridade média.
     let sddl = wide(&format!(

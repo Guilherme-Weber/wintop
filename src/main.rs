@@ -9,6 +9,7 @@ mod collect;
 mod config;
 mod engine;
 mod fmt;
+mod install;
 mod instance;
 mod model;
 mod pdh;
@@ -55,6 +56,9 @@ usage: wintop [option]
 
   (no option)   open the monitor (+/- change the refresh interval, q quits)
   --check       collect twice and show the status of every metric
+  --install     copy to Program Files and add a Start menu shortcut that opens
+                wintop elevated without the UAC prompt (scheduled task)
+  --uninstall   remove the scheduled task, the shortcut and the installed copy
   --version     print the version
   --help        show this help";
 
@@ -68,6 +72,18 @@ fn main() {
         }
         Some("--help" | "-h") => {
             println!("{HELP}");
+            return;
+        }
+        Some(cmd @ ("--install" | "--uninstall")) => {
+            let r = if cmd == "--install" {
+                install::install()
+            } else {
+                install::uninstall()
+            };
+            if let Err(e) = r {
+                eprintln!("wintop {cmd}: {e}");
+                std::process::exit(1);
+            }
             return;
         }
         Some("--check") | None => {}
