@@ -82,7 +82,10 @@ pub(super) fn process_names() -> HashMap<u32, String> {
     // SAFETY: estrutura local com dwSize preenchido.
     let mut ok = unsafe { Process32FirstW(h, &raw mut e) }.is_ok();
     while ok {
-        out.insert(e.th32ProcessID, from_wide(&e.szExeFile));
+        out.insert(
+            e.th32ProcessID,
+            crate::win::printable(&from_wide(&e.szExeFile)),
+        );
         // SAFETY: idem.
         ok = unsafe { Process32NextW(h, &raw mut e) }.is_ok();
     }
@@ -156,8 +159,14 @@ pub(super) struct VramCollector {
     non_local: Slot,
     committed: Slot,
     adapter: Slot,
-    /// PID → nome, refeito pelo Toolhelp só quando aparece um PID desconhecido com VRAM.
+    /// PID → nome, relido pelo Toolhelp só quando aparece um PID desconhecido com VRAM.
     pub(super) names: HashMap<u32, String>,
+    /// PIDs que o último snapshot não achou (processo que já saiu, instância do PDH atrasada):
+    /// não disparam um snapshot novo a cada ciclo.
+    unnamed: std::collections::HashSet<u32>,
+    /// PIDs pedidos neste ciclo (todas as GPUs): o resto sai do cache no próximo `collect`, e
+    /// um PID que some e volta (possivelmente outro processo) é relido.
+    seen: std::collections::HashSet<u32>,
 }
 
 impl VramCollector {
@@ -178,6 +187,8 @@ impl VramCollector {
             committed,
             adapter,
             names: HashMap::new(),
+            unnamed: std::collections::HashSet::new(),
+            seen: std::collections::HashSet::new(),
         }
     }
 
@@ -199,14 +210,24 @@ impl VramCollector {
     /// (um PID que sai do conjunto e volta, possivelmente outro processo, é relido).
     pub(super) fn refresh_names(&mut self, pids: impl Iterator<Item = u32>) {
         let pids: Vec<u32> = pids.collect();
-        if pids.iter().any(|p| !self.names.contains_key(p)) {
-            let all = process_names();
-            self.names = pids
-                .iter()
-                .filter_map(|p| all.get(p).map(|n| (*p, n.clone())))
-                .collect();
-        } else {
-            self.names.retain(|p, _| pids.contains(p));
+        self.seen.extend(&pids);
+        let new: Vec<u32> = pids
+            .into_iter()
+            .filter(|p| !self.names.contains_key(p) && !self.unnamed.contains(p))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let all = process_names();
+        for p in new {
+            match all.get(&p) {
+                Some(n) => {
+                    self.names.insert(p, n.clone());
+                }
+                None => {
+                    self.unnamed.insert(p);
+                }
+            }
         }
     }
 
@@ -225,8 +246,12 @@ impl VramCollector {
         Ok(out)
     }
 
-    /// Coleta a consulta (uma vez por ciclo, antes das leituras de cada GPU).
-    pub(super) fn collect(&self) -> Result<(), String> {
+    /// Coleta a consulta (uma vez por ciclo, antes das leituras de cada GPU) e esquece os nomes
+    /// de PIDs que não apareceram no ciclo anterior.
+    pub(super) fn collect(&mut self) -> Result<(), String> {
+        let seen = std::mem::take(&mut self.seen);
+        self.names.retain(|p, _| seen.contains(p));
+        self.unnamed.retain(|p| seen.contains(p));
         match &self.query {
             Ok(q) => q.collect(),
             Err(e) => Err(e.clone()),
@@ -244,7 +269,13 @@ impl VramCollector {
     ) -> Metric<VramBreakdown> {
         let per_process = self.per_process(&self.local, luid).or_else(fail)?;
         if names.is_none() {
-            self.refresh_names(per_process.keys().copied());
+            // Só os PIDs que de fato usam VRAM (os de 0 bytes nem aparecem na barra).
+            let using: Vec<u32> = per_process
+                .iter()
+                .filter(|(_, v)| **v > 0)
+                .map(|(p, _)| *p)
+                .collect();
+            self.refresh_names(using.into_iter());
         }
         let names = names.unwrap_or(&self.names);
         let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;

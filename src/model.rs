@@ -243,6 +243,8 @@ pub struct Proc {
     pub pid: u32,
     pub parent: u32,
     pub name: String,
+    /// Instante de criação (FILETIME, 100 ns): identifica o processo mesmo com PID reaproveitado.
+    pub create: u64,
     /// % do sistema inteiro (todos os lógicos), como o Task Manager.
     pub cpu: f64,
     /// Working set privado (coluna "Memory" do Task Manager), bytes.

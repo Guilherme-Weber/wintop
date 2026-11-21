@@ -15,6 +15,7 @@ use nvml_wrapper::error::NvmlError;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use super::gpu_engine::EngineCollector;
 use super::vram::{ProcMem, VramCollector};
@@ -259,8 +260,11 @@ fn read_device(nvml: &Nvml, index: u32) -> Gpu {
         Ok(d) => d,
         Err(e) => return failed_gpu(index, &format!("NVML device_by_index: {e}")),
     };
-    let clock =
-        |c: Clock| -> Metric<(u32, u32)> { Ok((nv(d.clock_info(c))?, nv(d.max_clock_info(c))?)) };
+    // O máximo (clock) e o limite (potência) podem não ter suporte (GPUs móveis): o valor atual
+    // continua valendo, com 0 = "não informado" (a interface mostra só o atual).
+    let clock = |c: Clock| -> Metric<(u32, u32)> {
+        Ok((nv(d.clock_info(c))?, d.max_clock_info(c).unwrap_or(0)))
+    };
     let util = nv(d.utilization_rates());
     Gpu {
         index,
@@ -278,9 +282,9 @@ fn read_device(nvml: &Nvml, index: u32) -> Gpu {
         clock_sm: clock(Clock::SM),
         clock_mem: clock(Clock::Memory),
         clock_video: clock(Clock::Video),
-        power: nv(d.power_usage()).and_then(|p| {
-            let l = nv(d.enforced_power_limit())?;
-            Ok((f64::from(p) / 1000.0, f64::from(l) / 1000.0))
+        power: nv(d.power_usage()).map(|p| {
+            let l = d.enforced_power_limit().unwrap_or(0);
+            (f64::from(p) / 1000.0, f64::from(l) / 1000.0)
         }),
         fans: read_fans(&d),
         pcie_link: nv(d.current_pcie_link_gen())
@@ -341,7 +345,12 @@ pub struct GpuSlowCollector {
     vram: VramCollector,
     /// Engines por processo: consulta aberta só com a aba GPU visível.
     engines: EngineCollector,
+    /// Última leitura de PCIe por GPU: (instante, TX, RX).
+    pcie: HashMap<u32, (Instant, Metric<u64>, Metric<u64>)>,
 }
+
+/// Intervalo mínimo entre leituras de PCIe (o piso da thread lenta).
+const PCIE_EVERY: std::time::Duration = std::time::Duration::from_millis(1900);
 
 impl GpuSlowCollector {
     pub fn new(nvml: SharedNvml) -> Self {
@@ -367,6 +376,7 @@ impl GpuSlowCollector {
             luids,
             vram: VramCollector::new(),
             engines: EngineCollector::new(),
+            pcie: HashMap::new(),
         }
     }
 
@@ -450,12 +460,26 @@ impl GpuSlowCollector {
                             _ => Ok(list),
                         }
                     });
+                    // PCIe custa ~23 ms por sentido: no máximo a cada `PCIE_EVERY`, mesmo quando
+                    // abrir uma aba acorda a thread lenta antes da hora.
+                    let fresh = self
+                        .pcie
+                        .get(&index)
+                        .filter(|(t, ..)| t.elapsed() < PCIE_EVERY)
+                        .map(|(_, tx, rx)| (tx.clone(), rx.clone()));
+                    let (pcie_tx, pcie_rx) = fresh.unwrap_or_else(|| {
+                        let tx = nv(d.pcie_throughput(PcieUtilCounter::Send))
+                            .map(|k| u64::from(k) * 1024);
+                        let rx = nv(d.pcie_throughput(PcieUtilCounter::Receive))
+                            .map(|k| u64::from(k) * 1024);
+                        self.pcie
+                            .insert(index, (Instant::now(), tx.clone(), rx.clone()));
+                        (tx, rx)
+                    });
                     GpuSlow {
                         index,
-                        pcie_tx: nv(d.pcie_throughput(PcieUtilCounter::Send))
-                            .map(|k| u64::from(k) * 1024),
-                        pcie_rx: nv(d.pcie_throughput(PcieUtilCounter::Receive))
-                            .map(|k| u64::from(k) * 1024),
+                        pcie_tx,
+                        pcie_rx,
                         vram,
                         procs,
                     }

@@ -14,7 +14,7 @@ use super::{
     put, text, vram_bar,
 };
 use crate::fmt::{bytes, num};
-use crate::model::{GpuProc, Metric, Missing, Proc, fail};
+use crate::model::{GpuProc, Metric, Missing, Proc};
 use crate::ui::widgets::gradient;
 use crate::win::printable;
 
@@ -940,7 +940,7 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
                     None => format!("Disk {}", t.number),
                 };
                 let value = if t.model.is_some() && model.is_some() && t.model != model {
-                    fail("disk changed: waiting for a new reading")
+                    crate::model::neutral("disk changed: waiting for a new reading")
                 } else {
                     t.celsius.clone().map(f64::from)
                 };

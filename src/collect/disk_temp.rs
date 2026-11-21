@@ -40,6 +40,8 @@ fn native_temp(b: &[u8]) -> Option<i16> {
     let count = usize::from(u16::from_le_bytes(
         b.get(T_INFO_COUNT..T_INFO_COUNT + 2)?.try_into().ok()?,
     ));
+    // Não passa do que cabe no buffer (contagem corrompida não vira 65 mil voltas).
+    let count = count.min(b.len().saturating_sub(T_INFO) / T_INFO_SIZE);
     (0..count).find_map(|i| {
         let off = T_INFO + i * T_INFO_SIZE + T_TEMP;
         let t = i16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?);

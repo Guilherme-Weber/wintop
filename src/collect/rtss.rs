@@ -42,7 +42,7 @@ use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
     WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::model::{Fps, Game, Metric, Missing, fail, neutral};
 use crate::shm::SharedView;
@@ -91,6 +91,9 @@ const IGNORED: &[&str] = &[
     "openlogi-overlay.exe",
     "yourphoneappproxyhost.exe",
 ];
+/// Janela em que um jogo exato (pipe) continua exato sem frames: acima de `ACTIVE_MS` (que usa
+/// o relógio do RTSS, de 15,6 ms), para um travamento de ~2 s não piscar como "approx.".
+const EXACT_GRACE: Duration = Duration::from_millis(ACTIVE_MS as u64 + 500);
 /// Pausa sem frames a partir da qual o FPS passa a contar o tempo parado.
 const FREEZE_MIN_US: u64 = 50_000;
 /// Período mais longo entre amostras da thread do RTSS (sem jogo).
@@ -326,6 +329,7 @@ impl Ring {
 fn feed(
     rings: &mut HashMap<u32, Ring>,
     known: &HashSet<u32>,
+    ignored: &HashSet<u32>,
     carry: &mut Vec<u8>,
     data: &[u8],
     complete: bool,
@@ -338,7 +342,7 @@ fn feed(
         let app = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
         let us = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
         // Índice fora da Shared Memory ou frametime 0 (sem delta): registro ignorado.
-        if (app as usize) >= MAX_APPS || us == 0 {
+        if (app as usize) >= MAX_APPS || us == 0 || ignored.contains(&app) {
             continue;
         }
         if known.contains(&app) {
@@ -402,7 +406,7 @@ fn h(o: &OwnedHandle) -> HANDLE {
 }
 
 impl Instance {
-    fn create(first: bool, sa: &SECURITY_ATTRIBUTES) -> Result<Self, String> {
+    fn create(name: &[u16], first: bool, sa: &SECURITY_ATTRIBUTES) -> Result<Self, String> {
         let mut mode: FILE_FLAGS_AND_ATTRIBUTES = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
         if first {
             mode |= FILE_FLAG_FIRST_PIPE_INSTANCE; // falha se outro servidor já existe
@@ -410,7 +414,7 @@ impl Instance {
         // SAFETY: atributos válidos durante a chamada.
         let pipe = unsafe {
             CreateNamedPipeW(
-                w!(r"\\.\pipe\RTSS_Frametime"),
+                PCWSTR(name.as_ptr()),
                 mode,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 INSTANCES as u32, // limite fixo: ninguém cria instâncias além das nossas
@@ -525,7 +529,12 @@ impl Instance {
     }
 
     /// O evento sinalizou: trata uma conclusão e arma a próxima operação.
-    fn on_signal(&mut self, rings: &mut HashMap<u32, Ring>, known: &HashSet<u32>) {
+    fn on_signal(
+        &mut self,
+        rings: &mut HashMap<u32, Ring>,
+        known: &HashSet<u32>,
+        ignored: &HashSet<u32>,
+    ) {
         // SAFETY: evento válido; a próxima operação (ou `signal`) volta a sinalizá-lo.
         unsafe {
             let _ = ResetEvent(h(&self.event));
@@ -559,11 +568,25 @@ impl Instance {
                 let got = (n as usize).min(self.buf.len());
                 match r {
                     Ok(()) => {
-                        feed(rings, known, &mut self.carry, &self.buf[..got], true);
+                        feed(
+                            rings,
+                            known,
+                            ignored,
+                            &mut self.carry,
+                            &self.buf[..got],
+                            true,
+                        );
                         self.start_read();
                     }
                     Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                        feed(rings, known, &mut self.carry, &self.buf[..got], false);
+                        feed(
+                            rings,
+                            known,
+                            ignored,
+                            &mut self.carry,
+                            &self.buf[..got],
+                            false,
+                        );
                         self.start_read();
                     }
                     Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
@@ -630,7 +653,15 @@ fn user_sid() -> Option<String> {
 
 /// As 8 instâncias do pipe, ou erro. Todas ou nenhuma: uma vaga livre deixaria outro processo
 /// do usuário criar uma instância e receber conexões do hook (GW inclui CREATE_PIPE_INSTANCE).
+/// Nome do pipe que o hook do RTSS procura.
+const PIPE_NAME: &str = r"\\.\pipe\RTSS_Frametime";
+
 fn create_pipe() -> Result<Vec<Instance>, String> {
+    create_pipe_named(PIPE_NAME)
+}
+
+fn create_pipe_named(name: &str) -> Result<Vec<Instance>, String> {
+    let name = wide(name);
     let sid = user_sid().ok_or("could not read the user SID")?;
     // DACL protegida: SYSTEM e Administradores com controle total; o usuário (jogo sem
     // elevação) com GRGW, sem WRITE_DAC/WRITE_OWNER. Rótulo de integridade média.
@@ -654,7 +685,7 @@ fn create_pipe() -> Result<Vec<Instance>, String> {
         bInheritHandle: false.into(),
     };
     let instances: Result<Vec<Instance>, String> = (0..INSTANCES)
-        .map(|i| Instance::create(i == 0, &sa))
+        .map(|i| Instance::create(&name, i == 0, &sa))
         .collect();
     // SAFETY: descritor alocado acima; as instâncias já foram criadas.
     unsafe {
@@ -705,6 +736,8 @@ pub struct RtssCollector {
     exact: HashMap<u32, Ring>,
     /// Índices dos apps (fora dos ignorados) na última amostra: os que o pipe guarda inteiros.
     known: HashSet<u32>,
+    /// Índices de apps ignorados (navegadores, overlays): os frames deles são descartados.
+    ignored: HashSet<u32>,
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
     lows: LowsCache,
@@ -728,6 +761,7 @@ impl RtssCollector {
             turn: 0,
             exact: HashMap::new(),
             known: HashSet::new(),
+            ignored: HashSet::new(),
             approx: HashMap::new(),
             lows: None,
             published: None,
@@ -775,7 +809,7 @@ impl RtssCollector {
             }
             match armed[..n].get(idx - 1) {
                 Some(&k) => {
-                    instances[k].on_signal(&mut self.exact, &self.known);
+                    instances[k].on_signal(&mut self.exact, &self.known, &self.ignored);
                     handled += 1;
                 }
                 None => return false, // timeout ou erro
@@ -826,6 +860,7 @@ impl RtssCollector {
         self.lows = None;
         // Sem Shared Memory válida, nenhum índice é "conhecido" (o teto vale para todos).
         self.known.clear();
+        self.ignored.clear();
         self.published = None;
     }
 
@@ -868,22 +903,22 @@ impl RtssCollector {
         };
         let rtss = Ok(format!("shared memory {}.{}", ver >> 16, ver & 0xFFFF));
         let now = Instant::now();
+        // Só os índices de apps acompanhados (os ignorados, como navegadores, não guardam 60 s
+        // de frames).
+        let (ign, ok): (Vec<&App>, Vec<&App>) = apps
+            .iter()
+            .partition(|a| IGNORED.contains(&a.name.to_ascii_lowercase().as_str()));
+        self.known = ok.iter().map(|a| a.index).collect();
+        self.ignored = ign.iter().map(|a| a.index).collect();
         // Índice reaproveitado por outro app: os frames antigos não valem. Ring sem dono
         // (frames que chegaram antes desta amostra) fica com o app atual do índice.
-        for a in &apps {
+        for a in &ok {
             let ring = self.exact.entry(a.index).or_default();
             if ring.pid.is_some_and(|p| p != a.pid) {
                 ring.frames.clear();
             }
             ring.pid = Some(a.pid);
         }
-        // Só os índices de apps acompanhados (os ignorados, como navegadores, não guardam 60 s
-        // de frames).
-        self.known = apps
-            .iter()
-            .filter(|a| !IGNORED.contains(&a.name.to_ascii_lowercase().as_str()))
-            .map(|a| a.index)
-            .collect();
         self.exact.retain(|i, _| self.known.contains(i));
         self.approx
             .retain(|pid, _| apps.iter().any(|a| a.pid == *pid));
@@ -909,7 +944,7 @@ impl RtssCollector {
         let exact_recent = self
             .exact
             .get(&g.index)
-            .is_some_and(|r| r.recent(now, Duration::from_millis(u64::from(ACTIVE_MS))));
+            .is_some_and(|r| r.recent(now, EXACT_GRACE));
         let approx = !exact_recent;
         if approx && g.frametime_us > 0 {
             self.approx
@@ -976,7 +1011,8 @@ impl RtssCollector {
             api: api_name(g.api),
             resolution: match g.res {
                 Some((x, y)) if x > 0 && y > 0 => Ok((x, y)),
-                _ => fail("resolution not reported by RTSS"),
+                Some(_) => fail("resolution not reported by RTSS"),
+                None => neutral("needs RTSS shared memory 2.20+"),
             },
             approx,
             fps,
@@ -1225,6 +1261,57 @@ mod tests {
         );
     }
 
+    /// Servidor do pipe real com um nome de teste e clientes falsos (sem RTSS nem jogo): os
+    /// registros chegam inteiros, inclusive partidos em mensagens; a 9ª conexão é recusada
+    /// (as 8 instâncias são todas nossas); o evento de parada interrompe a espera na hora.
+    #[test]
+    fn servidor_do_pipe_com_clientes_falsos() {
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        let name = format!(r"\\.\pipe\wintop_test_{}", std::process::id());
+        let mut c = RtssCollector::new(false, false);
+        c.pipe = create_pipe_named(&name).map_err(Some);
+        assert!(c.pipe.is_ok(), "{:?}", c.pipe.as_ref().err());
+        // SAFETY: evento sem nome; o handle passa a ter dono na hora.
+        let ev = unsafe {
+            OwnedHandle::from_raw_handle(
+                windows::Win32::System::Threading::CreateEventW(None, true, false, None)
+                    .expect("evento")
+                    .0,
+            )
+        };
+        let stop = HANDLE(ev.as_raw_handle());
+        let rec = |app: u32, us: u32| [app.to_le_bytes(), us.to_le_bytes()].concat();
+        let open = || std::fs::OpenOptions::new().write(true).open(&name);
+        let mut a = open().expect("cliente 1");
+        let mut b = open().expect("cliente 2");
+        // 100 frames do app 3 num cliente; 50 do app 5 em outro, numa mensagem só.
+        for _ in 0..100 {
+            a.write_all(&rec(3, 7000)).expect("escrita");
+        }
+        let many: Vec<u8> = (0..50).flat_map(|_| rec(5, 16_000)).collect();
+        b.write_all(&many).expect("escrita");
+        // 8 instâncias: com 2 em uso, mais 6 conectam e a 9ª é recusada.
+        let extra: Vec<_> = (0..6).map(|_| open().expect("cliente extra")).collect();
+        assert!(open().is_err(), "9ª conexão recusada");
+        c.pump(Instant::now() + Duration::from_millis(300), stop);
+        assert_eq!(c.exact.get(&3).map(|r| r.frames.len()), Some(100));
+        assert_eq!(c.exact.get(&5).map(|r| r.frames.len()), Some(50));
+        drop(extra);
+        // Parada: o pump volta na hora mesmo com prazo longo.
+        // SAFETY: evento válido.
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(stop);
+        }
+        let t = Instant::now();
+        assert!(c.pump(Instant::now() + Duration::from_secs(10), stop));
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
     fn all_known() -> HashSet<u32> {
         (0..MAX_APPS as u32).collect()
     }
@@ -1243,7 +1330,7 @@ mod tests {
             }
         }
         for _ in 0..200 {
-            feed(&mut rings, &known, &mut carry, &data, true);
+            feed(&mut rings, &known, &HashSet::new(), &mut carry, &data, true);
         }
         let unknown: Vec<_> = rings.keys().filter(|i| !known.contains(i)).collect();
         assert!(unknown.len() <= MAX_UNKNOWN_RINGS, "{}", unknown.len());
@@ -1264,16 +1351,44 @@ mod tests {
         let mut carry = Vec::new();
         let mut rec = 7u32.to_le_bytes().to_vec();
         rec.extend(16_000u32.to_le_bytes());
-        feed(&mut rings, &all_known(), &mut carry, &rec[..5], false); // ERROR_MORE_DATA no meio
-        feed(&mut rings, &all_known(), &mut carry, &rec[5..], true);
+        feed(
+            &mut rings,
+            &all_known(),
+            &HashSet::new(),
+            &mut carry,
+            &rec[..5],
+            false,
+        ); // ERROR_MORE_DATA no meio
+        feed(
+            &mut rings,
+            &all_known(),
+            &HashSet::new(),
+            &mut carry,
+            &rec[5..],
+            true,
+        );
         let got: Vec<u32> = rings[&7].frames.iter().map(|(_, us)| *us).collect();
         assert_eq!(got, vec![16_000]);
-        feed(&mut rings, &all_known(), &mut carry, &rec[..3], true); // malformada: descartada
+        feed(
+            &mut rings,
+            &all_known(),
+            &HashSet::new(),
+            &mut carry,
+            &rec[..3],
+            true,
+        ); // malformada: descartada
         assert!(carry.is_empty());
         // Índice fora da Shared Memory é ignorado.
         let mut bad = 9999u32.to_le_bytes().to_vec();
         bad.extend(1u32.to_le_bytes());
-        feed(&mut rings, &all_known(), &mut carry, &bad, true);
+        feed(
+            &mut rings,
+            &all_known(),
+            &HashSet::new(),
+            &mut carry,
+            &bad,
+            true,
+        );
         assert!(!rings.contains_key(&9999));
     }
 
@@ -1283,7 +1398,14 @@ mod tests {
         let mut carry = Vec::new();
         let mut rec = 3u32.to_le_bytes().to_vec();
         rec.extend(0u32.to_le_bytes());
-        feed(&mut rings, &all_known(), &mut carry, &rec, true);
+        feed(
+            &mut rings,
+            &all_known(),
+            &HashSet::new(),
+            &mut carry,
+            &rec,
+            true,
+        );
         assert!(!rings.contains_key(&3));
     }
 

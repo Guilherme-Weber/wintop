@@ -42,7 +42,7 @@ const TITLE: Color = Color::Rgb(220, 224, 232);
 const TEXT: Color = Color::Rgb(200, 204, 212);
 const LABEL: Color = Color::Rgb(127, 133, 148);
 const NEUTRAL: Color = Color::Rgb(108, 112, 128);
-const FAIL: Color = Color::Rgb(235, 80, 80);
+pub(super) const FAIL: Color = Color::Rgb(235, 80, 80);
 const NET_SEND: Color = Color::Rgb(200, 120, 200);
 const NET_RECV: Color = Color::Rgb(92, 184, 228);
 const FPS_COLOR: Color = Color::Rgb(80, 200, 120);
@@ -69,7 +69,9 @@ impl Series {
         if self.0.len() == HISTORY {
             self.0.pop_front();
         }
-        self.0.push_back(if v.is_finite() { v } else { 0.0 });
+        // NaN = coleta sem valor: lacuna no gráfico (um 0 falso pareceria uso zero).
+        self.0
+            .push_back(if v.is_finite() || v.is_nan() { v } else { 0.0 });
     }
 
     fn values(&mut self) -> &[f64] {
@@ -187,6 +189,17 @@ impl State {
         }
     }
 
+    /// Tecla `d`: inverte o recolhimento do pool que está na tela (no automático com mais de 12
+    /// discos ele já começa recolhido: um aperto expande).
+    pub fn toggle_fold_pool(&mut self) {
+        let total = self
+            .fast
+            .as_ref()
+            .and_then(|f| f.disks.as_ref().ok())
+            .map_or(0, Vec::len);
+        self.fold_pool = Some(!pool_folded(self, total));
+    }
+
     /// Zera os extremos da sessão (tecla `r`).
     /// O histórico do jogo também: só o `r` o zera (jogos trocam de executável e congelam ao
     /// carregar, e isso não deve apagar o gráfico).
@@ -257,26 +270,53 @@ impl State {
         Some(v)
     }
 
-    /// Enter na aba GPU: lê os runtimes do processo selecionado (aplicando antes as teclas de
-    /// seleção ainda pendentes, sobre a lista exibida).
-    pub fn request_runtimes(&mut self) {
+    /// Enter na aba GPU: pedido de leitura dos runtimes do processo selecionado (aplicando
+    /// antes as teclas de seleção ainda pendentes, sobre a lista exibida). A leitura em si roda
+    /// fora da thread da interface (`RuntimeJob::run`); até lá, "reading modules".
+    pub fn request_runtimes(&mut self) -> Option<RuntimeJob> {
         let Some(Ok(list)) = &self.gpu_procs else {
-            return;
+            return None;
         };
         let rows = tabs::sorted_gpu(list);
         let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
         let page = self.gpu_cursor.page();
         let (Some(i), _) = self.gpu_cursor.resolve(&pids, page) else {
-            return;
+            return None;
         };
         let (pid, name) = (rows[i].pid, rows[i].name.clone());
-        let r = match self.protected_pids() {
-            Some(p) => crate::collect::modules::runtimes(pid, &name, &p),
-            None => crate::model::neutral(
-                "skipped: waiting for RTSS to list the hooked apps (anticheat safety)",
-            ),
+        let create = match &self.procs {
+            Some(Ok(l)) => l.iter().find(|p| p.pid == pid).map(|p| p.create),
+            _ => None,
         };
-        self.runtimes.insert(pid, (name, r));
+        let Some(protected) = self.protected_pids() else {
+            self.runtimes.insert(
+                pid,
+                (
+                    name,
+                    crate::model::neutral(
+                        "skipped: waiting for RTSS to list the hooked apps (anticheat safety)",
+                    ),
+                ),
+            );
+            return None;
+        };
+        self.runtimes.insert(
+            pid,
+            (name.clone(), crate::model::neutral("reading modules...")),
+        );
+        Some(RuntimeJob {
+            pid,
+            name,
+            create,
+            protected,
+        })
+    }
+
+    /// Resultado de uma leitura de runtimes (vale se o processo da linha ainda é o mesmo).
+    pub fn finish_runtimes(&mut self, pid: u32, name: String, r: Metric<Vec<&'static str>>) {
+        if self.runtimes.get(&pid).is_some_and(|(n, _)| *n == name) {
+            self.runtimes.insert(pid, (name, r));
+        }
     }
 
     pub fn reset_session(&mut self) {
@@ -290,7 +330,7 @@ impl State {
     /// Nova coleta da thread rápida: guarda, alimenta os históricos (inclusive os do jogo, no
     /// mesmo ritmo) e os extremos da sessão.
     pub fn push_fast(&mut self, f: Fast) {
-        let usage = |m: &Metric<f64>| m.as_ref().map_or(0.0, |v| v / 100.0);
+        let usage = |m: &Metric<f64>| m.as_ref().map_or(f64::NAN, |v| v / 100.0);
         if let Ok(c) = &f.cpu {
             self.cpu.push(usage(&c.usage));
             self.cpu_kernel.push(usage(&c.kernel));
@@ -320,7 +360,9 @@ impl State {
             && let Some(g) = list.first()
         {
             let (_, v) = busiest_engine(g);
-            self.gpu.push(f64::from(v) / 100.0);
+            let any = [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok());
+            self.gpu
+                .push(if any { f64::from(v) / 100.0 } else { f64::NAN });
             if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
                 self.session.gpu.update(f64::from(v));
             }
@@ -359,7 +401,7 @@ impl State {
             self.send.retain(|a, _| list.iter().any(|n| &n.alias == a));
             self.recv.retain(|a, _| list.iter().any(|n| &n.alias == a));
             for n in list {
-                let v = |m: &Metric<f64>| m.as_ref().copied().unwrap_or(0.0);
+                let v = |m: &Metric<f64>| m.as_ref().copied().unwrap_or(f64::NAN);
                 self.send
                     .entry(n.alias.clone())
                     .or_default()
@@ -422,6 +464,21 @@ impl State {
                 self.session.sensors.entry(key).or_default().update(*v);
             }
         }
+    }
+}
+
+/// Leitura de runtimes pedida pela interface, feita numa thread à parte (abrir um processo
+/// travado não congela a tela).
+pub struct RuntimeJob {
+    pub pid: u32,
+    pub name: String,
+    pub create: Option<u64>,
+    pub protected: Vec<u32>,
+}
+
+impl RuntimeJob {
+    pub fn run(&self) -> Metric<Vec<&'static str>> {
+        crate::collect::modules::runtimes(self.pid, &self.name, self.create, &self.protected)
     }
 }
 
@@ -709,7 +766,7 @@ fn source_failed<T>(m: &Metric<T>, inner: impl FnOnce(&T) -> bool) -> bool {
 }
 
 /// Fontes com alguma falha.
-fn failing_sources(st: &State) -> usize {
+pub(super) fn failing_sources(st: &State) -> usize {
     let mut n = 0;
     let mut add = |b: bool| n += usize::from(b);
     if let Some(f) = &st.fast {
@@ -756,8 +813,9 @@ fn failing_sources(st: &State) -> usize {
             l.iter()
                 .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv))
         }));
+        // Só a GPU exibida (a 1ª): a interface ainda não mostra outras.
         add(source_failed(&f.gpus, |l| {
-            l.iter().any(|g| {
+            l.iter().take(1).any(|g| {
                 failed(&g.name)
                     || failed(&g.driver)
                     || failed(&g.vbios)
@@ -792,6 +850,7 @@ fn failing_sources(st: &State) -> usize {
         slow_gpus_failed = s.gpus.is_err();
         add(source_failed(&s.gpus, |l| {
             l.iter()
+                .take(1)
                 .any(|g| failed(&g.pcie_tx) || failed(&g.pcie_rx) || failed(&g.vram))
         }));
         add(source_failed(&s.disk_temps, |l| {
@@ -806,6 +865,8 @@ fn failing_sources(st: &State) -> usize {
         Some(Ok(list)) => add(list.iter().any(|p| failed(&p.engines))),
         _ => {}
     }
+    // Runtimes pedidos na aba GPU (aparecem no detalhe dela).
+    add(st.tab == Tab::Gpu && st.runtimes.values().any(|(_, r)| failed(r)));
     if let Some(f) = &st.fps {
         add(failed(&f.rtss));
         add(failed(&f.pipe));
@@ -893,6 +954,10 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             format!("(base {})", num(f64::from(*m) / 1000.0, 2))
         }),
     ];
+    // Sem o tempo de kernel por lógico a grade mostra só o total: a causa aparece.
+    if let Err(e) = &c.kernel_per_logical {
+        l1.extend([sep(), label("kernel per core "), missing(e)]);
+    }
     match sensors {
         Some(Ok(s)) => {
             l1.extend([sep(), label("Tctl "), temp(&s.tctl)]);
@@ -1205,13 +1270,16 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         session_lines = wrap(spans, inner.width, 0, 8);
         bottom_h += session_lines.len() as u16;
     }
-    let [top, bottom] =
-        Layout::vertical([Constraint::Min(4), Constraint::Length(bottom_h)]).areas(inner);
+    let [top, bottom] = Layout::vertical([
+        Constraint::Min((engine_rows as u16).max(4)),
+        Constraint::Length(bottom_h),
+    ])
+    .areas(inner);
     let [graph, panel] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_W)]).areas(top);
 
     // Gráfico da engine dominante, com o nome dela no canto.
-    let head = if g.usage.is_ok() {
+    let head = if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
         vec![
             text(format!("{engine_v}% ")).add_modifier(Modifier::BOLD),
             Span::styled(engine.to_string(), Style::new().fg(engine_color(engine))),
@@ -1899,9 +1967,9 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Só o estado neutro ("disconnected") vai para a linha de desconectadas; falha aparece.
-    let (down, up): (Vec<_>, Vec<_>) = list
-        .iter()
-        .partition(|n| matches!(n.link, Err(Missing::Neutral(_))));
+    let (down, up): (Vec<_>, Vec<_>) = list.iter().partition(|n| {
+        matches!(n.link, Err(Missing::Neutral(_))) && !failed(&n.send) && !failed(&n.recv)
+    });
     // Placas que não cabem: a última linha avisa quantas ficaram de fora.
     // Uma placa precisa de 2 linhas (cabeçalho + taxa); com menos, nenhuma cabe.
     let fits = |reserved: u16| {
@@ -1947,6 +2015,24 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             inner,
         );
         let body = (per - 1).min(bottom.saturating_sub(y + 1));
+        if body == 1 {
+            let rate = |m: &Metric<f64>| metric(m, |v| bits(*v));
+            line(
+                frame,
+                vec![
+                    Span::styled(" ↑ ", Style::new().fg(NET_SEND)),
+                    rate(&n.send),
+                    Span::styled("   ↓ ", Style::new().fg(NET_RECV)),
+                    rate(&n.recv),
+                ],
+                inner.x,
+                y + 1,
+                inner.width,
+                inner,
+            );
+            y += per;
+            continue;
+        }
         let half_up = body.div_ceil(2);
         let half_down = body - half_up;
         let gw = inner.width.saturating_sub(RATE_W + 1);
@@ -2105,7 +2191,8 @@ fn disk_label(d: &Disk) -> String {
 /// Largura da coluna de temperatura (um estado neutro mais longo vai para as notas).
 const DISK_TEMP_W: usize = 8;
 
-/// Temperatura do disco, só se a leitura é do mesmo modelo (disco trocado no mesmo número).
+/// Temperatura do disco, só se a leitura é do mesmo modelo (disco trocado no mesmo número: a
+/// coluna mostra "wait" até a thread lenta reler).
 fn disk_temp<'a>(st: &'a State, d: &Disk) -> Option<&'a crate::model::DiskTemp> {
     match st.slow.as_ref().map(|s| &s.disk_temps) {
         Some(Ok(list)) => list
@@ -2141,7 +2228,14 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
     if let Some(Err(e)) = st.slow.as_ref().map(|s| &s.disk_temps) {
         note("disks", "temperature", e);
     }
-    for (d, _) in disk_order(st) {
+    // Todos os discos, inclusive os membros recolhidos do pool (a falha deles também aparece).
+    let all: Vec<Disk> = st
+        .fast
+        .as_ref()
+        .and_then(|f| f.disks.as_ref().ok())
+        .cloned()
+        .unwrap_or_default();
+    for d in all {
         let name = disk_label(&d);
         let fails: [(&str, Option<&Missing>); 5] = [
             ("model", d.model.as_ref().err()),
@@ -2157,6 +2251,13 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
                 Some(m @ Missing::Neutral(n)) if n.chars().count() > 6 => note(&name, what, m),
                 _ => {}
             }
+        }
+        // Contadores de I/O (o mesmo IOCTL): uma nota com a causa, a coluna mostra "! failed".
+        if let Some(m) = [&d.active, &d.response, &d.read, &d.write]
+            .into_iter()
+            .find_map(|m| m.as_ref().err().filter(|e| matches!(e, Missing::Fail(_))))
+        {
+            note(&name, "I/O counters", m);
         }
         if let Some(t) = disk_temp(st, &d)
             && let Err(m) = &t.celsius
@@ -2336,11 +2437,30 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             Some(Err(Missing::Fail(_))) => Span::styled("! failed", Style::new().fg(FAIL)),
             Some(Err(m)) if m.to_string().chars().count() > DISK_TEMP_W => label("(below)"),
             Some(c) => metric(c, |c| format!("{c} °C")),
+            // Há leitura deste número, mas de outro modelo (disco trocado): espera a releitura.
+            None if st
+                .slow
+                .as_ref()
+                .and_then(|s| s.disk_temps.as_ref().ok())
+                .is_some_and(|l| l.iter().any(|t| t.number == d.number)) =>
+            {
+                label("wait")
+            }
             None => label(""),
         };
-        // As quatro vêm do mesmo IOCTL: falhando juntas, a causa aparece uma vez só.
+        // As quatro vêm do mesmo IOCTL: falhando juntas, "! failed" (causa nas notas) e a
+        // temperatura continua no lugar dela.
         let info = match (&d.active, &d.response, &d.read, &d.write) {
-            (Err(e), Err(_), Err(_), Err(_)) => vec![missing(e), Span::raw("  "), t],
+            (Err(e), Err(_), Err(_), Err(_)) => vec![
+                match e {
+                    Missing::Fail(_) => {
+                        Span::styled(format!("{:<31}", "! failed"), Style::new().fg(FAIL))
+                    }
+                    Missing::Neutral(n) => label(&format!("{:<31}", printable(n))),
+                },
+                Span::raw("  "),
+                t,
+            ],
             _ => vec![
                 metric(&d.active, |v| format!("{:>4}%", num(*v, 0))),
                 metric(&d.response, |v| format!(" {:>5}ms", num(v * 1000.0, 1))),
@@ -2394,10 +2514,11 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let rtss_failed = matches!(fps.rtss, Err(Missing::Fail(_)));
     let (title, source) = match g {
         Some(g) => {
-            let res = g.resolution.as_ref().map_or_else(
-                |e| format!(" · resolution: {e}"),
-                |(x, y)| format!(" · {x}x{y}"),
-            );
+            // Sem resolução: a causa vai para as linhas de baixo, com a cor do estado.
+            let res = g
+                .resolution
+                .as_ref()
+                .map_or(String::new(), |(x, y)| format!(" · {x}x{y}"));
             let title = format!(
                 "game · {} ({} · PID {}{res})",
                 printable(&g.name),
@@ -2458,8 +2579,11 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let ceil = fps_ceiling(st.game_fps.max_of(n));
     let head = vec![
         label("FPS "),
-        g.map_or_else(idle, |g| {
-            metric(&g.fps, |v| num(*v, 0)).add_modifier(Modifier::BOLD)
+        // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
+        g.map_or_else(idle, |g| match &g.fps {
+            Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
+            Err(Missing::Neutral(_)) => label("-"),
+            Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(FAIL)),
         }),
         sep(),
         minmax(st.session.fps, |v| num(v, 0)),
@@ -2538,30 +2662,41 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
 /// As duas linhas de detalhe do jogo em foco.
 fn game_lines(g: &crate::model::Game, interval_ms: u64) -> Vec<Line<'static>> {
     let ms = |v: f64| format!("{} ms", num(v, 2));
-    vec![
-        Line::from(vec![
-            label("1% low "),
-            metric(&g.lows, |(a, _)| num(*a, 0)),
-            label("   0.1% low "),
-            metric(&g.lows, |(_, b)| num(*b, 0)),
-            bar_sep(),
-            label("frametime "),
-            metric(&g.frametime, |(a, lo, hi)| {
-                format!("{} ({} - {} ms)", ms(*a), num(*lo, 1), num(*hi, 1))
-            }),
-            bar_sep(),
-            label("GPU busy "),
-            metric(&g.gpu_time, |(a, f)| {
-                format!("{} / frame {}", ms(*a), ms(*f))
-            }),
-        ]),
-        Line::from(vec![
-            label("limited by "),
-            metric(&g.bound, ToString::to_string),
-            bar_sep(),
-            label("lows over 60 s"),
-            bar_sep(),
-            label(&format!("graphs synced to the {interval_ms} ms tick")),
-        ]),
-    ]
+    // O que não cabe no cabeçalho dos gráficos (estado do FPS) e no título (resolução).
+    let mut extra = Vec::new();
+    if let Err(e) = &g.fps {
+        extra.push(Line::from(vec![label("FPS "), missing(e)]));
+    }
+    if let Err(e) = &g.resolution {
+        extra.push(Line::from(vec![label("resolution "), missing(e)]));
+    }
+    extra
+        .into_iter()
+        .chain(vec![
+            Line::from(vec![
+                label("1% low "),
+                metric(&g.lows, |(a, _)| num(*a, 0)),
+                label("   0.1% low "),
+                metric(&g.lows, |(_, b)| num(*b, 0)),
+                bar_sep(),
+                label("frametime "),
+                metric(&g.frametime, |(a, lo, hi)| {
+                    format!("{} ({} - {} ms)", ms(*a), num(*lo, 1), num(*hi, 1))
+                }),
+                bar_sep(),
+                label("GPU busy "),
+                metric(&g.gpu_time, |(a, f)| {
+                    format!("{} / frame {}", ms(*a), ms(*f))
+                }),
+            ]),
+            Line::from(vec![
+                label("limited by "),
+                metric(&g.bound, ToString::to_string),
+                bar_sep(),
+                label("lows over 60 s"),
+                bar_sep(),
+                label(&format!("graphs synced to the {interval_ms} ms tick")),
+            ]),
+        ])
+        .collect()
 }

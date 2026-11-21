@@ -10,6 +10,7 @@ mod widgets;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -53,12 +54,17 @@ fn event_loop(
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
     let mut st = view::State::new(engine.interval_ms());
+    let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<RuntimeResult>();
     let mut seen = Seen::default();
     let mut dirty = true;
     let mut last_second = (u16::MAX, 0, 0);
     while !stop.load(Ordering::SeqCst) {
         // Cada redesenho também acorda o terminal (que conta no orçamento de CPU): as fontes
         // fora de fase esperam o próximo tick da coleta rápida quando a tela não depende delas.
+        while let Ok((pid, name, r)) = jobs_rx.try_recv() {
+            st.finish_runtimes(pid, name, r);
+            dirty = true;
+        }
         let u = engine.updates(&mut seen);
         let overview = st.tab == view::Tab::Overview;
         if let Some(f) = u.fast {
@@ -134,7 +140,7 @@ fn event_loop(
                     }
                     KeyCode::Char('d') => {
                         // Automático → recolhe → expande → recolhe...
-                        st.fold_pool = Some(!st.fold_pool.unwrap_or(false));
+                        st.toggle_fold_pool();
                         dirty = true;
                     }
                     KeyCode::Char(c @ '1'..='4') => {
@@ -147,7 +153,7 @@ fn event_loop(
                         engine.set_view(st.view());
                         dirty = true;
                     }
-                    code => dirty |= list_key(&mut st, code),
+                    code => dirty |= list_key(&mut st, code, &jobs_tx),
                 },
                 Event::Resize(..) => dirty = true,
                 _ => {}
@@ -161,7 +167,10 @@ fn event_loop(
 }
 
 /// Teclas das listas (abas Processos e GPU). `true` = redesenhar.
-fn list_key(st: &mut view::State, code: KeyCode) -> bool {
+/// Resultado de uma leitura de runtimes: (PID, nome, runtimes).
+type RuntimeResult = (u32, String, crate::model::Metric<Vec<&'static str>>);
+
+fn list_key(st: &mut view::State, code: KeyCode, jobs: &Sender<RuntimeResult>) -> bool {
     let cursor = match st.tab {
         view::Tab::Processes => &mut st.proc_cursor,
         view::Tab::Gpu => &mut st.gpu_cursor,
@@ -182,7 +191,26 @@ fn list_key(st: &mut view::State, code: KeyCode) -> bool {
         KeyCode::Char('/') if st.tab == view::Tab::Processes => st.filtering = true,
         // Sob demanda: abre o processo selecionado (nunca o jogo nem apps com o hook do RTSS,
         // recusados antes de abrir).
-        KeyCode::Enter if st.tab == view::Tab::Gpu => st.request_runtimes(),
+        KeyCode::Enter if st.tab == view::Tab::Gpu => {
+            if let Some(job) = st.request_runtimes() {
+                let (pid, name) = (job.pid, job.name.clone());
+                let tx = jobs.clone();
+                // Thread curta por pedido (sob demanda, raro): a interface segue respondendo.
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("runtimes".into())
+                        .spawn(move || {
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                job.run()
+                            }))
+                            .unwrap_or_else(|_| crate::model::fail("module reader panicked"));
+                            let _ = tx.send((job.pid, job.name, r));
+                        });
+                if let Err(e) = spawned {
+                    st.finish_runtimes(pid, name, crate::model::fail(e.to_string()));
+                }
+            }
+        }
         _ => return false,
     }
     true

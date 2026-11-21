@@ -58,7 +58,25 @@ pub fn classify<'a>(modules: impl Iterator<Item = &'a str>) -> Vec<&'static str>
 /// depois da última amostra); (3) o PID ainda é o mesmo processo (PID reaproveitado por um
 /// jogo novo). Qualquer dúvida = não abre. Fica o caso de um jogo que o RTSS não engancha
 /// (perfil excluído): por isso a leitura é só sob demanda, nunca automática.
-pub fn runtimes(pid: u32, name: &str, hooked: &[u32]) -> Metric<Vec<&'static str>> {
+/// Processo mais novo que isto não é aberto: o hook do RTSS entra alguns instantes depois do
+/// início (um jogo recém-aberto ainda não aparece como 3D).
+const MIN_AGE: u64 = 5 * 10_000_000; // 5 s em 100 ns
+
+/// Instante atual em FILETIME (100 ns desde 1601), a mesma base do instante de criação.
+fn now_filetime() -> u64 {
+    // SAFETY: sem pré-condições; devolve a estrutura por valor.
+    crate::win::filetime(unsafe {
+        windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime()
+    })
+}
+
+/// `create`: instante de criação do processo que a interface mostrava (quando conhecido).
+pub fn runtimes(
+    pid: u32,
+    name: &str,
+    create: Option<u64>,
+    hooked: &[u32],
+) -> Metric<Vec<&'static str>> {
     const SKIP: &str = "skipped: 3D app hooked by RTSS (anticheat safety)";
     if hooked.contains(&pid) {
         return neutral(SKIP);
@@ -71,8 +89,12 @@ pub fn runtimes(pid: u32, name: &str, hooked: &[u32]) -> Metric<Vec<&'static str
         Ok(_) => {}
         Err(e) => return neutral(format!("skipped: {e} (anticheat safety)")),
     }
-    match super::procs::name_of(pid) {
-        Ok(Some(n)) if n == name => {}
+    match super::procs::identity_of(pid) {
+        Ok(Some((n, c))) if n == name && create.is_none_or(|x| x == c) => {
+            if now_filetime().saturating_sub(c) < MIN_AGE {
+                return neutral("skipped: started less than 5 s ago (anticheat safety)");
+            }
+        }
         Ok(_) => return neutral("process changed: select it again"),
         Err(e) => return fail(e),
     }
@@ -131,10 +153,10 @@ mod tests {
     #[test]
     fn processo_com_hook_nem_e_aberto() {
         assert_eq!(
-            runtimes(1234, "game.exe", &[1234]),
+            runtimes(1234, "game.exe", None, &[1234]),
             neutral("skipped: 3D app hooked by RTSS (anticheat safety)")
         );
-        assert_eq!(runtimes(4, "System", &[]), neutral("protected"));
+        assert_eq!(runtimes(4, "System", None, &[]), neutral("protected"));
     }
 
     fn my_name() -> String {
@@ -147,12 +169,38 @@ mod tests {
     #[test]
     #[ignore = "hardware: precisa do RTSS aberto"]
     fn o_proprio_processo() {
-        let r = runtimes(std::process::id(), &my_name(), &[]).expect("módulos do próprio processo");
+        let me = std::process::id();
+        // Outro teste já carregou DXGI neste processo: o RTSS o enganchou e tudo é recusado
+        // antes de abrir (a trava funcionando).
+        if super::super::rtss::hooked_now().is_ok_and(|l| l.contains(&me)) {
+            let r = runtimes(me, &my_name(), None, &[]);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("hooked by RTSS")),
+                "{r:?}"
+            );
+            return;
+        }
+        // O processo de teste tem menos de 5 s de vida: recusado; esperando, é lido.
+        let (_, create) = super::super::procs::identity_of(me)
+            .expect("lista")
+            .expect("o próprio processo");
+        let age_s = now_filetime().saturating_sub(create) / 10_000_000;
+        if age_s < 5 {
+            assert!(runtimes(me, &my_name(), Some(create), &[]).is_err());
+            std::thread::sleep(std::time::Duration::from_secs(5 - age_s + 1));
+        }
+        let r = runtimes(me, &my_name(), Some(create), &[]).expect("módulos do próprio processo");
         // O executável de teste não carrega runtime de GPU.
         assert!(!r.contains(&"CUDA"), "{r:?}");
         assert_eq!(
-            runtimes(std::process::id(), "outro.exe", &[]),
+            runtimes(me, "outro.exe", None, &[]),
             neutral("process changed: select it again")
+        );
+        assert_eq!(
+            runtimes(me, &my_name(), Some(create + 1), &[]),
+            neutral("process changed: select it again"),
+            "mesmo nome, outro instante de criação = outro processo"
         );
     }
 }

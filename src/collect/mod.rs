@@ -132,6 +132,8 @@ pub struct SlowCollectors {
     procs: procs::ProcCollector,
     /// Engines por processo já em coleta (aba GPU visível no ciclo anterior).
     engines_open: bool,
+    /// Ciclos seguidos com a aba GPU fora de vista.
+    gpu_hidden: u32,
 }
 
 /// Espera entre a 1ª leitura das taxas (aba recém-aberta) e a publicada.
@@ -156,6 +158,7 @@ impl SlowCollectors {
             disk_temp: create("disk temperature", disk_temp::DiskTempCollector::new),
             procs: procs::ProcCollector::new(),
             engines_open: false,
+            gpu_hidden: 0,
         }
     }
 
@@ -168,11 +171,18 @@ impl SlowCollectors {
         if !want_procs {
             self.procs.reset();
         }
-        if !view.gpu && self.engines_open {
-            if let Ok(g) = &mut self.gpu {
-                g.close_engines();
+        // Fora da aba GPU por um ciclo inteiro: a consulta fecha. Voltar antes disso não reabre
+        // a consulta nem repete o aquecimento.
+        if view.gpu {
+            self.gpu_hidden = 0;
+        } else if self.engines_open {
+            self.gpu_hidden += 1;
+            if self.gpu_hidden >= 2 {
+                if let Ok(g) = &mut self.gpu {
+                    g.close_engines();
+                }
+                self.engines_open = false;
             }
-            self.engines_open = false;
         }
         // Aquecimento das taxas que acabaram de entrar em vista.
         let mut warm = false;

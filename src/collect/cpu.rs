@@ -295,6 +295,51 @@ pub(crate) fn parse_topology(b: &[u8]) -> Option<Topology> {
 mod tests {
     use super::*;
 
+    /// Carga conhecida por lógico: K threads presas (afinidade) nos lógicos 0..K ocupadas o
+    /// tempo todo aparecem nesses lógicos, na ordem do coletor, e no total (~K/N).
+    #[test]
+    #[ignore = "mede carga real: rodar sozinho (--test-threads=1)"]
+    fn carga_presa_nos_logicos() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+        const K: usize = 4;
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads: Vec<_> = (0..K)
+            .map(|k| {
+                let s = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    // SAFETY: pseudo-handle da própria thread; máscara de um lógico do grupo 0.
+                    unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << k) };
+                    let mut x = 0u64;
+                    while !s.load(Ordering::Relaxed) {
+                        x = std::hint::black_box(x.wrapping_add(1));
+                    }
+                })
+            })
+            .collect();
+        let mut c = CpuCollector::new();
+        let pi = super::super::perf_info();
+        let _ = c.read(pi.as_ref());
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let pi = super::super::perf_info();
+        let cpu = c.read(pi.as_ref());
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().expect("thread");
+        }
+        let per = cpu.per_logical.expect("por lógico");
+        let n = per.len() as f64;
+        let total = cpu.usage.expect("total");
+        println!(
+            "lógicos 0..{K}: {:?}; total {total:.1}% (mín. {:.1}%)",
+            &per[..K],
+            100.0 * K as f64 / n
+        );
+        assert!(per[..K].iter().all(|v| *v > 85.0), "{per:?}");
+        assert!(total >= 100.0 * K as f64 / n * 0.9, "{total}");
+    }
+
     #[test]
     fn ordem_por_grupo_e_numero() {
         let items = vec![

@@ -48,6 +48,8 @@ struct State {
     fast_seq: u64,
     slow_seq: u64,
     fps_seq: u64,
+    /// A última publicação do RTSS ainda não foi lida pela interface.
+    fps_unread: bool,
     stop: bool,
 }
 
@@ -276,7 +278,7 @@ impl Engine {
 
     /// O que mudou desde `seen` (e atualiza `seen`). Só clona o que é novo.
     pub fn updates(&self, seen: &mut Seen) -> Updates {
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
         let mut u = Updates::default();
         if st.fast_seq != seen.fast {
             seen.fast = st.fast_seq;
@@ -289,6 +291,7 @@ impl Engine {
         if st.fps_seq != seen.fps {
             seen.fps = st.fps_seq;
             u.fps.clone_from(&st.fps);
+            st.fps_unread = false;
         }
         u
     }
@@ -354,10 +357,20 @@ impl Drop for Engine {
 /// Thread do RTSS: amostra a cada 250 ms com jogo (1 s sem) e atende o pipe no meio. Um pânico
 /// publica a falha (a interface não fica parada no último valor) e encerra a thread.
 fn rtss_thread(sh: &Shared, stop: HANDLE) {
-    let publish = |snap: Fps| {
+    let publish = |mut snap: Fps| {
         let mut st = sh.lock();
+        // A interface não leu a publicação anterior (tela ocupada mais de 250 ms): o pior frame
+        // dela não se perde, entra no desta (o gráfico de frametime mostra o pior do tick).
+        if st.fps_unread
+            && let (Some(Ok(prev)), Ok(cur)) = (st.fps.as_ref().map(|f| &f.game), &mut snap.game)
+            && prev.pid == cur.pid
+            && let Some(p) = prev.peak_ms
+        {
+            cur.peak_ms = Some(cur.peak_ms.map_or(p, |c| c.max(p)));
+        }
         st.fps = Some(snap);
         st.fps_seq += 1;
+        st.fps_unread = true;
     };
     let Ok(mut c) = catch_unwind(|| RtssCollector::new(true, true)) else {
         publish(rtss::failed("RTSS collector panicked on startup"));
@@ -449,6 +462,106 @@ mod tests {
         let n = after - before;
         println!("{n} coletas rápidas em 3 s a 300 ms");
         assert!((8..=12).contains(&n), "{n}");
+    }
+
+    fn shared(interval_ms: u64) -> Arc<Shared> {
+        Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            interval_ms: AtomicU64::new(interval_ms),
+            stopping: AtomicBool::new(false),
+            view: AtomicU8::new(0),
+            kick: AtomicBool::new(false),
+        })
+    }
+
+    /// Espera da thread lenta (período longo) num thread de teste; devolve quanto levou.
+    fn waiting(sh: &Arc<Shared>) -> JoinHandle<(bool, Duration)> {
+        let s = Arc::clone(sh);
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let r = s.wait_tick(Instant::now(), SLOW_FACTOR, SLOW_FLOOR, Some(&s.kick));
+            (r.is_some(), t.elapsed())
+        })
+    }
+
+    #[test]
+    fn chute_acorda_a_thread_lenta() {
+        let sh = shared(10_000); // período de 20 s
+        let t = waiting(&sh);
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let _st = sh.lock();
+            sh.kick.store(true, Ordering::Relaxed);
+        }
+        sh.wake.notify_all();
+        let (ok, took) = t.join().expect("thread");
+        assert!(ok && took < Duration::from_millis(500), "{took:?}");
+    }
+
+    #[test]
+    fn intervalo_menor_vale_na_hora_e_parada_interrompe() {
+        let sh = shared(10_000);
+        let t = waiting(&sh);
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let _st = sh.lock();
+            sh.interval_ms.store(100, Ordering::Relaxed);
+        }
+        sh.wake.notify_all();
+        // Novo período = piso de 2 s a partir da base (não os 20 s de antes).
+        let (ok, took) = t.join().expect("thread");
+        assert!(ok && took < Duration::from_millis(2600), "{took:?}");
+        let t = waiting(&sh);
+        std::thread::sleep(Duration::from_millis(50));
+        sh.lock().stop = true;
+        sh.wake.notify_all();
+        let (ok, took) = t.join().expect("thread");
+        assert!(!ok && took < Duration::from_millis(500), "{took:?}");
+    }
+
+    /// Orçamento: o motor inteiro (as três threads), alternando as abas com coleta própria,
+    /// fica abaixo de 0,3% de CPU e de 45 MB de working set privado (o executável de teste é
+    /// maior que o do wintop). Evita regressões silenciosas de consumo.
+    #[test]
+    #[ignore = "hardware: inicia todos os coletores por ~20 s (rodar sozinho)"]
+    fn orcamento_de_consumo() {
+        let e = Engine::start(DEFAULT_INTERVAL_MS);
+        let views = [
+            View::default(),
+            View {
+                procs: true,
+                gpu: false,
+            },
+            View {
+                procs: false,
+                gpu: true,
+            },
+            View::default(),
+        ];
+        let mut cpu = Vec::new();
+        let mut ws = 0u64;
+        for v in views {
+            e.set_view(v);
+            std::thread::sleep(Duration::from_secs(5));
+            if let (Some(f), _, _) = e.latest()
+                && let Ok(o) = &f.own
+            {
+                if let Ok(c) = o.cpu {
+                    cpu.push(c);
+                }
+                if let Ok(w) = o.private_ws {
+                    ws = ws.max(w);
+                }
+            }
+        }
+        let avg = cpu.iter().sum::<f64>() / cpu.len().max(1) as f64;
+        println!(
+            "CPU {cpu:?} (média {avg:.3}%), WS privado máx. {} MB",
+            ws >> 20
+        );
+        assert!(avg < 0.3, "{avg}");
+        assert!(ws < 45 << 20, "{} MB", ws >> 20);
     }
 
     #[test]

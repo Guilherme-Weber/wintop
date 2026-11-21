@@ -129,8 +129,14 @@ fn raw_of(pid: u32) -> Result<Option<Raw>, String> {
 }
 
 /// Nome atual do processo `pid`.
+#[cfg(test)]
 pub fn name_of(pid: u32) -> Result<Option<String>, String> {
     Ok(raw_of(pid)?.map(|r| r.name))
+}
+
+/// Nome e instante de criação (FILETIME) do processo `pid` agora.
+pub fn identity_of(pid: u32) -> Result<Option<(String, u64)>, String> {
+    Ok(raw_of(pid)?.map(|r| (r.name, r.create)))
 }
 
 /// Working set privado do processo `pid` (o do próprio wintop no Windows 10, onde o
@@ -265,6 +271,7 @@ impl ProcCollector {
                 pid: r.pid,
                 parent: r.parent,
                 name: r.name,
+                create: r.create,
                 cpu,
                 mem: r.mem,
                 commit: r.commit,

@@ -160,3 +160,30 @@ impl SharedView {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leituras_nas_bordas() {
+        let mut b = vec![0u8; 16];
+        b[1..5].copy_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+        b[8..12].copy_from_slice(b"ab\x9b\x07");
+        let v = SharedView::from_bytes(&b);
+        // Desalinhado: lido byte a byte, mesmo valor.
+        assert_eq!(v.u32_at(1), Some(0xA1B2_C3D4));
+        // Fim exato e além do fim.
+        assert!(v.u32_at(12).is_some());
+        assert_eq!(v.u32_at(13), None);
+        assert_eq!(v.u32_at(usize::MAX), None);
+        // Entrada de array com estouro na multiplicação e na soma.
+        assert_eq!(v.entry(0, usize::MAX, 2), None);
+        assert_eq!(v.entry(usize::MAX, 1, 1), None);
+        assert_eq!(v.entry(0, 1, 8), Some(8));
+        assert_eq!(v.entry(0, 2, 8), None);
+        // String sem terminador e com controles C0/C1: nada de sequência no terminal.
+        assert_eq!(v.cstr(8, 4).as_deref(), Some("ab??"));
+        assert_eq!(v.cstr(14, 4), None);
+    }
+}

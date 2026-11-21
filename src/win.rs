@@ -138,8 +138,10 @@ pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
 pub fn is_local_absolute(p: &std::path::Path) -> bool {
     use std::path::{Component, Prefix};
     let mut c = p.components();
+    // A raiz sozinha (`C:\`) não vale: pelo menos uma pasta.
     matches!(c.next(), Some(Component::Prefix(x)) if matches!(x.kind(), Prefix::Disk(_)))
         && matches!(c.next(), Some(Component::RootDir))
+        && c.next().is_some_and(|x| matches!(x, Component::Normal(_)))
         && c.all(|x| matches!(x, Component::Normal(_)))
 }
 
@@ -194,6 +196,7 @@ mod tests {
         assert!(!is_local_absolute(Path::new(r"C:\a\..\b")));
         assert!(!is_local_absolute(Path::new(r"C:relative")));
         assert!(!is_local_absolute(Path::new(r"relative\x")));
+        assert!(!is_local_absolute(Path::new(r"C:\")));
     }
 
     #[test]

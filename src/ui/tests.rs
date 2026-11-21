@@ -492,6 +492,7 @@ fn proc(pid: u32, name: &str, cpu: f64, mem_mb: u64) -> crate::model::Proc {
         pid,
         parent: 4,
         name: name.into(),
+        create: u64::from(pid) * 1000,
         cpu,
         mem: mem_mb * MB,
         commit: mem_mb * 2 * MB,
@@ -679,7 +680,10 @@ fn sem_lista_do_rtss_nenhum_processo_e_aberto() {
     });
     assert_eq!(st.protected_pids(), None);
     let _ = render(&mut st, 160, 20);
-    st.request_runtimes();
+    assert!(
+        st.request_runtimes().is_none(),
+        "nenhuma leitura sem a lista do RTSS"
+    );
     let (_, r) = st.runtimes.values().next().expect("resultado");
     assert!(
         matches!(r, Err(Missing::Neutral(s)) if s.contains("waiting for RTSS")),
@@ -693,7 +697,13 @@ fn enter_usa_a_selecao_pendente() {
     let _ = render(&mut st, 160, 20);
     // ↓ e Enter no mesmo lote de teclas (sem desenho no meio): vale o 2º da lista.
     st.gpu_cursor.down(1);
-    st.request_runtimes();
+    let job = st.request_runtimes().expect("pedido de leitura");
+    assert_eq!(job.pid, 9120);
+    assert_eq!(
+        job.create,
+        Some(9120 * 1000),
+        "identidade pelo instante de criação"
+    );
     // 2º por uso de GPU = firefox (12% no decoder); ele não tem o hook no fixture.
     assert!(st.runtimes.contains_key(&9120), "{:?}", st.runtimes.keys());
 }
@@ -785,4 +795,191 @@ fn disco_removido_some_da_aba_sensores() {
     let out = render(&mut st, 160, 40);
     assert!(!out.contains("Disk 7"), "{out}");
     assert!(out.contains("Disk 0"), "{out}");
+}
+
+// --- Invariante: toda falha contada no rodapé aparece em vermelho, inteira, em alguma aba ---
+
+/// Uma alteração que põe uma falha com a causa `tag` numa métrica.
+type Inject = Box<dyn Fn(&mut Fast, &mut Slow, &mut Fps, &str)>;
+
+fn injections() -> Vec<(&'static str, Inject)> {
+    fn f<T>(tag: &str) -> crate::model::Metric<T> {
+        fail(format!("cause {tag} of the {}", tag.replace("TAG", "END")))
+    }
+    let cpu = |g: fn(&mut Cpu, &str)| -> Inject {
+        Box::new(move |fa, _, _, t| {
+            if let Ok(c) = &mut fa.cpu {
+                g(c, t);
+            }
+        })
+    };
+    let gpu = |g: fn(&mut Gpu, &str)| -> Inject {
+        Box::new(move |fa, _, _, t| {
+            if let Ok(l) = &mut fa.gpus {
+                g(&mut l[0], t);
+            }
+        })
+    };
+    let mem = |g: fn(&mut Memory, &str)| -> Inject {
+        Box::new(move |fa, _, _, t| {
+            if let Ok(m) = &mut fa.memory {
+                g(m, t);
+            }
+        })
+    };
+    let disk = |g: fn(&mut Disk, &str)| -> Inject {
+        Box::new(move |fa, _, _, t| {
+            if let Ok(l) = &mut fa.disks {
+                g(&mut l[0], t);
+            }
+        })
+    };
+    let game = |g: fn(&mut Game, &str)| -> Inject {
+        Box::new(move |_, _, fp, t| {
+            if let Ok(x) = &mut fp.game {
+                g(x, t);
+            }
+        })
+    };
+    vec![
+        ("cpu.name", cpu(|c, t| c.name = f(t))),
+        ("cpu.topology", cpu(|c, t| c.topology = f(t))),
+        ("cpu.base", cpu(|c, t| c.base_mhz = f(t))),
+        ("cpu.virt", cpu(|c, t| c.virtualization = f(t))),
+        ("cpu.freq", cpu(|c, t| c.freq_mhz = f(t))),
+        ("cpu.counts", cpu(|c, t| c.counts = f(t))),
+        ("cpu.kernel_per", cpu(|c, t| c.kernel_per_logical = f(t))),
+        (
+            "sensors.tctl",
+            Box::new(|fa, _, _, t| {
+                if let Ok(s) = &mut fa.cpu_sensors {
+                    s.tctl = f(t);
+                }
+            }),
+        ),
+        (
+            "sensors.power",
+            Box::new(|fa, _, _, t| {
+                if let Ok(s) = &mut fa.cpu_sensors {
+                    s.package_power = f(t);
+                }
+            }),
+        ),
+        ("mem.commit", mem(|m, t| m.commit = f(t))),
+        ("mem.paged", mem(|m, t| m.paged_pool = f(t))),
+        ("mem.pagefile", mem(|m, t| m.pagefile_usage = f(t))),
+        ("disk.model", disk(|d, t| d.model = f(t))),
+        ("disk.capacity", disk(|d, t| d.capacity = f(t))),
+        (
+            "disk.io",
+            disk(|d, t| {
+                d.active = f(t);
+                d.read = f(t);
+                d.write = f(t);
+                d.response = f(t);
+            }),
+        ),
+        (
+            "nic.send",
+            Box::new(|fa, _, _, t| {
+                if let Ok(l) = &mut fa.nics {
+                    l[1].send = f(t);
+                }
+            }),
+        ),
+        ("gpu.driver", gpu(|g, t| g.driver = f(t))),
+        ("gpu.temp_slowdown", gpu(|g, t| g.temp_slowdown = f(t))),
+        ("gpu.encoder", gpu(|g, t| g.encoder = f(t))),
+        ("gpu.clock_mem", gpu(|g, t| g.clock_mem = f(t))),
+        ("gpu.fans", gpu(|g, t| g.fans = f(t))),
+        ("gpu.throttle", gpu(|g, t| g.throttle = f(t))),
+        (
+            "own.ws",
+            Box::new(|fa, _, _, t| {
+                if let Ok(o) = &mut fa.own {
+                    o.private_ws = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.pcie",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.gpus {
+                    l[0].pcie_tx = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.disktemp",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.disk_temps {
+                    l[0].celsius = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.disktemp.all",
+            Box::new(|_, sl, _, t| sl.disk_temps = f(t)),
+        ),
+        ("game.resolution", game(|g, t| g.resolution = f(t))),
+        ("game.fps", game(|g, t| g.fps = f(t))),
+        ("game.lows", game(|g, t| g.lows = f(t))),
+        ("game.bound", game(|g, t| g.bound = f(t))),
+        ("rtss.pipe", Box::new(|_, _, fp, t| fp.pipe = f(t))),
+    ]
+}
+
+/// As marcas do começo e do fim da causa aparecem em vermelho na tela (a causa pode estar
+/// quebrada em linhas dentro de uma caixa: o fim visível prova que nada foi cortado).
+fn red_text(st: &mut State, tags: &[String], tab: view::Tab) -> bool {
+    st.set_tab(tab);
+    let mut t = Terminal::new(TestBackend::new(200, 60)).expect("terminal de teste");
+    t.draw(|fr| view::draw(fr, st)).expect("desenho");
+    let buf = t.backend().buffer();
+    let red_in_row = |y: u16, tag: &str| {
+        let row: Vec<(String, ratatui::style::Color)> = (0..200)
+            .map(|x| (buf[(x, y)].symbol().to_string(), buf[(x, y)].fg))
+            .collect();
+        let chars: Vec<char> = tag.chars().collect();
+        (0..row.len().saturating_sub(chars.len())).any(|i| {
+            chars
+                .iter()
+                .enumerate()
+                .all(|(k, c)| row[i + k].0 == c.to_string() && row[i + k].1 == view::FAIL)
+        })
+    };
+    tags.iter().all(|tag| (0..60).any(|y| red_in_row(y, tag)))
+}
+
+#[test]
+fn toda_falha_contada_aparece_em_vermelho() {
+    let mut problems = Vec::new();
+    for (i, (name, inject)) in injections().into_iter().enumerate() {
+        let tag = format!("TAG{i:02}");
+        let mut fa = fast(3);
+        let mut sl = slow();
+        let mut fp = game();
+        inject(&mut fa, &mut sl, &mut fp, &tag);
+        let mut st = State::new(1000);
+        st.push_fps(fp);
+        st.push_fast(fa);
+        st.push_slow(sl);
+        let counted = view::failing_sources(&st);
+        let tags = [tag.clone(), tag.replace("TAG", "END")];
+        let seen = [
+            view::Tab::Overview,
+            view::Tab::Sensors,
+            view::Tab::Gpu,
+            view::Tab::Processes,
+        ]
+        .into_iter()
+        .any(|t| red_text(&mut st, &tags, t));
+        if counted == 0 {
+            problems.push(format!("{name}: falha não contada no rodapé"));
+        }
+        if !seen {
+            problems.push(format!("{name}: causa não aparece inteira em vermelho"));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
