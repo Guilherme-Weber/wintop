@@ -63,6 +63,9 @@ Copy-Item modules (Join-Path $stage 'modules') -Recurse
 Copy-Item LICENSE, README.md, CHANGELOG.md, SECURITY.md $stage
 # Avisos de licença das crates ligadas no exe (MIT/Apache exigem os avisos na distribuição
 # binária). Offline e com falha em licença não reconhecida (about.toml).
+# O `cargo metadata` dele precisa de todas as crates do Cargo.lock baixadas (não só as compiladas).
+cargo fetch --locked
+if ($LASTEXITCODE -ne 0) { throw 'cargo fetch falhou' }
 cargo about generate --frozen --fail about.hbs -o (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
 if ($LASTEXITCODE -ne 0) { throw 'cargo about falhou (instalar: cargo install cargo-about --locked --features cli)' }
 
