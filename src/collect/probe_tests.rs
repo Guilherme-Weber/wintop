@@ -72,7 +72,6 @@ fn start_probe(seconds: u32) -> Option<Probe> {
 
 fn start_probe_with(seconds: u32, extra: &[&str]) -> Option<Probe> {
     let child = Command::new(probe_exe()?)
-        .args(extra)
         .args([
             "--fps",
             &FPS.to_string(),
@@ -85,6 +84,7 @@ fn start_probe_with(seconds: u32, extra: &[&str]) -> Option<Probe> {
             "--seconds",
             &seconds.to_string(),
         ])
+        .args(extra)
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("iniciar o fps_probe");
@@ -299,4 +299,97 @@ fn probe_aberto_antes_fica_aproximado() {
     );
     assert!(g.approx, "jogo aberto antes do pipe = aproximado");
     assert!((avg - want).abs() < want * 0.1, "FPS {avg} × {want}");
+}
+
+/// Dois "jogos" D3D11 ao mesmo tempo (60 e 144 FPS): o FPS é o do que está em primeiro plano
+/// (o aberto por último pega o foco); fechado ele, volta para o outro. Os dois aparecem com a
+/// própria VRAM na aba GPU.
+#[test]
+#[ignore = "hardware: RTSS aberto + fps_probe compilado (abre duas janelas D3D11 por ~20 s)"]
+fn probe_dois_jogos_segue_o_foco() {
+    let ev = stop_event();
+    let stop = HANDLE(ev.as_raw_handle());
+    let mut c = RtssCollector::new(false, true);
+    if !rtss_running(&mut c) {
+        return;
+    }
+    let args = |fps: &'static str, mb: &'static str| {
+        vec!["--fps", fps, "--stutter-every", "1000000", "--vram-mb", mb]
+    };
+    let Some(a) = start_probe_with(25, &args("60", "128")) else {
+        return;
+    };
+    let watch = |c: &mut RtssCollector, secs: u64| -> Vec<(u32, f64)> {
+        let t0 = Instant::now();
+        let mut seen = Vec::new();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            let s = c.sample();
+            if let Ok(g) = &s.game
+                && let Ok(f) = g.fps
+            {
+                seen.push((g.pid, f));
+            }
+            c.pump(Instant::now() + Duration::from_millis(250), stop);
+        }
+        seen
+    };
+    let first = watch(&mut c, 4);
+    let b = start_probe_with(15, &args("144", "384")).expect("2º probe");
+    let both = watch(&mut c, 5);
+    // Os dois na aba GPU, cada um com a própria VRAM.
+    let mut slow = SlowCollectors::new(super::shared_nvml());
+    let view = View {
+        procs: true,
+        gpu: true,
+    };
+    let s = slow.collect(&std::sync::atomic::AtomicBool::new(false), view);
+    let procs = s.gpus.expect("GPUs")[0]
+        .procs
+        .clone()
+        .expect("aba GPU")
+        .expect("processos");
+    let vram = |pid: u32| procs.iter().find(|p| p.pid == pid).map(|p| p.local >> 20);
+    for p in procs.iter().filter(|p| p.name == "fps_probe.exe") {
+        println!(
+            "{}: local {} MB, compartilhada {} MB, confirmada {} MB",
+            p.pid,
+            p.local >> 20,
+            p.non_local >> 20,
+            p.committed >> 20
+        );
+    }
+    let (va, vb) = (vram(a.0.id()), vram(b.0.id()));
+    drop(b);
+    let after = watch(&mut c, 5);
+    let last = |v: &[(u32, f64)]| v.last().copied();
+    println!(
+        "só A: {:?}; A e B: {:?}; B fechado: {:?}; VRAM A {va:?} MB, B {vb:?} MB",
+        last(&first),
+        last(&both),
+        last(&after)
+    );
+    let (pa, pb) = (a.0.id(), probe_pid(&both));
+    assert_eq!(last(&first).map(|x| x.0), Some(pa));
+    assert_ne!(pb, Some(pa), "o 2º (em foco) virou o jogo");
+    assert!(
+        last(&both).is_some_and(|x| (x.1 - 144.0).abs() < 8.0),
+        "{both:?}"
+    );
+    assert_eq!(
+        last(&after).map(|x| x.0),
+        Some(pa),
+        "volta para o que sobrou"
+    );
+    assert!(
+        last(&after).is_some_and(|x| (x.1 - 60.0).abs() < 4.0),
+        "{after:?}"
+    );
+    assert!(
+        va.is_some_and(|v| v >= 128) && vb.is_some_and(|v| v >= 384),
+        "{va:?} {vb:?}"
+    );
+}
+
+fn probe_pid(v: &[(u32, f64)]) -> Option<u32> {
+    v.last().map(|x| x.0)
 }

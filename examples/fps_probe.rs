@@ -257,6 +257,13 @@ fn main() -> windows::core::Result<()> {
             next += Duration::from_secs_f64(ms / 1000.0);
             let c = (frame % 120) as f32 / 120.0;
             ctx.ClearRenderTargetView(&rtv, &[c, 0.3, 1.0 - c, 1.0]);
+            // Usa as texturas a cada ~0,5 s, como um jogo usa os seus recursos: memória que
+            // nunca é tocada o WDDM tira da VRAM (vira "paginada").
+            if frame.is_multiple_of(50) {
+                for (_, v) in &keep {
+                    ctx.ClearRenderTargetView(v, &[c, 0.2, 0.3, 1.0]);
+                }
+            }
             wait_until(timer, next);
             let _ = swap.Present(0, DXGI_PRESENT(0));
         }
