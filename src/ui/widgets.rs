@@ -32,11 +32,43 @@ pub const DIM: Color = Color::Rgb(60, 60, 70);
 const LEFT: [u8; 4] = [0x40, 0x04, 0x02, 0x01];
 const RIGHT: [u8; 4] = [0x80, 0x20, 0x10, 0x08];
 
+/// Como colorir o gráfico.
+#[derive(Clone, Copy)]
+pub enum GraphColor {
+    /// Gradiente pela altura da linha (gráficos altos: CPU, GPU).
+    Height,
+    /// Gradiente pelo valor da amostra (gráficos de 1 linha: discos).
+    Value,
+    Fixed(Color),
+    /// Cor fixa, e `alert` nas colunas com valor ≥ `at` (frametime acima de 33 ms).
+    Threshold {
+        base: Color,
+        alert: Color,
+        at: f64,
+    },
+}
+
 /// Gráfico de área em braille. `samples` em 0..=1, o mais novo por último (fica à direita).
+/// `invert`: cresce de cima para baixo (metade de baixo da rede espelhada).
 pub struct Graph<'a> {
     pub samples: &'a [f64],
-    /// Cor fixa (ex.: rede); `None` = gradiente pela altura.
-    pub color: Option<Color>,
+    pub color: GraphColor,
+    pub invert: bool,
+}
+
+impl<'a> Graph<'a> {
+    pub fn new(samples: &'a [f64], color: GraphColor) -> Self {
+        Self {
+            samples,
+            color,
+            invert: false,
+        }
+    }
+
+    pub fn inverted(mut self) -> Self {
+        self.invert = true;
+        self
+    }
 }
 
 /// Quantos pontos (de `0..=max`) acender para um valor em 0..=1: qualquer valor acima de zero
@@ -60,38 +92,56 @@ impl Widget for Graph<'_> {
         let take = (w * 2).min(self.samples.len());
         let tail = &self.samples[self.samples.len() - take..];
         let offset = w * 2 - take;
-        let level = |i: usize| -> usize {
+        let sample = |i: usize| -> f64 {
             i.checked_sub(offset)
                 .and_then(|k| tail.get(k))
-                .map_or(0, |&v| dots(v, max))
+                .copied()
+                .unwrap_or(0.0)
         };
         for col in 0..w {
-            let (l, r) = (level(col * 2), level(col * 2 + 1));
+            let (sl, sr) = (sample(col * 2), sample(col * 2 + 1));
+            let (l, r) = (dots(sl, max), dots(sr, max));
+            let peak = sl.max(sr);
             for row in 0..h {
-                // Linha 0 = a de baixo.
+                // Linha 0 = a da base (a de baixo; a de cima se invertido).
                 let base = row * 4;
                 let mut bits = 0u8;
                 for d in 0..4 {
+                    // Invertido, os pontos de cada célula também enchem de cima para baixo.
+                    let (lb, rb) = if self.invert {
+                        (LEFT[3 - d], RIGHT[3 - d])
+                    } else {
+                        (LEFT[d], RIGHT[d])
+                    };
                     if l > base + d {
-                        bits |= LEFT[d];
+                        bits |= lb;
                     }
                     if r > base + d {
-                        bits |= RIGHT[d];
+                        bits |= rb;
                     }
                 }
                 if bits == 0 {
                     continue;
                 }
                 let ch = char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ');
-                let color = self.color.unwrap_or_else(|| {
-                    gradient(if h > 1 {
+                let color = match self.color {
+                    GraphColor::Height => gradient(if h > 1 {
                         row as f64 / (h - 1) as f64
                     } else {
                         0.0
-                    })
-                });
-                let pos = (area.x + col as u16, area.y + (h - 1 - row) as u16);
-                if let Some(cell) = buf.cell_mut(pos) {
+                    }),
+                    GraphColor::Value => gradient(peak),
+                    GraphColor::Fixed(c) => c,
+                    GraphColor::Threshold { base, alert, at } => {
+                        if peak >= at {
+                            alert
+                        } else {
+                            base
+                        }
+                    }
+                };
+                let y = if self.invert { row } else { h - 1 - row };
+                if let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + y as u16)) {
                     cell.set_char(ch).set_fg(color);
                 }
             }
@@ -155,14 +205,32 @@ mod tests {
     fn grafico_alinhado_a_direita() {
         let area = Rect::new(0, 0, 3, 1);
         let mut buf = Buffer::empty(area);
-        Graph {
-            samples: &[1.0, 0.5],
-            color: Some(Color::White),
-        }
-        .render(area, &mut buf);
+        Graph::new(&[1.0, 0.5], GraphColor::Fixed(Color::White)).render(area, &mut buf);
         // 2 amostras ocupam só a última célula: 4 pontos à esquerda e 2 à direita.
         assert_eq!(buf[(0, 0)].symbol(), " ");
         assert_eq!(buf[(2, 0)].symbol(), "⣧");
+        // Invertido: os 4 pontos à esquerda e os 2 de cima à direita (0x47 | 0x18 = ⡟).
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[1.0, 0.5], GraphColor::Fixed(Color::White))
+            .inverted()
+            .render(area, &mut buf);
+        assert_eq!(buf[(2, 0)].symbol(), "⡟");
+    }
+
+    #[test]
+    fn cor_pelo_valor_e_limite() {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[1.0, 1.0], GraphColor::Value).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].fg, gradient(1.0));
+        let mut buf = Buffer::empty(area);
+        let t = GraphColor::Threshold {
+            base: Color::Green,
+            alert: Color::Red,
+            at: 0.66,
+        };
+        Graph::new(&[0.7, 0.1], t).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].fg, Color::Red);
     }
 
     #[test]

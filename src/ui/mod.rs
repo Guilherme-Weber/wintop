@@ -69,6 +69,12 @@ fn event_loop(
             st.push_fps(s);
             dirty = true;
         }
+        // Relógio da barra de abas: redesenha quando o segundo muda.
+        let now = clock();
+        if now != st.clock {
+            st.clock = now;
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|f| view::draw(f, &mut st))?;
             dirty = false;
@@ -93,6 +99,24 @@ fn event_loop(
                             engine.set_interval_ms(engine.interval_ms().saturating_sub(STEP_MS));
                         dirty = true;
                     }
+                    KeyCode::Char('r') => {
+                        st.reset_session();
+                        dirty = true;
+                    }
+                    KeyCode::Char('d') => {
+                        // Automático → recolhe → expande → recolhe...
+                        st.fold_pool = Some(!st.fold_pool.unwrap_or(false));
+                        dirty = true;
+                    }
+                    KeyCode::Char(c @ '1'..='4') => {
+                        st.tab = match c {
+                            '1' => view::Tab::Overview,
+                            '2' => view::Tab::Processes,
+                            '3' => view::Tab::Gpu,
+                            _ => view::Tab::Sensors,
+                        };
+                        dirty = true;
+                    }
                     _ => {}
                 },
                 Event::Resize(..) => dirty = true,
@@ -104,6 +128,13 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Hora local "HH:MM:SS" para a barra de abas.
+fn clock() -> String {
+    // SAFETY: sem pré-condições; devolve a estrutura por valor.
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
 }
 
 #[cfg(test)]

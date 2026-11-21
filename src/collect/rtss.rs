@@ -112,8 +112,10 @@ fn api_name(flags: u32) -> &'static str {
         0x3 => "D3D8",
         0x4 => "D3D9",
         0x5 => "D3D9Ex",
-        0x6 => "D3D10",
-        0x7 => "D3D11",
+        // O RTSS informa D3D10 para jogos D3D11 (Deadlock: 0x6, e o jogo carrega D3D11). Os
+        // dois passam pelo DXGI e confirmar a API exigiria ler os módulos do jogo (proibido
+        // pelo anticheat): nunca afirmar a errada.
+        0x6 | 0x7 => "D3D10/11",
         0x8 => "D3D12",
         0x9 => "D3D12 AFR",
         0xA => "Vulkan",

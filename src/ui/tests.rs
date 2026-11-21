@@ -240,6 +240,14 @@ fn geral_com_jogo() {
 }
 
 #[test]
+fn geral_1080p() {
+    // Tamanho da janela do usuário: Windows Terminal maximizado num monitor 1080p.
+    let mut st = filled();
+    st.clock = "10:33:28".into();
+    insta::assert_snapshot!(render(&mut st, 210, 52));
+}
+
+#[test]
 fn geral_terminal_pequeno() {
     // Não pode entrar em pânico nem sair dos limites num terminal apertado.
     insta::assert_snapshot!(render(&mut filled(), 80, 24));
@@ -283,17 +291,19 @@ fn bordas_intactas(st: &mut State, w: u16, h: u16) {
 #[test]
 fn larguras_estreitas_sem_vazamento() {
     let mut st = filled();
-    // A borda direita da caixa da CPU (largura 58% de 60 = 34) continua sendo borda.
+    // A borda direita da caixa da CPU continua sendo borda em toda a altura (a linha 0 é a
+    // barra de abas; a caixa começa na 1).
     let mut t = Terminal::new(TestBackend::new(60, 24)).expect("terminal de teste");
     t.draw(|f| view::draw(f, &mut st)).expect("desenho");
     let buf = t.backend().buffer();
+    let top = 1u16;
     let cpu_right = (0..60u16)
-        .find(|&x| buf[(x, 0)].symbol() == "╮")
+        .find(|&x| buf[(x, top)].symbol() == "╮")
         .expect("canto da caixa da CPU");
-    let bottom = (1..24u16)
+    let bottom = (top + 1..24u16)
         .find(|&y| buf[(cpu_right, y)].symbol() == "╯")
         .expect("canto inferior da caixa da CPU");
-    for y in 1..bottom {
+    for y in top + 1..bottom {
         assert_eq!(buf[(cpu_right, y)].symbol(), "│", "linha {y}");
     }
     bordas_intactas(&mut st, 60, 24);
