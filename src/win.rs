@@ -233,6 +233,24 @@ pub fn user_sid() -> Option<String> {
     unsafe { sid_string(user.User.Sid) }
 }
 
+/// Pasta do perfil do usuário do token atual (ex.: `C:\Users\nome`). Vem do `ProfileList` do
+/// HKLM (não do ambiente nem do HKCU): o usuário não consegue redirecioná-la.
+pub fn profile_dir() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
+    let mut token = HANDLE::default();
+    // SAFETY: token passa a ter dono logo abaixo.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
+    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
+    let _token = unsafe { own(token) };
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: buffer local com o tamanho (em caracteres) informado.
+    unsafe { GetUserProfileDirectoryW(token, Some(PWSTR(buf.as_mut_ptr())), &raw mut len) }.ok()?;
+    let n = buf.iter().position(|&c| c == 0)?;
+    let p = PathBuf::from(String::from_utf16(&buf[..n]).ok()?);
+    is_local_absolute(&p).then_some(p)
+}
+
 /// `FILETIME` em unidades de 100 ns.
 pub fn filetime(ft: FILETIME) -> u64 {
     (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)

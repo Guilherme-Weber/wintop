@@ -7,8 +7,8 @@
 //!
 //! - toda abertura usa `FILE_FLAG_OPEN_REPARSE_POINT` (um reparse point é recusado, não seguido)
 //!   e confere o caminho final do handle contra o esperado;
-//! - a pasta base (`AppData\Roaming`) tem de ter o próprio usuário como dono (AppData apontado
-//!   para uma pasta do sistema é recusado);
+//! - a pasta base (`AppData\Roaming`) tem de ter como dono o próprio usuário, ou Administradores
+//!   dentro do perfil dele (AppData apontado para uma pasta do sistema é recusado);
 //! - as pastas ficam abertas sem `FILE_SHARE_DELETE` durante a operação (não podem ser trocadas
 //!   por uma junction no meio dela);
 //! - a gravação vai para um temporário novo e exclusivo (`CREATE_NEW`) e é trocada pelo próprio
@@ -203,6 +203,24 @@ fn owner(c: &Checked) -> Result<String, String> {
     s.ok_or_else(|| "owner SID".into())
 }
 
+/// Administradores (dono padrão do que um processo elevado cria).
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+/// A base é do usuário: dono = o próprio usuário, ou Administradores **dentro do perfil dele**
+/// (perfis criados por imagem ou por processo elevado, como nos runners do GitHub). Fora do
+/// perfil, uma pasta de Administradores (ex.: `Program Files\wintop`) seria um redirecionamento
+/// do AppData pelo HKCU: recusada.
+fn trusted_owner(own: &str, user: &str, base: &Path, profile: Option<&Path>) -> bool {
+    if own == user {
+        return true;
+    }
+    let Some(profile) = profile else {
+        return false;
+    };
+    let p = format!("{}\\", norm(&profile.to_string_lossy()));
+    own == ADMINISTRATORS && norm(&base.to_string_lossy()).starts_with(&p)
+}
+
 /// Pastas abertas e conferidas para uma operação em `<base>\<dir>`.
 pub struct UserDir {
     _base: Checked,
@@ -220,7 +238,8 @@ impl UserDir {
             open(base, GENERIC_READ.0, share, OPEN_EXISTING, true, true).map_err(String::from)?;
         let user = crate::win::user_sid().ok_or("could not read the user SID")?;
         let own = owner(&b)?;
-        if own != user {
+        let profile = crate::win::profile_dir();
+        if !trusted_owner(&own, &user, base, profile.as_deref()) {
             return Err(format!(
                 "{} is not owned by the current user ({own}): refused",
                 base.display()
@@ -471,6 +490,23 @@ mod tests {
         // Base que não é caminho local (UNC, pipe): recusada antes de qualquer abertura.
         assert!(UserDir::open(Path::new(r"\127.0.0.1\c$"), "wintop", false).is_err());
         assert!(UserDir::open(Path::new(r"\.\pipe\x"), "wintop", false).is_err());
+    }
+
+    #[test]
+    fn dono_administradores_so_dentro_do_perfil() {
+        let user = "S-1-5-21-1-2-3-1001";
+        let prof = Path::new(r"C:\Users\nome");
+        let roam = Path::new(r"C:\Users\nome\AppData\Roaming");
+        assert!(trusted_owner(user, user, roam, Some(prof)));
+        assert!(trusted_owner(ADMINISTRATORS, user, roam, Some(prof)));
+        // Fora do perfil (AppData redirecionado), prefixo parecido ou sem perfil: recusado.
+        let pf = Path::new(r"C:\Program Files\wintop");
+        assert!(!trusted_owner(ADMINISTRATORS, user, pf, Some(prof)));
+        let irmao = Path::new(r"C:\Users\nome2\AppData\Roaming");
+        assert!(!trusted_owner(ADMINISTRATORS, user, irmao, Some(prof)));
+        assert!(!trusted_owner(ADMINISTRATORS, user, roam, None));
+        // Outros donos (SYSTEM, TrustedInstaller), mesmo dentro do perfil: recusados.
+        assert!(!trusted_owner("S-1-5-18", user, roam, Some(prof)));
     }
 
     #[test]
