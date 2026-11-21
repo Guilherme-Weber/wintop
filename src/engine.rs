@@ -158,7 +158,20 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Com a lista de ignorados padrão do RTSS (testes).
+    #[cfg(test)]
     pub fn start(interval_ms: u64) -> Self {
+        Self::start_with(
+            interval_ms,
+            crate::config::DEFAULT_RTSS_IGNORED
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )
+    }
+
+    /// `rtss_ignored`: executáveis que nunca viram o jogo (`config.toml`).
+    pub fn start_with(interval_ms: u64, rtss_ignored: Vec<String>) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -224,7 +237,7 @@ impl Engine {
             let stop = Arc::clone(&stop_event);
             std::thread::Builder::new()
                 .name("rtss".into())
-                .spawn(move || rtss_thread(&sh, HANDLE(stop.as_raw_handle())))
+                .spawn(move || rtss_thread(&sh, HANDLE(stop.as_raw_handle()), rtss_ignored))
                 .expect("failed to create the RTSS thread")
         };
         let slow = {
@@ -356,7 +369,7 @@ impl Drop for Engine {
 
 /// Thread do RTSS: amostra a cada 250 ms com jogo (1 s sem) e atende o pipe no meio. Um pânico
 /// publica a falha (a interface não fica parada no último valor) e encerra a thread.
-fn rtss_thread(sh: &Shared, stop: HANDLE) {
+fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
     let publish = |mut snap: Fps| {
         let mut st = sh.lock();
         // A interface não leu a publicação anterior (tela ocupada mais de 250 ms): o pior frame
@@ -372,7 +385,9 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
         st.fps_seq += 1;
         st.fps_unread = true;
     };
-    let Ok(mut c) = catch_unwind(|| RtssCollector::new(true, true)) else {
+    let Ok(mut c) = catch_unwind(AssertUnwindSafe(|| {
+        RtssCollector::new(true, true).with_ignored(ignored)
+    })) else {
         publish(rtss::failed("RTSS collector panicked on startup"));
         return;
     };

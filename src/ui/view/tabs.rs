@@ -9,23 +9,18 @@
 //!
 //! As colunas menos importantes saem primeiro quando a largura não dá (nada é cortado no meio).
 
-use super::{
-    BORDER, LABEL, NEUTRAL, State, TEXT, TITLE, bar_sep, boxed, empty_box, label, metric, missing,
-    put, text, vram_bar,
-};
+use super::{State, bar_sep, boxed, empty_box, label, metric, missing, put, text, vram_bar};
 use crate::fmt::{bytes, num};
 use crate::model::{GpuProc, Metric, Missing, Proc};
+use crate::ui::theme::th;
 use crate::ui::widgets::gradient;
 use crate::win::printable;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-
-const SELECTED: Color = Color::Rgb(48, 54, 70);
-const GAME: Color = Color::Rgb(224, 138, 60);
 
 // --- Cursor (seleção estável por PID) ---
 
@@ -272,12 +267,12 @@ fn header(cols: &[Col], widths: &[Option<u16>], sorted: Option<(usize, bool)>) -
         .enumerate()
         .map(|(i, c)| {
             let mut t = c.title.to_string();
-            let mut style = Style::new().fg(LABEL).add_modifier(Modifier::BOLD);
+            let mut style = Style::new().fg(th().label).add_modifier(Modifier::BOLD);
             if let Some((s, desc)) = sorted
                 && s == i
             {
                 t.push(if desc { '▼' } else { '▲' });
-                style = Style::new().fg(TITLE).add_modifier(Modifier::BOLD);
+                style = Style::new().fg(th().title).add_modifier(Modifier::BOLD);
             }
             (t, style)
         })
@@ -286,11 +281,11 @@ fn header(cols: &[Col], widths: &[Option<u16>], sorted: Option<(usize, bool)>) -
 }
 
 fn plain(s: String) -> (String, Style) {
-    (s, Style::new().fg(TEXT))
+    (s, Style::new().fg(th().text))
 }
 
 fn dim(s: String) -> (String, Style) {
-    (s, Style::new().fg(LABEL))
+    (s, Style::new().fg(th().label))
 }
 
 /// Porcentagem com a cor pela intensidade (cinza no zero).
@@ -467,9 +462,9 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
     let game = game_pid(st);
     for (i, p) in rows.iter().enumerate().skip(offset).take(body_h) {
         let name_style = if Some(p.pid) == game {
-            Style::new().fg(GAME).add_modifier(Modifier::BOLD)
+            Style::new().fg(th().game).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(TEXT)
+            Style::new().fg(th().text)
         };
         let mut line = row(
             &PROC_COLS,
@@ -487,7 +482,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
             ],
         );
         if Some(i) == sel {
-            line = line.style(Style::new().bg(SELECTED));
+            line = line.style(Style::new().bg(th().selected));
         }
         let y = inner.y + 1 + (i - offset) as u16;
         put(
@@ -641,9 +636,9 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let e = |v: Option<f64>| v.map_or_else(|| dim("-".into()), pct_cell);
     for (i, p) in rows.iter().enumerate().skip(offset).take(body_h) {
         let name_style = if Some(p.pid) == game {
-            Style::new().fg(GAME).add_modifier(Modifier::BOLD)
+            Style::new().fg(th().game).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(TEXT)
+            Style::new().fg(th().text)
         };
         let cpu_ram = procs.get(&p.pid).map_or_else(
             || dim("-".into()),
@@ -677,7 +672,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ],
         );
         if Some(i) == sel {
-            line = line.style(Style::new().bg(SELECTED));
+            line = line.style(Style::new().bg(th().selected));
         }
         let y = table_y + 1 + (i - offset) as u16;
         put(
@@ -701,7 +696,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         frame,
         Paragraph::new(Span::styled(
             "─".repeat(usize::from(inner.width)),
-            Style::new().fg(BORDER),
+            Style::new().fg(th().border),
         )),
         Rect::new(inner.x, detail_y - 1, inner.width, 1),
         inner,
@@ -976,7 +971,10 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         note(
             frame,
             inner,
-            Span::styled("waiting for the first collection", Style::new().fg(NEUTRAL)),
+            Span::styled(
+                "waiting for the first collection",
+                Style::new().fg(th().neutral),
+            ),
         );
         return;
     }
@@ -1067,7 +1065,7 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                         frame,
                         Paragraph::new(Span::styled(
                             t,
-                            Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
+                            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
                         )),
                         at,
                         inner,
@@ -1151,7 +1149,10 @@ fn sensor_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>], st: &State) -> V
     let room = value_room(widths);
     if value.width() > room {
         if name_fits {
-            out.push(Line::from(Span::styled(shown_name, Style::new().fg(TEXT))));
+            out.push(Line::from(Span::styled(
+                shown_name,
+                Style::new().fg(th().text),
+            )));
         }
         out.extend(super::wrap(vec![value], cw, 2, 2));
     } else if value.width() > usize::from(widths[1].unwrap_or(0)) {
@@ -1159,7 +1160,7 @@ fn sensor_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>], st: &State) -> V
         out.push(Line::from(vec![
             Span::styled(
                 cell(&shown_name, name_w as u16, false),
-                Style::new().fg(TEXT),
+                Style::new().fg(th().text),
             ),
             Span::raw(" "),
             Span::styled(cell(&value.content, room as u16, true), value.style),

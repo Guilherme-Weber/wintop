@@ -942,10 +942,9 @@ fn red_text(st: &mut State, tags: &[String], tab: view::Tab) -> bool {
             .collect();
         let chars: Vec<char> = tag.chars().collect();
         (0..row.len().saturating_sub(chars.len())).any(|i| {
-            chars
-                .iter()
-                .enumerate()
-                .all(|(k, c)| row[i + k].0 == c.to_string() && row[i + k].1 == view::FAIL)
+            chars.iter().enumerate().all(|(k, c)| {
+                row[i + k].0 == c.to_string() && row[i + k].1 == super::theme::th().fail
+            })
         })
     };
     tags.iter().all(|tag| (0..60).any(|y| red_in_row(y, tag)))

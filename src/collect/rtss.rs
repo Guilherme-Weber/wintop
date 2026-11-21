@@ -74,23 +74,6 @@ const V2_20: u32 = 0x0002_0014;
 const V2_21: u32 = 0x0002_0015;
 const MAX_APPS: usize = 256;
 
-/// Processos que o RTSS acompanha mas não são jogos (overlays, navegadores, apps Electron).
-/// Na Etapa 7 vira configuração.
-const IGNORED: &[&str] = &[
-    "claude.exe",
-    "spotify.exe",
-    "spotifast.exe",
-    "zapfast.exe",
-    "discord.exe",
-    "chrome.exe",
-    "msedge.exe",
-    "firefox.exe",
-    "msedgewebview2.exe",
-    "steamwebhelper.exe",
-    "gameoverlayui64.exe",
-    "openlogi-overlay.exe",
-    "yourphoneappproxyhost.exe",
-];
 /// Janela em que um jogo exato (pipe) continua exato sem frames: acima de `ACTIVE_MS` (que usa
 /// o relógio do RTSS, de 15,6 ms), para um travamento de ~2 s não piscar como "approx.".
 const EXACT_GRACE: Duration = Duration::from_millis(ACTIVE_MS as u64 + 500);
@@ -235,13 +218,19 @@ fn read_apps(v: &SharedView) -> Result<(Vec<App>, Option<u32>, u32), String> {
     Ok((apps, fg, ver))
 }
 
+/// Nome de executável na lista de ignorados (comparação sem diferenciar maiúsculas).
+fn is_ignored(list: &[String], name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    list.contains(&n)
+}
+
 /// Jogo atual: ativo, com API 3D e fora da lista de ignorados; o primeiro plano desempata,
 /// senão o de maior FPS.
-fn select_game(apps: &[App], fg: Option<u32>) -> Option<&App> {
+fn select_game<'a>(apps: &'a [App], fg: Option<u32>, ignored: &[String]) -> Option<&'a App> {
     let candidates: Vec<&App> = apps
         .iter()
         .filter(|a| a.api != 0 && a.age_ms.is_some_and(|m| m < ACTIVE_MS))
-        .filter(|a| !IGNORED.contains(&a.name.to_ascii_lowercase().as_str()))
+        .filter(|a| !is_ignored(ignored, &a.name))
         .collect();
     candidates
         .iter()
@@ -738,6 +727,8 @@ pub struct RtssCollector {
     known: HashSet<u32>,
     /// Índices de apps ignorados (navegadores, overlays): os frames deles são descartados.
     ignored: HashSet<u32>,
+    /// Executáveis (minúsculos) que nunca viram o jogo (`config.toml`, `[rtss] ignored`).
+    ignored_names: Vec<String>,
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
     lows: LowsCache,
@@ -762,10 +753,20 @@ impl RtssCollector {
             exact: HashMap::new(),
             known: HashSet::new(),
             ignored: HashSet::new(),
+            ignored_names: crate::config::DEFAULT_RTSS_IGNORED
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             approx: HashMap::new(),
             lows: None,
             published: None,
         }
+    }
+
+    /// Troca a lista de ignorados (do `config.toml`).
+    pub fn with_ignored(mut self, list: Vec<String>) -> Self {
+        self.ignored_names = list;
+        self
     }
 
     /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
@@ -907,7 +908,7 @@ impl RtssCollector {
         // de frames).
         let (ign, ok): (Vec<&App>, Vec<&App>) = apps
             .iter()
-            .partition(|a| IGNORED.contains(&a.name.to_ascii_lowercase().as_str()));
+            .partition(|a| is_ignored(&self.ignored_names, &a.name));
         self.known = ok.iter().map(|a| a.index).collect();
         self.ignored = ign.iter().map(|a| a.index).collect();
         // Índice reaproveitado por outro app: os frames antigos não valem. Ring sem dono
@@ -925,7 +926,7 @@ impl RtssCollector {
         for r in self.exact.values_mut().chain(self.approx.values_mut()) {
             r.prune(now);
         }
-        let game = match select_game(&apps, fg) {
+        let game = match select_game(&apps, fg, &self.ignored_names) {
             None => neutral("no 3D game in focus"),
             Some(g) => Ok(self.game(g, now)),
         };
@@ -1133,9 +1134,18 @@ mod tests {
             app(3, "outro.exe", 7, 120.0, Some(9000)),
             app(4, "semapi.exe", 0, 60.0, Some(10)),
         ];
-        assert_eq!(select_game(&apps, Some(101)).map(|a| a.index), Some(2));
-        assert_eq!(select_game(&apps, None).map(|a| a.index), Some(2));
-        assert_eq!(select_game(&apps[2..], None).map(|a| a.index), None);
+        assert_eq!(
+            select_game(&apps, Some(101), &defaults()).map(|a| a.index),
+            Some(2)
+        );
+        assert_eq!(
+            select_game(&apps, None, &defaults()).map(|a| a.index),
+            Some(2)
+        );
+        assert_eq!(
+            select_game(&apps[2..], None, &defaults()).map(|a| a.index),
+            None
+        );
     }
 
     #[test]
@@ -1310,6 +1320,13 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    fn defaults() -> Vec<String> {
+        crate::config::DEFAULT_RTSS_IGNORED
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     fn all_known() -> HashSet<u32> {

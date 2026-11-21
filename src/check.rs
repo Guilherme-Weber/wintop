@@ -67,12 +67,30 @@ pub fn run() -> i32 {
         },
     );
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
-    let fps = RtssCollector::new(false, false).sample();
+    let cfg = crate::config::load(crate::config::default_path());
+    let fps = RtssCollector::new(false, false)
+        .with_ignored(cfg.config.rtss_ignored.clone())
+        .sample();
 
     let mut r = Report::default();
     fast_report(&mut r, &f);
     slow_report(&mut r, &s);
     fps_report(&mut r, &fps);
+    Report::section("Configuration");
+    let path = crate::config::default_path().map_or_else(
+        || "no AppData folder".to_string(),
+        |p| p.display().to_string(),
+    );
+    let state: crate::model::Metric<()> = match cfg.warnings.first() {
+        Some(w) => crate::model::fail(w.clone()),
+        None => Ok(()),
+    };
+    r.line("config.toml", &state, |()| {
+        format!(
+            "{path} (theme {}, interval {} ms)",
+            cfg.config.theme, cfg.config.interval_ms
+        )
+    });
     own_report(&mut r, &f);
     println!(
         "\nFast collection: {:.1} ms; slow: {:.1} ms",

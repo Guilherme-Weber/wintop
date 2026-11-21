@@ -15,7 +15,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
-use super::widgets::{DIM, Graph, GraphColor, Meter, Segmented};
+use super::theme::th;
+use super::widgets::{Graph, GraphColor, Meter, Segmented};
 use crate::fmt::{bits, bytes, num};
 use crate::model::{
     Disk, Fast, Fps, Gpu, GpuProc, Memory, Metric, Missing, Nic, Proc, Slow, View, VramBreakdown,
@@ -36,19 +37,6 @@ const FT_CEIL_MS: f64 = 50.0;
 const FT_ALERT_MS: f64 = 33.3;
 /// Degraus do teto do gráfico de FPS (sobe para o próximo quando o máximo passa).
 const FPS_STEPS: [f64; 8] = [60.0, 120.0, 165.0, 240.0, 360.0, 500.0, 750.0, 1000.0];
-
-const BORDER: Color = Color::Rgb(75, 82, 99);
-const TITLE: Color = Color::Rgb(220, 224, 232);
-const TEXT: Color = Color::Rgb(200, 204, 212);
-const LABEL: Color = Color::Rgb(127, 133, 148);
-const NEUTRAL: Color = Color::Rgb(108, 112, 128);
-pub(super) const FAIL: Color = Color::Rgb(235, 80, 80);
-const NET_SEND: Color = Color::Rgb(200, 120, 200);
-const NET_RECV: Color = Color::Rgb(92, 184, 228);
-const FPS_COLOR: Color = Color::Rgb(80, 200, 120);
-const FT_COLOR: Color = Color::Rgb(224, 168, 75);
-const ENCODE: Color = Color::Rgb(86, 194, 214);
-const DECODE: Color = Color::Rgb(176, 132, 224);
 
 /// Aba visível.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -177,6 +165,10 @@ pub struct State {
     /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
     pub gpu_cursor: Cursor,
+    /// Tema atual (tecla `t`, gravado no config).
+    pub theme_name: String,
+    /// Aviso da configuração (arquivo com erro, gravação recusada), no rodapé.
+    pub notice: Option<String>,
     /// Por PID, com o nome do processo lido (PID reaproveitado por outro não herda o resultado).
     pub runtimes: HashMap<u32, (String, Metric<Vec<&'static str>>)>,
 }
@@ -487,9 +479,11 @@ impl RuntimeJob {
 /// Valor, estado neutro (cinza) ou falha (vermelho, com a causa); sem controles.
 fn metric<T>(m: &Metric<T>, f: impl FnOnce(&T) -> String) -> Span<'static> {
     match m {
-        Ok(v) => Span::styled(printable(&f(v)), Style::new().fg(TEXT)),
-        Err(Missing::Neutral(s)) => Span::styled(printable(s), Style::new().fg(NEUTRAL)),
-        Err(Missing::Fail(s)) => Span::styled(format!("! {}", printable(s)), Style::new().fg(FAIL)),
+        Ok(v) => Span::styled(printable(&f(v)), Style::new().fg(th().text)),
+        Err(Missing::Neutral(s)) => Span::styled(printable(s), Style::new().fg(th().neutral)),
+        Err(Missing::Fail(s)) => {
+            Span::styled(format!("! {}", printable(s)), Style::new().fg(th().fail))
+        }
     }
 }
 
@@ -498,11 +492,11 @@ fn missing(e: &Missing) -> Span<'static> {
 }
 
 fn label(s: &str) -> Span<'static> {
-    Span::styled(s.to_string(), Style::new().fg(LABEL))
+    Span::styled(s.to_string(), Style::new().fg(th().label))
 }
 
 fn text(s: impl Into<String>) -> Span<'static> {
-    Span::styled(s.into(), Style::new().fg(TEXT))
+    Span::styled(s.into(), Style::new().fg(th().text))
 }
 
 fn sep() -> Span<'static> {
@@ -510,7 +504,7 @@ fn sep() -> Span<'static> {
 }
 
 fn bar_sep() -> Span<'static> {
-    Span::styled("  │  ", Style::new().fg(DIM))
+    Span::styled("  │  ", Style::new().fg(th().dim))
 }
 
 /// "min X max Y" de um extremo da sessão.
@@ -525,18 +519,22 @@ fn minmax(m: MinMax, f: impl Fn(f64) -> String) -> Span<'static> {
 fn boxed(title: &str, right: &str) -> Block<'static> {
     let mut b = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(BORDER))
+        .border_style(Style::new().fg(th().border))
         .title(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 printable(title),
-                Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]));
     if !right.is_empty() {
         b = b.title(
-            Line::from(Span::styled(format!(" {right} "), Style::new().fg(LABEL))).right_aligned(),
+            Line::from(Span::styled(
+                format!(" {right} "),
+                Style::new().fg(th().label),
+            ))
+            .right_aligned(),
         );
     }
     b
@@ -629,7 +627,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
         if st.tab == t {
             Span::styled(
                 format!(" [{n} {name}] "),
-                Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             )
         } else {
             label(&format!("  {n} {name}  "))
@@ -672,13 +670,17 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let key = |k: &str| {
         Span::styled(
             k.to_string(),
-            Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
         )
     };
     // Atalhos em grupos inteiros (tecla + rótulo): um grupo que não cabe sai inteiro.
     let mut groups: Vec<[Span<'static>; 2]> = vec![[key(" 1-4"), label(" tabs  ")]];
     let pairs: &[(&str, &str)] = match st.tab {
-        Tab::Overview => &[("r", " reset min/max  "), ("d", " fold pool  ")],
+        Tab::Overview => &[
+            ("r", " reset min/max  "),
+            ("d", " fold pool  "),
+            ("t", " theme  "),
+        ],
         Tab::Processes if st.filtering => &[
             ("type", " to filter  "),
             ("enter", " keep  "),
@@ -724,27 +726,50 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         ]);
     }
     let failing = failing_sources(st);
+    if let Some(n) = &st.notice {
+        if !right.is_empty() {
+            right.push(bar_sep());
+        }
+        right.push(Span::styled(
+            format!("! {}", printable(n)),
+            Style::new().fg(th().fail),
+        ));
+    }
     if !right.is_empty() {
         right.push(bar_sep());
     }
     right.push(match failing {
         0 => label("sources: all OK "),
-        1 => Span::styled("! 1 source failing ", Style::new().fg(FAIL)),
-        n => Span::styled(format!("! {n} sources failing "), Style::new().fg(FAIL)),
+        1 => Span::styled("! 1 source failing ", Style::new().fg(th().fail)),
+        n => Span::styled(
+            format!("! {n} sources failing "),
+            Style::new().fg(th().fail),
+        ),
     });
     // O lado direito (estado) tem prioridade; a ajuda usa o que sobra, com 2 colunas de folga.
     let right = Line::from(right);
     let rw = (right.width() as u16).min(area.width);
     let room = usize::from(area.width.saturating_sub(rw).saturating_sub(2));
-    let mut left = Vec::new();
+    // Prioridade na falta de espaço: abas, sair, intervalo, e então os atalhos da aba; a ordem
+    // na tela continua a natural.
+    let n = groups.len();
+    let mut priority: Vec<usize> = vec![0, n - 1, n - 2];
+    priority.extend(1..n - 2);
+    let mut keep = vec![false; n];
     let mut used = 0;
-    for g in groups {
-        let w = g[0].width() + g[1].width();
+    for i in priority {
+        let w = groups[i][0].width() + groups[i][1].width();
         if used + w <= room {
             used += w;
-            left.extend(g);
+            keep[i] = true;
         }
     }
+    let left: Vec<Span<'static>> = groups
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .flat_map(|(g, _)| g)
+        .collect();
     let left = Line::from(left);
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(rw)]).areas(area);
     frame.render_widget(Paragraph::new(left), l);
@@ -888,7 +913,7 @@ fn waiting(frame: &mut Frame<'_>, area: Rect, block: Block<'static>) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             "waiting for the first collection",
-            Style::new().fg(NEUTRAL),
+            Style::new().fg(th().neutral),
         ))
         .block(block),
         area,
@@ -1145,9 +1170,9 @@ fn busiest_engine(g: &Gpu) -> (&'static str, u32) {
 
 fn engine_color(name: &str) -> Color {
     match name {
-        "encode" => ENCODE,
-        "decode" => DECODE,
-        _ => TEXT,
+        "encode" => th().encode,
+        "decode" => th().decode,
+        _ => th().text,
     }
 }
 
@@ -1184,9 +1209,9 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Painel das engines e dos extremos da sessão.
     let eng = |name: &str, m: &Metric<u32>| -> Vec<(Vec<Span<'static>>, Option<f64>)> {
         let style = if name == engine {
-            Style::new().fg(TITLE).add_modifier(Modifier::BOLD)
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(LABEL)
+            Style::new().fg(th().label)
         };
         // Falha: a causa usa a linha toda (sem medidor, que mostraria um 0% falso) e quebra
         // em mais linhas se não couber no painel.
@@ -1625,13 +1650,13 @@ const VRAM_LABEL_W: u16 = 7;
 /// Cor de cada categoria da VRAM (próximas às do gputaskman).
 fn vram_color(k: VramKind) -> Color {
     match k {
-        VramKind::Game => Color::Rgb(224, 138, 60),
-        VramKind::App => Color::Rgb(78, 184, 176),
-        VramKind::Compositor => Color::Rgb(157, 124, 216),
-        VramKind::Browser => Color::Rgb(92, 156, 230),
-        VramKind::System => Color::Rgb(154, 160, 176),
-        VramKind::Kernel => Color::Rgb(138, 132, 88),
-        VramKind::Free => DIM,
+        VramKind::Game => th().game,
+        VramKind::App => th().vram_app,
+        VramKind::Compositor => th().vram_compositor,
+        VramKind::Browser => th().vram_browser,
+        VramKind::System => th().vram_system,
+        VramKind::Kernel => th().vram_kernel,
+        VramKind::Free => th().dim,
     }
 }
 
@@ -1784,10 +1809,10 @@ fn mem_text(st: &State, width: u16) -> Option<MemText> {
     let legend = match ram_parts(m) {
         Some((in_use, md, sb, free, _)) => {
             let spans: Vec<Span<'static>> = [
-                ("in use", in_use, RAM_IN_USE),
-                ("modified", md, RAM_MODIFIED),
-                ("standby", sb, RAM_STANDBY),
-                ("free", free, DIM),
+                ("in use", in_use, th().ram_in_use),
+                ("modified", md, th().ram_modified),
+                ("standby", sb, th().ram_standby),
+                ("free", free, th().dim),
             ]
             .into_iter()
             .flat_map(|(name, v, c)| {
@@ -1809,10 +1834,10 @@ fn mem_text(st: &State, width: u16) -> Option<MemText> {
             ),
             None => wrap(
                 vec![
-                    Span::styled("  ■ ", Style::new().fg(RAM_MODIFIED)),
+                    Span::styled("  ■ ", Style::new().fg(th().ram_modified)),
                     label("modified "),
                     metric(&m.modified, |v| short_bytes(*v)),
-                    Span::styled("  ■ ", Style::new().fg(RAM_STANDBY)),
+                    Span::styled("  ■ ", Style::new().fg(th().ram_standby)),
                     label("standby "),
                     metric(&m.standby, |v| short_bytes(*v)),
                 ],
@@ -1903,10 +1928,6 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     lines(frame, t.pools, &mut y);
 }
 
-const RAM_IN_USE: Color = Color::Rgb(78, 184, 176);
-const RAM_MODIFIED: Color = Color::Rgb(224, 138, 60);
-const RAM_STANDBY: Color = Color::Rgb(92, 120, 170);
-
 /// Barra da RAM (linha 0): cortada como o Task Manager, ou só o usado sem a divisão do cache.
 fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64)>) {
     if area.height == 0 {
@@ -1935,7 +1956,11 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
     match (ram_parts(m), ram) {
         (Some((in_use, md, sb, _, total)), _) => frame.render_widget(
             Segmented {
-                parts: &[(in_use, RAM_IN_USE), (md, RAM_MODIFIED), (sb, RAM_STANDBY)],
+                parts: &[
+                    (in_use, th().ram_in_use),
+                    (md, th().ram_modified),
+                    (sb, th().ram_standby),
+                ],
                 total,
             },
             bar,
@@ -2020,9 +2045,9 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             line(
                 frame,
                 vec![
-                    Span::styled(" ↑ ", Style::new().fg(NET_SEND)),
+                    Span::styled(" ↑ ", Style::new().fg(th().net_send)),
                     rate(&n.send),
-                    Span::styled("   ↓ ", Style::new().fg(NET_RECV)),
+                    Span::styled("   ↓ ", Style::new().fg(th().net_recv)),
                     rate(&n.recv),
                 ],
                 inner.x,
@@ -2047,7 +2072,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 half_up,
                 st.send.get_mut(&n.alias),
                 &n.send,
-                NET_SEND,
+                th().net_send,
                 "↑",
                 st.session.send.get(&n.alias).copied(),
             ),
@@ -2056,7 +2081,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 half_down,
                 st.recv.get_mut(&n.alias),
                 &n.recv,
-                NET_RECV,
+                th().net_recv,
                 "↓",
                 st.session.recv.get(&n.alias).copied(),
             ),
@@ -2116,7 +2141,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         if !names.is_empty() {
             spans.extend([
                 label("disconnected: "),
-                Span::styled(names.join(", "), Style::new().fg(NEUTRAL)),
+                Span::styled(names.join(", "), Style::new().fg(th().neutral)),
             ]);
         }
         line(
@@ -2210,9 +2235,9 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut note = |name: &str, what: &str, m: &Missing| {
         let style = Style::new().fg(if matches!(m, Missing::Fail(_)) {
-            FAIL
+            th().fail
         } else {
-            NEUTRAL
+            th().neutral
         });
         let mark = if matches!(m, Missing::Fail(_)) {
             "! "
@@ -2415,7 +2440,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             vec![
                 Span::styled(
                     format!("{name:<nw$}"),
-                    Style::new().fg(if *member { LABEL } else { TEXT }),
+                    Style::new().fg(if *member { th().label } else { th().text }),
                 ),
                 label(&format!("{bus:<7}{typ:<4}{cap:>6} {flags:<4}  ")),
             ],
@@ -2434,7 +2459,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         // A causa não cabe na coluna: vai inteira para as notas embaixo da tabela.
         let t = match disk_temp(st, d).map(|t| &t.celsius) {
-            Some(Err(Missing::Fail(_))) => Span::styled("! failed", Style::new().fg(FAIL)),
+            Some(Err(Missing::Fail(_))) => Span::styled("! failed", Style::new().fg(th().fail)),
             Some(Err(m)) if m.to_string().chars().count() > DISK_TEMP_W => label("(below)"),
             Some(c) => metric(c, |c| format!("{c} °C")),
             // Há leitura deste número, mas de outro modelo (disco trocado): espera a releitura.
@@ -2454,7 +2479,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             (Err(e), Err(_), Err(_), Err(_)) => vec![
                 match e {
                     Missing::Fail(_) => {
-                        Span::styled(format!("{:<31}", "! failed"), Style::new().fg(FAIL))
+                        Span::styled(format!("{:<31}", "! failed"), Style::new().fg(th().fail))
                     }
                     Missing::Neutral(n) => label(&format!("{:<31}", printable(n))),
                 },
@@ -2583,7 +2608,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         g.map_or_else(idle, |g| match &g.fps {
             Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
             Err(Missing::Neutral(_)) => label("-"),
-            Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(FAIL)),
+            Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(th().fail)),
         }),
         sep(),
         minmax(st.session.fps, |v| num(v, 0)),
@@ -2610,7 +2635,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         fps_area.height.saturating_sub(1),
     );
     frame.render_widget(
-        Graph::new(&data, GraphColor::Fixed(FPS_COLOR)),
+        Graph::new(&data, GraphColor::Fixed(th().fps)),
         gr.intersection(fps_area),
     );
 
@@ -2650,8 +2675,8 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         Graph::new(
             &data,
             GraphColor::Threshold {
-                base: FT_COLOR,
-                alert: FAIL,
+                base: th().frametime,
+                alert: th().fail,
                 at: FT_ALERT_MS / FT_CEIL_MS,
             },
         ),

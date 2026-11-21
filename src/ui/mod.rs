@@ -3,6 +3,7 @@
 //! Redesenha só quando há dado novo, tecla ou mudança de tamanho. `ratatui::init` liga o modo
 //! raw e a tela alternativa e instala um panic hook que restaura o terminal.
 
+pub mod theme;
 mod view;
 mod widgets;
 
@@ -20,7 +21,11 @@ use crate::engine::{Engine, STEP_MS, Seen};
 /// Roda até `q`, Esc, Ctrl+C ou `stop` (Ctrl+Break / fechar a janela, pelo handler do console).
 /// `start` inicia o motor depois do terminal e do panic hook (um pânico precoce de coletor não
 /// desfaz o terminal); o motor é parado antes de o terminal ser restaurado.
-pub fn run(start: impl FnOnce() -> Engine, stop: &AtomicBool) -> std::io::Result<()> {
+pub fn run(
+    start: impl FnOnce() -> Engine,
+    stop: &AtomicBool,
+    mut cfg: crate::config::Loaded,
+) -> std::io::Result<()> {
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -36,7 +41,7 @@ pub fn run(start: impl FnOnce() -> Engine, stop: &AtomicBool) -> std::io::Result
         }
     }));
     let engine = start();
-    let result = event_loop(&mut terminal, &engine, stop);
+    let result = event_loop(&mut terminal, &engine, stop, &mut cfg);
     // Threads paradas (handles fechados, PawnIO e NVML liberados) antes de restaurar.
     drop(engine);
     ratatui::restore();
@@ -52,8 +57,12 @@ fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     engine: &Engine,
     stop: &AtomicBool,
+    cfg: &mut crate::config::Loaded,
 ) -> std::io::Result<()> {
     let mut st = view::State::new(engine.interval_ms());
+    st.fold_pool = cfg.config.fold_pool.as_option();
+    st.theme_name = theme::th().name.to_string();
+    st.notice = cfg.warnings.first().cloned();
     let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<RuntimeResult>();
     let mut seen = Seen::default();
     let mut dirty = true;
@@ -127,11 +136,21 @@ fn event_loop(
                     }
                     KeyCode::Char('+' | '=') => {
                         st.interval_ms = engine.set_interval_ms(engine.interval_ms() + STEP_MS);
+                        save(cfg, &mut st);
                         dirty = true;
                     }
                     KeyCode::Char('-' | '_') => {
                         st.interval_ms =
                             engine.set_interval_ms(engine.interval_ms().saturating_sub(STEP_MS));
+                        save(cfg, &mut st);
+                        dirty = true;
+                    }
+                    KeyCode::Char('t') => {
+                        // Próximo tema; as cores avulsas do config continuam por cima.
+                        let next = theme::next(&st.theme_name);
+                        theme::set(theme::build(next, &cfg.config.colors));
+                        st.theme_name = next.to_string();
+                        save(cfg, &mut st);
                         dirty = true;
                     }
                     KeyCode::Char('r') => {
@@ -141,6 +160,7 @@ fn event_loop(
                     KeyCode::Char('d') => {
                         // Automático → recolhe → expande → recolhe...
                         st.toggle_fold_pool();
+                        save(cfg, &mut st);
                         dirty = true;
                     }
                     KeyCode::Char(c @ '1'..='4') => {
@@ -167,6 +187,20 @@ fn event_loop(
 }
 
 /// Teclas das listas (abas Processos e GPU). `true` = redesenhar.
+/// Grava no `config.toml` o que a interface muda (intervalo, tema, pool); erro vira aviso.
+fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {
+    let mut c = cfg.config.clone();
+    c.interval_ms = st.interval_ms;
+    c.theme.clone_from(&st.theme_name);
+    c.fold_pool = crate::config::FoldPool::from_option(st.fold_pool);
+    if c == cfg.config {
+        return;
+    }
+    if let Err(e) = cfg.save(&c) {
+        st.notice = Some(e);
+    }
+}
+
 /// Resultado de uma leitura de runtimes: (PID, nome, runtimes).
 type RuntimeResult = (u32, String, crate::model::Metric<Vec<&'static str>>);
 

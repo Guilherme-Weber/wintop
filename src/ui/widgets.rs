@@ -8,18 +8,21 @@ use ratatui::widgets::Widget;
 
 /// Gradiente do btop (padrão): verde em 0, amarelo no meio, vermelho em 1.
 pub fn gradient(t: f64) -> Color {
-    const LOW: (f64, f64, f64) = (80.0, 200.0, 120.0);
-    const MID: (f64, f64, f64) = (230.0, 200.0, 60.0);
-    const HIGH: (f64, f64, f64) = (230.0, 70.0, 70.0);
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => (f64::from(r), f64::from(g), f64::from(b)),
+        _ => (128.0, 128.0, 128.0),
+    };
+    let t3 = super::theme::th();
+    let (low, mid, high) = (rgb(t3.low), rgb(t3.mid), rgb(t3.high));
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
     } else {
         0.0
     };
     let (a, b, u) = if t < 0.5 {
-        (LOW, MID, t * 2.0)
+        (low, mid, t * 2.0)
     } else {
-        (MID, HIGH, (t - 0.5) * 2.0)
+        (mid, high, (t - 0.5) * 2.0)
     };
     let mix = |x: f64, y: f64| (x + (y - x) * u).round() as u8;
     Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
@@ -32,9 +35,6 @@ pub fn darker(c: Color) -> Color {
         other => other,
     }
 }
-
-/// Cor apagada das partes vazias.
-pub const DIM: Color = Color::Rgb(60, 60, 70);
 
 /// Bits do braille por linha de pontos (de baixo para cima), coluna esquerda e direita.
 const LEFT: [u8; 4] = [0x40, 0x04, 0x02, 0x01];
@@ -203,7 +203,7 @@ impl Widget for Meter {
             let style = if i < filled {
                 Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64))
             } else {
-                Style::new().fg(DIM)
+                Style::new().fg(crate::ui::theme::th().dim)
             };
             // Só dentro do buffer (área parcialmente fora da tela num terminal pequeno).
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
@@ -283,7 +283,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         Meter { value: 0.5 }.render(area, &mut buf);
         assert_eq!(buf[(1, 0)].fg, gradient(1.0 / 3.0));
-        assert_eq!(buf[(2, 0)].fg, DIM);
+        assert_eq!(buf[(2, 0)].fg, crate::ui::theme::th().dim);
     }
 }
 
@@ -304,7 +304,7 @@ impl Widget for Segmented<'_> {
             // Meio da célula, em bytes.
             let mid = ((i as f64 + 0.5) / w as f64) * self.total as f64;
             let mut acc = 0.0;
-            let mut color = DIM;
+            let mut color = crate::ui::theme::th().dim;
             for &(bytes, c) in self.parts {
                 acc += bytes as f64;
                 if mid < acc {
@@ -337,6 +337,6 @@ mod segmented_tests {
         assert_eq!(buf[(2, 0)].fg, a);
         assert_eq!(buf[(3, 0)].fg, b);
         assert_eq!(buf[(4, 0)].fg, b);
-        assert_eq!(buf[(5, 0)].fg, DIM);
+        assert_eq!(buf[(5, 0)].fg, crate::ui::theme::th().dim);
     }
 }
