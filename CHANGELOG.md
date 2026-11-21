@@ -24,9 +24,17 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 - Etapa 5: aba geral da interface (ratatui): gráficos de uso com tempo de kernel, grade por
   núcleo, VRAM por categoria, RAM por composição, rede espelhada, discos, caixa do jogo,
   mínimos e máximos da sessão (`r`), linhas que quebram em vez de cortar.
+- Etapa 8: fuzz dos parsers (`src/fuzz.rs`: topologia da CPU, layout e desempenho dos discos,
+  temperatura nativa e SMART, lista de processos, Shared Memory e pipe do RTSS, lows, arquivo de
+  configuração, instâncias do PDH), na suíte normal e em rodada longa (perfil `fuzz`, com
+  checagem de overflow); monitor de longa duração `scripts/soak.ps1`.
 
 ### Corrigido (revisão Gemini Neon + Argon)
 
+- Atividade de disco: soma dos tempos de leitura e escrita sem overflow com contadores
+  corrompidos (achado pelo fuzz).
+- Configuração: `AppData\Roaming` com dono Administradores (perfis criados por imagem, runners
+  do GitHub) aceito só no caminho padrão do perfil.
 - Manifesto de administrador só no executável principal (testes e exemplos rodam sem elevação).
 - Provas: HDD em repouso não é consultado; pipe do RTSS com várias instâncias e tratamento
   correto de I/O overlapped; leituras de Shared Memory voláteis e com limites checados; idade do

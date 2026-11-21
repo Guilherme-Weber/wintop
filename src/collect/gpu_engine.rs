@@ -96,6 +96,24 @@ impl EngineCollector {
 mod tests {
     use super::*;
 
+    /// Nomes de instância e valores quaisquer do PDH (NaN, infinitos, negativos): uso sempre
+    /// em 0..=100.
+    #[test]
+    fn fuzz_instancias_do_pdh() {
+        let seed = "pid_1234_luid_0x00000000_0x0000d1e1_phys_0_eng_3_engtype_VideoDecode";
+        crate::fuzz::run_text("gpu_engine", &[seed], 256, |name| {
+            let rows: Vec<(String, f64)> = [f64::NAN, f64::INFINITY, -5.0, 50.0, 1e300]
+                .into_iter()
+                .map(|v| (name.to_string(), v))
+                .collect();
+            for luid in ["luid_0x00000000_0x0000d1e1", ""] {
+                for engines in group(&rows, luid).values() {
+                    assert!(engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)));
+                }
+            }
+        });
+    }
+
     #[test]
     fn instancia_de_engine() {
         assert_eq!(

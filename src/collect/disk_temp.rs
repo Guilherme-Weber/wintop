@@ -349,6 +349,24 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_temperatura_nativa_e_smart() {
+        let mut n = vec![0u8; T_INFO + 2 * T_INFO_SIZE];
+        n[T_INFO_COUNT..T_INFO_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+        n[T_INFO + T_TEMP..T_INFO + T_TEMP + 2].copy_from_slice(&38i16.to_le_bytes());
+        let mut s = vec![0u8; PREDICT_SIZE];
+        s[2] = 194;
+        s[2 + 5] = 35;
+        crate::fuzz::run("temperatura", &[n, s], 1024, |_, b| {
+            if let Some(t) = native_temp(b) {
+                assert_ne!(t, TEMP_NOT_REPORTED);
+            }
+            if let Some((id, v)) = smart_temp(b) {
+                assert!(matches!(id, 190 | 194) && v > 0);
+            }
+        });
+    }
+
+    #[test]
     fn smart_prefere_194() {
         let mut v = vec![0u8; 2 + 30 * 12];
         v[2] = 190;

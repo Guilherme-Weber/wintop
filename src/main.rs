@@ -9,6 +9,8 @@ mod collect;
 mod config;
 mod engine;
 mod fmt;
+#[cfg(test)]
+mod fuzz;
 mod install;
 mod instance;
 mod model;

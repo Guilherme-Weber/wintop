@@ -370,6 +370,22 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_topologia() {
+        let mut b = record(3, 48, |_| {});
+        b.extend(record(0, 48, |r| {
+            r[30..32].copy_from_slice(&1u16.to_le_bytes());
+            r[32..40].copy_from_slice(&0xFFu64.to_le_bytes());
+        }));
+        b.extend(record(2, 48, |r| r[8] = 2));
+        crate::fuzz::run("topologia", &[b], 4096, |_, b| {
+            if let Some(t) = parse_topology(b) {
+                // Cada núcleo ocupa pelo menos um registro de 8 bytes.
+                assert!(t.cores > 0 && t.cores as usize <= b.len() / 8);
+            }
+        });
+    }
+
+    #[test]
     fn topologia_sintetica() {
         let mut b = Vec::new();
         b.extend(record(3, 48, |_| {}));

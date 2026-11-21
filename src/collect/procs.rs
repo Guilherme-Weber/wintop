@@ -369,6 +369,27 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_lista_de_processos() {
+        let base = 0x1000_0000;
+        let mut b = entry(0, "", 0, base, 0);
+        let next = b.len() as u32;
+        b[NEXT..NEXT + 4].copy_from_slice(&next.to_le_bytes());
+        b.extend(entry(1234, "game.exe", 0, base, next as usize));
+        crate::fuzz::run("processos", &[b], 4096, |r, b| {
+            // Base de vez em quando perto do fim do espaço de endereços (aritmética no limite).
+            let base = if r.chance(8) {
+                usize::MAX - r.below(4096)
+            } else {
+                base
+            };
+            if let Ok(list) = parse(b, base) {
+                // Cada entrada ocupa pelo menos a parte fixa.
+                assert!(!list.is_empty() && list.len() <= b.len() / ENTRY);
+            }
+        });
+    }
+
+    #[test]
     fn ponteiro_fora_do_buffer_e_erro() {
         let base = 0x1000_0000;
         let mut e = entry(8, "x.exe", 0, base, 0);

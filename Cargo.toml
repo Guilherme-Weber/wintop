@@ -70,6 +70,15 @@ strip = true
 # Arquivo e linha de cada frame no .pdb separado, sem aumentar o executável.
 debug = "line-tables-only"
 
+# Fuzz longo dos parsers (`src/fuzz.rs`): otimizado, mas com overflow e debug_assert ligados (o
+# release os desliga, e um overflow é justamente o que o fuzz procura).
+[profile.fuzz]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+lto = false
+codegen-units = 16
+
 # Spikes da Etapa 0 (examples/): os testes unitários da decodificação rodam com `cargo test`.
 [[example]]
 name = "spike_pawnio"

@@ -1181,6 +1181,79 @@ mod tests {
         assert_eq!(apps[0].frametime_us, 6944);
     }
 
+    /// A Shared Memory é escrita por outro processo (e pode ser criada por um processo sem
+    /// elevação no lugar do RTSS): qualquer conteúdo vira erro ou apps coerentes.
+    #[test]
+    fn fuzz_shared_memory() {
+        let seeds = [
+            shm(
+                V2_21,
+                ENTRY_V221,
+                &[(4242, br"C:\g\a.exe", 6), (7, b"b.exe", 7)],
+            ),
+            shm(0x0002_000F, E_FRAME_TIME + 4, &[(10, b"old.exe", 5)]),
+            shm(V2_20, E_RES_Y + 4, &[(11, b"mid.exe", 5), (0, b"", 0)]),
+        ];
+        crate::fuzz::run("shared_memory", &seeds, 64 * 1024, |_, b| {
+            if let Ok((apps, _, ver)) = read_apps(&SharedView::from_bytes(b)) {
+                assert_eq!(ver >> 16, 2);
+                assert!(apps.len() <= MAX_APPS);
+                for a in &apps {
+                    assert!(a.pid != 0 && (a.index as usize) < MAX_APPS);
+                    assert!(a.fps.is_finite() && a.fps >= 0.0);
+                    assert!(!a.name.contains('\\'));
+                }
+                let _ = select_game(&apps, apps.first().map(|a| a.pid), &defaults());
+            }
+        });
+    }
+
+    /// O pipe aceita escrita de processos sem elevação: mensagens quaisquer, partidas em
+    /// pedaços quaisquer, mantêm os tetos (filas desconhecidas, frames, sobra < 8 bytes).
+    #[test]
+    fn fuzz_pipe() {
+        let rec = |app: u32, us: u32| {
+            let mut v = app.to_le_bytes().to_vec();
+            v.extend(us.to_le_bytes());
+            v
+        };
+        let mut seed = rec(0, 6944);
+        seed.extend(rec(3, 16_000));
+        seed.extend(rec(200, 1));
+        let known: HashSet<u32> = [0, 1].into();
+        let ignored: HashSet<u32> = [1].into();
+        let mut rings = HashMap::new();
+        let mut carry = Vec::new();
+        crate::fuzz::run("pipe", &[seed], 512, |r, b| {
+            feed(&mut rings, &known, &ignored, &mut carry, b, r.chance(2));
+            assert!(carry.len() < 8);
+            let unknown = rings.keys().filter(|i| !known.contains(i)).count();
+            assert!(unknown <= MAX_UNKNOWN_RINGS);
+            for (i, ring) in &rings {
+                assert!((*i as usize) < MAX_APPS && !ignored.contains(i));
+                let cap = if known.contains(i) {
+                    MAX_FRAMES
+                } else {
+                    UNKNOWN_FRAMES
+                };
+                assert!(ring.frames.len() <= cap);
+                assert!(ring.frames.iter().all(|&(_, us)| us > 0));
+            }
+        });
+    }
+
+    #[test]
+    fn fuzz_lows() {
+        // Até ~1100 amostras: passa pelas duas regras do 0,1% (abaixo e acima de 1000).
+        crate::fuzz::run("lows", &[], 4400, |_, b| {
+            let s = b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c));
+            if let Some((l1, l01)) = lows(s) {
+                assert!(l1.is_finite() && l01.is_finite() && l1 > 0.0 && l01 > 0.0);
+                assert!(l01 <= l1 + 1e-9, "0,1% low acima do 1% low");
+            }
+        });
+    }
+
     #[test]
     fn shared_memory_antiga_sem_campos_novos() {
         // v2.15: sem primeiro plano, resolução e tempo de GPU; entrada no tamanho antigo.

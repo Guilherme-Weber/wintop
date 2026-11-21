@@ -237,8 +237,11 @@ fn activity(prev: &PerfSample, now: &PerfSample) -> Option<(f64, f64, f64, f64)>
     let idle = now.idle_time.checked_sub(prev.idle_time)?;
     let read = now.bytes_read.checked_sub(prev.bytes_read)?;
     let written = now.bytes_written.checked_sub(prev.bytes_written)?;
-    let busy =
-        now.read_time.checked_sub(prev.read_time)? + now.write_time.checked_sub(prev.write_time)?;
+    // Somas checadas: contadores corrompidos (ou que saltam) viram "sem amostra", não pânico.
+    let busy = now
+        .read_time
+        .checked_sub(prev.read_time)?
+        .checked_add(now.write_time.checked_sub(prev.write_time)?)?;
     // Contagens de 32 bits: a volta é normal em uptime longo.
     let transfers = u64::from(now.reads.wrapping_sub(prev.reads))
         + u64::from(now.writes.wrapping_sub(prev.writes));
@@ -657,6 +660,61 @@ impl DiskCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzz_layout_descritor_e_extensoes() {
+        let mut l = vec![0u8; L_ENTRIES + 2 * P_SIZE];
+        l[L_STYLE..L_STYLE + 4].copy_from_slice(&STYLE_GPT.to_le_bytes());
+        l[L_COUNT..L_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
+        let t = L_ENTRIES + P_SIZE + P_GPT_TYPE;
+        l[t..t + 16].copy_from_slice(&SPACES_PROTECTIVE);
+        let mut d = vec![0u8; 64];
+        d[D_VENDOR_OFF..D_VENDOR_OFF + 4].copy_from_slice(&40u32.to_le_bytes());
+        d[D_PRODUCT_OFF..D_PRODUCT_OFF + 4].copy_from_slice(&48u32.to_le_bytes());
+        d[40..43].copy_from_slice(b"WDC");
+        d[48..54].copy_from_slice(b"WD80EF");
+        let mut x = vec![0u8; X_ENTRIES + 3 * X_SIZE];
+        x[X_COUNT..X_COUNT + 4].copy_from_slice(&3u32.to_le_bytes());
+        for (i, n) in [5u32, 1, 5].iter().enumerate() {
+            let o = X_ENTRIES + i * X_SIZE;
+            x[o..o + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        crate::fuzz::run("disco", &[l, d, x], 4096, |_, b| {
+            let _ = is_pool_member(b);
+            let _ = model_name(b);
+            let disks = parse_extents(b);
+            assert!(disks.len() <= MAX_EXTENTS);
+            assert!(disks.windows(2).all(|w| w[0] < w[1]));
+        });
+    }
+
+    /// Duas amostras quaisquer do `IOCTL_DISK_PERFORMANCE` (contadores que voltam, valores no
+    /// limite do u64): a atividade sai finita e dentro das faixas, ou `None`.
+    #[test]
+    fn fuzz_atividade_entre_amostras() {
+        let mut p = vec![0u8; PERF_SIZE];
+        for (o, v) in [(P_BYTES_READ, 1u64 << 30), (P_IDLE_TIME, 9_000_000)] {
+            p[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        p[P_QUERY_TIME..P_QUERY_TIME + 8].copy_from_slice(&10_000_000u64.to_le_bytes());
+        crate::fuzz::run("atividade", &[p.clone()], 2 * PERF_SIZE, |r, b| {
+            let Some(a) = parse_perf(b) else { return };
+            let mut c = p.clone();
+            for _ in 0..=r.below(6) {
+                crate::fuzz::mutate(r, &mut c);
+            }
+            c.resize(PERF_SIZE, 0);
+            let c = parse_perf(&c).expect("amostra completa");
+            for (prev, now) in [(&a, &c), (&c, &a)] {
+                if let Some((active, read, write, resp)) = activity(prev, now) {
+                    assert!((0.0..=100.0).contains(&active));
+                    assert!(read.is_finite() && read >= 0.0);
+                    assert!(write.is_finite() && write >= 0.0);
+                    assert!(resp.is_finite() && resp >= 0.0);
+                }
+            }
+        });
+    }
 
     #[test]
     fn contagem_de_particoes_corrompida_nao_trava() {

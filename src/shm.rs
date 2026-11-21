@@ -23,6 +23,9 @@ pub struct SharedView {
     _handle: Option<OwnedHandle>,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// Visão de teste: o buffer local (vive enquanto a visão vive; nada vaza no fuzz).
+    #[cfg(test)]
+    _owned: Option<Vec<u64>>,
 }
 
 impl SharedView {
@@ -51,6 +54,8 @@ impl SharedView {
             _handle: Some(handle),
             view,
             len: 0,
+            #[cfg(test)]
+            _owned: None,
         };
         if got == 0 || mbi.State != MEM_COMMIT {
             return None; // `me` desmapeia a view no Drop
@@ -142,11 +147,10 @@ impl Drop for SharedView {
 
 #[cfg(test)]
 impl SharedView {
-    /// Visão sobre um buffer local (testes dos parsers). O buffer é vazado: vive até o fim do
-    /// processo de teste, como uma região mapeada.
+    /// Visão sobre uma cópia local de `b` (testes e fuzz dos parsers). O buffer pertence à
+    /// visão (`Vec`, não `Box`: o ponteiro para o heap continua válido quando ela é movida).
     pub fn from_bytes(b: &[u8]) -> Self {
-        let words: &'static mut [u64] =
-            Box::leak(vec![0u64; b.len().div_ceil(8)].into_boxed_slice());
+        let mut words = vec![0u64; b.len().div_ceil(8)];
         // SAFETY: o buffer tem pelo menos `b.len()` bytes e é só nosso.
         unsafe {
             std::ptr::copy_nonoverlapping(b.as_ptr(), words.as_mut_ptr().cast::<u8>(), b.len());
@@ -157,6 +161,7 @@ impl SharedView {
                 Value: words.as_mut_ptr().cast(),
             },
             len: b.len(),
+            _owned: Some(words),
         }
     }
 }

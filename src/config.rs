@@ -297,6 +297,24 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
     c
 }
 
+/// Valores que a interface muda, no documento (o resto fica como o usuário deixou).
+fn update_doc(doc: &mut DocumentMut, c: &Config) {
+    doc["interval_ms"] = value(c.interval_ms as i64);
+    doc["theme"] = value(c.theme.as_str());
+    doc["fold_pool"] = value(c.fold_pool.name());
+    // A lista do RTSS só entra se a tabela não existe (um `rtss` que não é tabela fica como
+    // o usuário deixou: indexar nele derrubaria o programa).
+    if doc.get("rtss").is_none() {
+        let mut a = Array::new();
+        for n in &c.rtss_ignored {
+            a.push(n.as_str());
+        }
+        let mut t = toml_edit::Table::new();
+        t.insert("ignored", value(a));
+        doc.insert("rtss", Item::Table(t));
+    }
+}
+
 impl Loaded {
     /// Grava os valores que a interface muda (intervalo, tema, pool), mantendo o resto do
     /// documento. Devolve o erro para a interface avisar.
@@ -308,20 +326,7 @@ impl Loaded {
         let doc = self
             .doc
             .get_or_insert_with(|| template(c).parse().unwrap_or_default());
-        doc["interval_ms"] = value(c.interval_ms as i64);
-        doc["theme"] = value(c.theme.as_str());
-        doc["fold_pool"] = value(c.fold_pool.name());
-        // A lista do RTSS só entra se a tabela não existe (um `rtss` que não é tabela fica como
-        // o usuário deixou: indexar nele derrubaria o programa).
-        if doc.get("rtss").is_none() {
-            let mut a = Array::new();
-            for n in &c.rtss_ignored {
-                a.push(n.as_str());
-            }
-            let mut t = toml_edit::Table::new();
-            t.insert("ignored", value(a));
-            doc.insert("rtss", Item::Table(t));
-        }
+        update_doc(doc, c);
         let text = doc.to_string();
         crate::userfile::UserDir::create(&base, &self.dir)?.write(FILE, &text)?;
         self.config = c.clone();
@@ -351,6 +356,32 @@ mod tests {
 
     fn cleanup(base: &Path, dir: &str) {
         let _ = std::fs::remove_dir_all(base.join(dir));
+    }
+
+    /// Arquivo qualquer: a leitura dá valores válidos (ou os padrões), e a regravação do que a
+    /// interface muda continua um TOML válido com esses valores.
+    #[test]
+    fn fuzz_arquivo_de_configuracao() {
+        let full = "interval_ms = 500\ntheme = \"nord\"\nfold_pool = \"fold\"\n\
+                    [rtss]\nignored = [\"a.exe\", \"B.EXE \"]\n[colors]\nborder = \"#112233\"\n";
+        let odd =
+            "rtss = 3\ncolors = { text = \"#zzzzzz\", nope = \"#000000\" }\ninterval_ms = -1\n";
+        let tpl = template(&Config::default());
+        crate::fuzz::run_text("config", &[full, odd, &tpl], 4096, |text| {
+            let Ok(mut doc) = text.parse::<DocumentMut>() else {
+                return;
+            };
+            let mut warn = Vec::new();
+            let c = from_doc(&doc, &mut warn);
+            assert!(crate::ui::theme::exists(&c.theme));
+            assert!(c.rtss_ignored.len() <= 256);
+            assert!(c.colors.len() <= 64);
+            assert!(warn.iter().all(|w| !w.chars().any(char::is_control)));
+            update_doc(&mut doc, &c);
+            let again: DocumentMut = doc.to_string().parse().expect("regravado inválido");
+            let back = from_doc(&again, &mut Vec::new());
+            assert_eq!((back.interval_ms, back.theme), (c.interval_ms, c.theme));
+        });
     }
 
     #[test]
