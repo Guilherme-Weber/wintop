@@ -22,7 +22,7 @@ use windows::Win32::Security::{
 };
 use windows::core::PCWSTR;
 
-use crate::win::{sid_string, wide};
+use crate::win::{known_folder, sid_string, wide};
 
 const TASK: &str = "wintop";
 
@@ -38,27 +38,14 @@ const WRITE_BITS: u32 = 0x0002 // FILE_WRITE_DATA / FILE_ADD_FILE
     | 0x4000_0000 // GENERIC_WRITE
     | 0x1000_0000; // GENERIC_ALL
 
-/// Quem nunca pode escrever: Todos, Usuários autenticados, Usuários, Interativo.
-const UNPRIVILEGED: [&str; 4] = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4"];
+/// CREATOR OWNER (só em ACEs herdáveis: vale como o dono do que for criado).
+const CREATOR_OWNER: &str = "S-1-3-0";
 /// Donos aceitos: Administradores, SYSTEM, TrustedInstaller.
 const OWNERS: [&str; 3] = [
     "S-1-5-32-544",
     "S-1-5-18",
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
 ];
-
-fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, String> {
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-    // SAFETY: GUID válido; a string devolvida é liberada com CoTaskMemFree.
-    unsafe {
-        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
-            .map_err(|e| format!("known folder: {e}"))?;
-        let s = p.to_string();
-        CoTaskMemFree(Some(p.0.cast()));
-        s.map(PathBuf::from).map_err(|e| e.to_string())
-    }
-}
 
 /// `<Program Files>\wintop`.
 pub fn install_dir() -> Result<PathBuf, String> {
@@ -67,6 +54,38 @@ pub fn install_dir() -> Result<PathBuf, String> {
 
 fn shortcut_path() -> Result<PathBuf, String> {
     Ok(known_folder(&windows::Win32::UI::Shell::FOLDERID_Programs)?.join("wintop.lnk"))
+}
+
+/// `path` é um link (junction, symlink): o instalador não segue links.
+fn is_link(path: &Path) -> bool {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW};
+    let w = wide(&path.to_string_lossy());
+    // SAFETY: caminho terminado em zero; o atributo é o do próprio link (não segue).
+    let a = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
+    a != u32::MAX && a & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+/// `path` (e tudo dentro, se for pasta) sem links e sem escrita para quem não é
+/// Administradores/SYSTEM/TrustedInstaller.
+fn check_tree(path: &Path) -> Result<(), String> {
+    if is_link(path) {
+        return Err(format!("{} is a link: refusing to install", path.display()));
+    }
+    let problems = unsafe_acl(path)?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "{} can be changed without elevation, refusing to create an elevated task: {}",
+            path.display(),
+            problems.join("; ")
+        ));
+    }
+    if path.is_dir() {
+        for e in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
+            let e = e.map_err(|e| e.to_string())?;
+            check_tree(&e.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Problemas de ACL que deixariam alguém sem elevação trocar `path`.
@@ -91,7 +110,6 @@ pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
     if r.is_err() {
         return Err(format!("{}: security info: {r:?}", path.display()));
     }
-    let user = crate::win::user_sid();
     let mut problems = Vec::new();
     // SAFETY: `owner` aponta para dentro do descritor, vivo até o LocalFree.
     let owner_s = unsafe { sid_string(owner) }.unwrap_or_default();
@@ -109,14 +127,23 @@ pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
             let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
             // SAFETY: índice < AceCount; `ace` aponta para dentro da DACL.
             if unsafe { GetAce(dacl, i, &raw mut ace) }.is_err() {
+                // Falha fechada: uma ACE que não dá para ler pode ser justamente a que permite.
+                problems.push(format!("ACE {i} could not be read"));
                 continue;
             }
             // SAFETY: toda ACE começa com o cabeçalho.
             let h = unsafe { *ace.cast::<ACE_HEADER>() };
             const ACCESS_ALLOWED: u8 = 0;
+            const ACCESS_DENIED: u8 = 1;
             const INHERIT_ONLY: u8 = 0x08;
-            if h.AceType != ACCESS_ALLOWED || h.AceFlags & INHERIT_ONLY != 0 {
-                continue; // negação ou só para filhos (ex.: CREATOR OWNER)
+            match h.AceType {
+                ACCESS_ALLOWED => {}
+                ACCESS_DENIED => continue,
+                // Objeto, condicional, callback...: não avaliados = recusados.
+                t => {
+                    problems.push(format!("ACE {i} of type {t} is not evaluated"));
+                    continue;
+                }
             }
             let a = ace.cast::<ACCESS_ALLOWED_ACE>();
             // SAFETY: ACE de permissão: a máscara e o SID seguem o cabeçalho.
@@ -124,9 +151,17 @@ pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
             // SAFETY: o SID começa em `SidStart`, dentro da ACE.
             let sid = PSID(unsafe { (&raw mut (*a).SidStart).cast() });
             // SAFETY: SID válido dentro da ACE.
-            let s = unsafe { sid_string(sid) }.unwrap_or_default();
-            let risky = UNPRIVILEGED.contains(&s.as_str()) || user.as_deref() == Some(s.as_str());
-            if risky && mask & WRITE_BITS != 0 {
+            let Some(s) = (unsafe { sid_string(sid) }) else {
+                problems.push(format!("ACE {i} has an unreadable SID"));
+                continue;
+            };
+            // Lista branca: só os donos aceitos podem escrever (também nas ACEs que valem só
+            // para o que for criado dentro: o XML da tarefa e os módulos herdam delas). A
+            // exceção é CREATOR OWNER herdável: o dono do que o instalador cria é Administradores.
+            if h.AceFlags & INHERIT_ONLY != 0 && s == CREATOR_OWNER {
+                continue;
+            }
+            if mask & WRITE_BITS != 0 && !OWNERS.contains(&s.as_str()) {
                 problems.push(format!("{s} can write ({mask:#x})"));
             }
         }
@@ -267,7 +302,29 @@ pub fn install() -> Result<(), String> {
     let exe = dir.join("wintop.exe");
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let here = me.parent().ok_or("no executable folder")?;
+    // Antes de gravar qualquer coisa: a pasta pai (Program Files) e a de destino, se já existe,
+    // sem links e sem escrita para quem não é administrador (senão a cópia em si já seria
+    // gravar como administrador num lugar que outro controla).
+    let parent = dir.parent().ok_or("no Program Files folder")?;
+    if is_link(parent) {
+        return Err(format!(
+            "{} is a link: refusing to install",
+            parent.display()
+        ));
+    }
+    let p = unsafe_acl(parent)?;
+    if !p.is_empty() {
+        return Err(format!(
+            "{} is writable without elevation: {}",
+            parent.display(),
+            p.join("; ")
+        ));
+    }
+    if dir.exists() {
+        check_tree(&dir).map_err(|e| format!("{e} (remove {} and try again)", dir.display()))?;
+    }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    check_tree(&dir)?;
     if !same_file(&me, &exe) {
         std::fs::copy(&me, &exe).map_err(|e| format!("copy to {}: {e}", exe.display()))?;
         let modules = here.join("modules");
@@ -276,23 +333,30 @@ pub fn install() -> Result<(), String> {
         }
         println!("copied to {}", dir.display());
     }
-    for p in [&dir, &exe] {
-        let problems = unsafe_acl(p)?;
-        if !problems.is_empty() {
-            return Err(format!(
-                "{} is writable without elevation, refusing to create an elevated task: {}",
-                p.display(),
-                problems.join("; ")
-            ));
-        }
-    }
+    // Depois da cópia: tudo o que o wintop elevado executa ou carrega (o exe e os módulos do
+    // PawnIO) continua protegido.
+    check_tree(&dir)?;
     let user = crate::win::user_sid().ok_or("could not read the user SID")?;
     let xml = dir.join("wintop-task.xml");
     let utf16: Vec<u8> = std::iter::once(0xFEFFu16)
         .chain(task_xml(&exe, &user).encode_utf16())
         .flat_map(u16::to_le_bytes)
         .collect();
-    std::fs::write(&xml, utf16).map_err(|e| format!("{}: {e}", xml.display()))?;
+    // Arquivo novo e exclusivo (um que já exista, ou um link no lugar, é apagado antes).
+    if xml.exists() || is_link(&xml) {
+        std::fs::remove_file(&xml).map_err(|e| format!("{}: {e}", xml.display()))?;
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&xml)
+            .map_err(|e| format!("{}: {e}", xml.display()))?;
+        f.write_all(&utf16)
+            .map_err(|e| format!("{}: {e}", xml.display()))?;
+    }
+    check_tree(&xml)?;
     let r = schtasks(&["/create", "/tn", TASK, "/xml", &xml.to_string_lossy(), "/f"]);
     let _ = std::fs::remove_file(&xml);
     r?;
@@ -322,7 +386,14 @@ pub fn uninstall() -> Result<(), String> {
     }
     let dir = install_dir()?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    if me.starts_with(&dir) {
+    // Comparação sem diferenciar maiúsculas e com links resolvidos (como o Windows).
+    let canon = |p: &Path| {
+        std::fs::canonicalize(p).map_or_else(
+            |_| p.to_string_lossy().to_lowercase(),
+            |c| c.to_string_lossy().to_lowercase(),
+        )
+    };
+    if canon(&me).starts_with(&canon(&dir)) {
         println!(
             "{} is in use by this process: delete it after closing wintop",
             dir.display()
@@ -368,6 +439,12 @@ mod tests {
     fn acl_da_system32_e_segura_e_a_da_pasta_do_usuario_nao() {
         let sys = crate::win::system_dir().expect("System32");
         assert_eq!(unsafe_acl(&sys).expect("acl"), Vec::<String>::new());
+        // Program Files (a pasta pai da instalação) também.
+        let pf = install_dir().expect("Program Files");
+        assert_eq!(
+            unsafe_acl(pf.parent().expect("pai")).expect("acl"),
+            Vec::<String>::new()
+        );
         let mine = std::env::temp_dir().join(format!("wintop_acl_{}", std::process::id()));
         std::fs::create_dir_all(&mine).expect("pasta");
         let p = unsafe_acl(&mine).expect("acl");

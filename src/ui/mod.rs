@@ -193,12 +193,15 @@ fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {
     c.interval_ms = st.interval_ms;
     c.theme.clone_from(&st.theme_name);
     c.fold_pool = crate::config::FoldPool::from_option(st.fold_pool);
-    if c == cfg.config {
+    if c == cfg.config || !cfg.writable() {
+        // Sem gravação: o aviso de leitura (que explica o porquê) continua na tela.
         return;
     }
-    if let Err(e) = cfg.save(&c) {
-        st.notice = Some(e);
-    }
+    // Gravou: um erro anterior (arquivo travado por um editor) deixa de valer.
+    st.notice = match cfg.save(&c) {
+        Ok(()) => cfg.warnings.first().cloned(),
+        Err(e) => Some(e),
+    };
 }
 
 /// Resultado de uma leitura de runtimes: (PID, nome, runtimes).

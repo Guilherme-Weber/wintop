@@ -15,6 +15,7 @@ mod model;
 mod pdh;
 mod shm;
 mod ui;
+mod userfile;
 mod win;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,7 +131,7 @@ fn run_ui() {
     // antes de o terminal ser restaurado.
     // Configuração do usuário: intervalo, tema, pool e ignorados do RTSS (erro = padrões e aviso
     // na tela; nunca impede de abrir).
-    let cfg = config::load(config::default_path());
+    let cfg = config::load(config::roaming(), true);
     ui::theme::set(ui::theme::build(&cfg.config.theme, &cfg.config.colors));
     let interval = cfg.config.interval_ms;
     let ignored = cfg.config.rtss_ignored.clone();

@@ -982,3 +982,22 @@ fn toda_falha_contada_aparece_em_vermelho() {
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }
+
+#[test]
+fn aviso_do_config_aparece_inteiro_sem_esconder_o_estado() {
+    let mut st = filled();
+    st.notice = Some(
+        r"config: syntax error (TOML parse error at line 3, column 14 in C:\Users\someone\AppData\Roaming\wintop\config.toml); defaults, not saved".into(),
+    );
+    for w in [80, 120, 200] {
+        let out = render(&mut st, w, 40);
+        let flat: String = out
+            .lines()
+            .map(|l| l.trim_matches('"').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("defaults, not saved"), "{w}\n{out}");
+        let footer = out.lines().last().expect("rodapé");
+        assert!(footer.contains("sources: all OK"), "{w}\n{footer}");
+    }
+}

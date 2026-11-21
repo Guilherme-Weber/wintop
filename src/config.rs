@@ -9,7 +9,7 @@
 //! - Arquivo com erro de sintaxe: o wintop abre com os padrões, avisa e **não grava** por cima
 //!   (a edição do usuário não se perde).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use toml_edit::{Array, DocumentMut, Item, Value, value};
 
@@ -130,76 +130,82 @@ fn template(c: &Config) -> String {
     )
 }
 
+/// Pasta e arquivo dentro de `AppData\Roaming`.
+const DIR: &str = "wintop";
+const FILE: &str = "config.toml";
+
 /// Configuração carregada: os valores, o documento (para regravar mantendo comentários) e
 /// os avisos (valores inválidos, arquivo com erro).
 pub struct Loaded {
     pub config: Config,
     doc: Option<DocumentMut>,
-    path: Option<PathBuf>,
-    /// Problemas encontrados (a interface mostra o primeiro).
+    /// `AppData\Roaming` (a pasta `wintop` fica dentro).
+    base: Option<PathBuf>,
+    /// Nome da pasta dentro da base (`wintop`; outro só nos testes).
+    dir: String,
+    /// Problemas encontrados ao ler (a interface mostra o primeiro).
     pub warnings: Vec<String>,
-    /// Gravação liberada (não com o arquivo do usuário em erro de sintaxe).
+    /// Gravação liberada (não com o arquivo do usuário em erro de sintaxe ou ilegível).
     writable: bool,
 }
 
-/// Caminho do arquivo: `%APPDATA%\wintop\config.toml` (pasta do perfil pelo Known Folder, não
-/// pela variável de ambiente).
-pub fn default_path() -> Option<PathBuf> {
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{
-        FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
-    };
-    // SAFETY: GUID estático; a string devolvida é liberada com CoTaskMemFree.
-    unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()?;
-        let s = p.to_string().ok();
-        CoTaskMemFree(Some(p.0.cast()));
-        Some(PathBuf::from(s?).join("wintop").join("config.toml"))
-    }
+/// `AppData\Roaming` do usuário (Known Folder, não a variável de ambiente).
+pub fn roaming() -> Option<PathBuf> {
+    crate::win::known_folder(&windows::Win32::UI::Shell::FOLDERID_RoamingAppData).ok()
 }
 
-/// Lê (ou cria) o arquivo em `path`.
-pub fn load(path: Option<PathBuf>) -> Loaded {
+/// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml`.
+pub fn default_path() -> Option<PathBuf> {
+    roaming().map(|r| r.join(DIR).join(FILE))
+}
+
+/// Lê o arquivo em `<base>\wintop\config.toml`; `create`: cria com os padrões se faltar (a
+/// interface; o `--check` só lê). Todo acesso passa por `userfile` (o wintop roda elevado e a
+/// pasta é do usuário: links e redirecionamentos são recusados).
+pub fn load(base: Option<PathBuf>, create: bool) -> Loaded {
+    load_in(base, DIR, create)
+}
+
+fn load_in(base: Option<PathBuf>, dir_name: &str, create: bool) -> Loaded {
     let mut l = Loaded {
         config: Config::default(),
         doc: None,
-        path: path.clone(),
+        base: base.clone(),
+        dir: dir_name.to_string(),
         warnings: Vec::new(),
-        writable: path.is_some(),
+        writable: base.is_some(),
     };
-    let Some(path) = path else {
+    let Some(base) = base else {
         l.warnings
             .push("config: no AppData folder (defaults, not saved)".into());
         return l;
     };
-    match std::fs::metadata(&path) {
-        Err(_) => {
-            // 1ª execução: cria com os padrões.
+    let dir = match crate::userfile::UserDir::open(&base, dir_name, create) {
+        Ok(d) => d,
+        // Sem a pasta no modo só leitura: padrões, sem aviso (ainda não foi criada).
+        Err(_) if !create && !base.join(dir_name).exists() => return l,
+        Err(e) => {
+            l.warnings
+                .push(format!("config: {e} (defaults, not saved)"));
+            l.writable = false;
+            return l;
+        }
+    };
+    let text = match dir.read(FILE, MAX_BYTES) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            // 1ª execução: cria com os padrões (comentados).
             let text = template(&l.config);
-            if let Err(e) = write_atomic(&path, &text) {
-                l.warnings
-                    .push(format!("config: could not create {}: {e}", path.display()));
+            if create && let Err(e) = dir.write(FILE, &text) {
+                l.warnings.push(format!("config: could not create it: {e}"));
                 l.writable = false;
             }
             l.doc = text.parse().ok();
             return l;
         }
-        Ok(m) if m.len() > MAX_BYTES => {
-            l.warnings.push(format!(
-                "config: file larger than {} KB (defaults, not saved)",
-                MAX_BYTES >> 10
-            ));
-            l.writable = false;
-            return l;
-        }
-        Ok(_) => {}
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
         Err(e) => {
-            l.warnings.push(format!(
-                "config: could not read it: {e} (defaults, not saved)"
-            ));
+            l.warnings
+                .push(format!("config: {e} (defaults, not saved)"));
             l.writable = false;
             return l;
         }
@@ -212,7 +218,8 @@ pub fn load(path: Option<PathBuf>) -> Loaded {
         Err(e) => {
             let first = e.to_string().lines().next().unwrap_or_default().to_string();
             l.warnings.push(format!(
-                "config: syntax error ({first}); defaults, not saved"
+                "config: syntax error ({}); defaults, not saved",
+                crate::win::printable(&first)
             ));
             l.writable = false;
         }
@@ -249,6 +256,9 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
                 FoldPool::Auto
             }
         };
+    }
+    if doc.get("rtss").is_some_and(|t| t.as_table_like().is_none()) {
+        warn.push("config: rtss must be a table ([rtss])".into());
     }
     if let Some(list) = doc.get("rtss").and_then(|t| t.get("ignored")) {
         match list.as_array() {
@@ -294,51 +304,62 @@ impl Loaded {
         if !self.writable {
             return Err("config not saved (see the warning)".into());
         }
-        let path = self.path.clone().ok_or("no config path")?;
+        let base = self.base.clone().ok_or("no AppData folder")?;
         let doc = self
             .doc
             .get_or_insert_with(|| template(c).parse().unwrap_or_default());
         doc["interval_ms"] = value(c.interval_ms as i64);
         doc["theme"] = value(c.theme.as_str());
         doc["fold_pool"] = value(c.fold_pool.name());
-        if doc.get("rtss").and_then(|t| t.get("ignored")).is_none() {
+        // A lista do RTSS só entra se a tabela não existe (um `rtss` que não é tabela fica como
+        // o usuário deixou: indexar nele derrubaria o programa).
+        if doc.get("rtss").is_none() {
             let mut a = Array::new();
             for n in &c.rtss_ignored {
                 a.push(n.as_str());
             }
-            doc["rtss"]["ignored"] = value(a);
+            let mut t = toml_edit::Table::new();
+            t.insert("ignored", value(a));
+            doc.insert("rtss", Item::Table(t));
         }
-        write_atomic(&path, &doc.to_string()).map_err(|e| e.to_string())?;
+        let text = doc.to_string();
+        crate::userfile::UserDir::open(&base, &self.dir, true)?.write(FILE, &text)?;
         self.config = c.clone();
         Ok(())
     }
-}
 
-/// Grava em `<arquivo>.tmp` na mesma pasta e troca pelo original (um corte de energia no meio
-/// deixa o antigo ou o novo, nunca metade).
-fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    /// Gravação liberada (o aviso de leitura explica por que não).
+    pub fn writable(&self) -> bool {
+        self.writable
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("wintop_cfg_{}_{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d.join("config.toml")
+    /// Pasta de teste dentro da Roaming real (do usuário, como a de verdade), sem encostar no
+    /// `wintop\config.toml`: devolve (base, nome da pasta, caminho do arquivo).
+    fn temp(name: &str) -> (PathBuf, String, PathBuf) {
+        let base = roaming().expect("Roaming");
+        let dir = format!("wintop_test_{}_{name}", std::process::id());
+        let _ = std::fs::remove_dir_all(base.join(&dir));
+        let file = base.join(&dir).join(FILE);
+        (base, dir, file)
+    }
+
+    fn cleanup(base: &Path, dir: &str) {
+        let _ = std::fs::remove_dir_all(base.join(dir));
     }
 
     #[test]
     fn primeira_execucao_cria_com_os_padroes() {
-        let p = temp("novo");
-        let l = load(Some(p.clone()));
+        let (base, dir, p) = temp("novo");
+        // Só leitura (--check): não cria nada.
+        let l = load_in(Some(base.clone()), &dir, false);
+        assert!(l.warnings.is_empty() && !p.exists(), "{:?}", l.warnings);
+        let l = load_in(Some(base.clone()), &dir, true);
         assert!(l.warnings.is_empty(), "{:?}", l.warnings);
         assert_eq!(l.config, Config::default());
         let text = std::fs::read_to_string(&p).expect("arquivo criado");
@@ -347,20 +368,23 @@ mod tests {
             "{text}"
         );
         // O arquivo criado relido dá os mesmos valores.
-        assert_eq!(load(Some(p.clone())).config, Config::default());
-        let _ = std::fs::remove_dir_all(p.parent().expect("pasta"));
+        assert_eq!(
+            load_in(Some(base.clone()), &dir, true).config,
+            Config::default()
+        );
+        cleanup(&base, &dir);
     }
 
     #[test]
     fn gravar_preserva_comentarios_e_o_resto() {
-        let p = temp("grava");
+        let (base, dir, p) = temp("grava");
         std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
         std::fs::write(
             &p,
             "# meu comentário\ninterval_ms = 500\ntheme = \"nord\"\n\n[rtss]\nignored = [\"obs64.exe\"]\n\n[colors]\nborder = \"#112233\"\n",
         )
         .expect("escrita");
-        let mut l = load(Some(p.clone()));
+        let mut l = load_in(Some(base.clone()), &dir, true);
         assert_eq!(l.config.interval_ms, 500);
         assert_eq!(l.config.theme, "nord");
         assert_eq!(l.config.rtss_ignored, vec!["obs64.exe"]);
@@ -382,16 +406,16 @@ mod tests {
             text.contains("obs64.exe") && text.contains("#112233"),
             "{text}"
         );
-        let _ = std::fs::remove_dir_all(p.parent().expect("pasta"));
+        cleanup(&base, &dir);
     }
 
     #[test]
     fn arquivo_com_erro_abre_com_padroes_e_nao_e_regravado() {
-        let p = temp("erro");
+        let (base, dir, p) = temp("erro");
         std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
         let broken = "interval_ms = = 3\n";
         std::fs::write(&p, broken).expect("escrita");
-        let mut l = load(Some(p.clone()));
+        let mut l = load_in(Some(base.clone()), &dir, true);
         assert_eq!(l.config, Config::default());
         assert!(l.warnings[0].contains("syntax error"), "{:?}", l.warnings);
         assert!(l.save(&Config::default()).is_err());
@@ -400,7 +424,31 @@ mod tests {
             broken,
             "edição do usuário intacta"
         );
-        let _ = std::fs::remove_dir_all(p.parent().expect("pasta"));
+        cleanup(&base, &dir);
+    }
+
+    #[test]
+    fn rtss_que_nao_e_tabela_nao_derruba_a_gravacao() {
+        let (base, dir, p) = temp("rtss");
+        std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
+        std::fs::write(&p, "rtss = \"off\"\n").expect("escrita");
+        let mut l = load_in(Some(base.clone()), &dir, true);
+        assert!(
+            l.warnings
+                .iter()
+                .any(|w| w.contains("rtss must be a table")),
+            "{:?}",
+            l.warnings
+        );
+        let mut c = l.config.clone();
+        c.interval_ms = 700;
+        l.save(&c).expect("gravação sem pânico");
+        let text = std::fs::read_to_string(&p).expect("leitura");
+        assert!(
+            text.contains("rtss = \"off\"") && text.contains("interval_ms = 700"),
+            "{text}"
+        );
+        cleanup(&base, &dir);
     }
 
     #[test]

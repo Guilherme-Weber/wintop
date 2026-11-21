@@ -67,7 +67,8 @@ pub fn run() -> i32 {
         },
     );
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
-    let cfg = crate::config::load(crate::config::default_path());
+    // Só lê: o --check não cria nem grava o config.
+    let cfg = crate::config::load(crate::config::roaming(), false);
     let fps = RtssCollector::new(false, false)
         .with_ignored(cfg.config.rtss_ignored.clone())
         .sample();

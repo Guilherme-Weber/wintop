@@ -176,6 +176,20 @@ pub fn is_elevated() -> bool {
     ok && elev.TokenIsElevated != 0
 }
 
+/// Pasta conhecida do Windows (`FOLDERID_*`) pela API, não por variável de ambiente.
+pub fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    // SAFETY: GUID válido; a string devolvida é liberada com CoTaskMemFree.
+    unsafe {
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
+            .map_err(|e| format!("known folder: {e}"))?;
+        let s = p.to_string();
+        CoTaskMemFree(Some(p.0.cast()));
+        s.map(PathBuf::from).map_err(|e| e.to_string())
+    }
+}
+
 /// SID em texto (S-1-5-...), ou `None`.
 ///
 /// # Safety
@@ -215,16 +229,8 @@ pub fn user_sid() -> Option<String> {
     .ok()?;
     // SAFETY: GetTokenInformation preencheu um TOKEN_USER no início do buffer alinhado.
     let user = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read() };
-    let mut text = PWSTR::null();
-    // SAFETY: SID válido enquanto `buf` vive; o texto é liberado com LocalFree.
-    unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) }.ok()?;
-    // SAFETY: `text` aponta para uma string terminada em zero alocada pela API.
-    let s = unsafe { text.to_string() }.ok();
-    // SAFETY: liberado uma única vez.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
-    }
-    s
+    // SAFETY: SID válido enquanto `buf` vive.
+    unsafe { sid_string(user.User.Sid) }
 }
 
 /// `FILETIME` em unidades de 100 ns.

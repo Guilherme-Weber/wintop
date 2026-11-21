@@ -585,12 +585,30 @@ fn temp(m: &Metric<f64>) -> Span<'static> {
 // --- Layout ---
 
 pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
-    let [tabs, body, footer] = Layout::vertical([
+    // Aviso do config (arquivo com erro, gravação recusada): linhas próprias acima do rodapé,
+    // inteiras, sem disputar espaço com o estado das fontes.
+    let notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
+        wrap(
+            vec![Span::styled(
+                format!("! {}", printable(n)),
+                Style::new().fg(th().fail),
+            )],
+            frame.area().width,
+            1,
+            3,
+        )
+    });
+    let notice_h = (notice.len() as u16).min(frame.area().height.saturating_sub(10));
+    let [tabs, body, notice_area, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(8),
+        Constraint::Length(notice_h),
         Constraint::Length(1),
     ])
     .areas(frame.area());
+    if notice_h > 0 {
+        frame.render_widget(Paragraph::new(notice), notice_area);
+    }
     draw_tabs(frame, tabs, st);
     draw_footer(frame, footer, st);
     match st.tab {
@@ -726,15 +744,6 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         ]);
     }
     let failing = failing_sources(st);
-    if let Some(n) = &st.notice {
-        if !right.is_empty() {
-            right.push(bar_sep());
-        }
-        right.push(Span::styled(
-            format!("! {}", printable(n)),
-            Style::new().fg(th().fail),
-        ));
-    }
     if !right.is_empty() {
         right.push(bar_sep());
     }
@@ -750,11 +759,20 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let right = Line::from(right);
     let rw = (right.width() as u16).min(area.width);
     let room = usize::from(area.width.saturating_sub(rw).saturating_sub(2));
-    // Prioridade na falta de espaço: abas, sair, intervalo, e então os atalhos da aba; a ordem
+    // Prioridade na falta de espaço: abas, sair, os atalhos da aba e por último o intervalo
+    // (que já aparece no topo); digitando o filtro, os atalhos dele vêm antes de tudo. A ordem
     // na tela continua a natural.
     let n = groups.len();
-    let mut priority: Vec<usize> = vec![0, n - 1, n - 2];
-    priority.extend(1..n - 2);
+    let mut priority: Vec<usize> = if st.filtering {
+        (1..n - 2).chain([0, n - 1, n - 2]).collect()
+    } else {
+        [0, n - 1]
+            .into_iter()
+            .chain(1..n - 2)
+            .chain([n - 2])
+            .collect()
+    };
+    priority.dedup();
     let mut keep = vec![false; n];
     let mut used = 0;
     for i in priority {
