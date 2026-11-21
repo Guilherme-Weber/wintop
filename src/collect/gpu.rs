@@ -55,12 +55,8 @@ fn dxgi_adapters() -> Result<Vec<Adapter>, String> {
 }
 
 /// Adaptador DXGI da GPU do NVML (`pci_device_id` = dispositivo << 16 | fabricante). Vários
-/// adaptadores iguais (mesmo modelo e placa) não têm como ser distinguidos: erro.
-fn match_adapter(
-    adapters: &[Adapter],
-    pci_device_id: u32,
-    subsys: Option<u32>,
-) -> Result<Adapter, String> {
+/// adaptadores iguais (mesmo modelo e placa) não têm como ser distinguidos: estado neutro.
+fn match_adapter(adapters: &[Adapter], pci_device_id: u32, subsys: Option<u32>) -> Metric<Adapter> {
     let (vendor, device) = (pci_device_id & 0xFFFF, pci_device_id >> 16);
     let found: Vec<&Adapter> = adapters
         .iter()
@@ -69,11 +65,13 @@ fn match_adapter(
         })
         .collect();
     let mut luids: Vec<(i32, u32)> = found.iter().map(|a| (a.luid_high, a.luid_low)).collect();
+    luids.sort_unstable();
     luids.dedup();
     match (found.first(), luids.len()) {
         (Some(a), 1) => Ok(**a),
-        (None, _) => Err("NVML GPU not found in DXGI".into()),
-        _ => Err("several identical GPUs: NVML-DXGI matching pending".into()),
+        (None, _) => fail("NVML GPU not found in DXGI"),
+        // Estado neutro do inventário: sem como distinguir placas idênticas.
+        _ => neutral("several identical GPUs: NVML-DXGI matching pending"),
     }
 }
 
@@ -142,7 +140,7 @@ struct Static {
     vbios: Metric<String>,
     total: Metric<u64>,
     /// Prefixo PDH e limite da memória compartilhada, ou o motivo da falha da associação.
-    adapter: Result<(String, u64), String>,
+    adapter: Metric<(String, u64)>,
 }
 
 pub struct GpuCollector {
@@ -174,8 +172,8 @@ impl GpuCollector {
                     .map(|(index, d)| {
                         let pci = d.pci_info();
                         let adapter = match (&adapters, pci) {
-                            (Err(e), _) => Err(e.clone()),
-                            (_, Err(e)) => Err(format!("NVML pci_info: {e}")),
+                            (Err(e), _) => fail(e.clone()),
+                            (_, Err(e)) => fail(format!("NVML pci_info: {e}")),
                             (Ok(a), Ok(p)) => {
                                 match_adapter(a, p.pci_device_id, p.pci_sub_system_id)
                                     .map(|a| (luid_prefix(a.luid_high, a.luid_low), a.shared_total))
@@ -212,7 +210,11 @@ impl GpuCollector {
             Ok(q) => q.collect(),
             Err(e) => Err(e.clone()),
         };
-        let arr = |slot: &Slot| sampled.clone().and_then(|()| pdh::read_array(slot));
+        let arr = |slot: &Slot| {
+            sampled
+                .clone()
+                .and_then(|()| pdh::read_array(&self.query, slot))
+        };
         let dedicated = arr(&self.dedicated);
         let shared = arr(&self.shared);
         let out = self
@@ -220,7 +222,7 @@ impl GpuCollector {
             .iter()
             .map(|s| {
                 let vram = |items: &Result<Vec<(String, f64)>, String>| -> Metric<u64> {
-                    let (prefix, _) = s.adapter.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
+                    let (prefix, _) = s.adapter.as_ref().map_err(Clone::clone)?;
                     let items = items.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
                     sum_for(items, prefix)
                         .map(|v| v as u64)
@@ -375,7 +377,17 @@ mod tests {
         assert_eq!(a.luid_low, 0xDBF2);
         assert!(match_adapter(&list, (0x9999 << 16) | 0x10DE, None).is_err());
         let twins = [adapter(0x2C05, 1, 1), adapter(0x2C05, 1, 2)];
-        assert!(match_adapter(&twins, (0x2C05 << 16) | 0x10DE, Some(1)).is_err());
+        assert!(matches!(
+            match_adapter(&twins, (0x2C05 << 16) | 0x10DE, Some(1)),
+            Err(Missing::Neutral(_))
+        ));
+        // Mesmo LUID repetido (fora de ordem) continua sendo um adaptador só.
+        let dup = [
+            adapter(0x2C05, 1, 7),
+            adapter(0x2C05, 1, 8),
+            adapter(0x2C05, 1, 7),
+        ];
+        assert!(match_adapter(&dup, (0x2C05 << 16) | 0x10DE, None).is_err());
     }
 
     #[test]

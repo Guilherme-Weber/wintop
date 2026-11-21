@@ -119,7 +119,7 @@ impl fmt::Display for Bus {
             Self::Sas => f.write_str("SAS"),
             Self::Raid => f.write_str("RAID"),
             Self::Virtual => f.write_str("Virtual"),
-            Self::Other(n) => write!(f, "barramento {n}"),
+            Self::Other(n) => write!(f, "bus {n}"),
         }
     }
 }

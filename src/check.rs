@@ -118,7 +118,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     Report::section("Memory");
     match &f.memory {
-        Err(e) => r.line("coletor", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(m) => {
             let used_total = m.used.clone().and_then(|u| Ok((u, m.total.clone()?)));
             r.line("In use / total", &used_total, |(u, t)| {
@@ -141,7 +141,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     Report::section("Disks");
     match &f.disks {
-        Err(e) => r.line("coletor", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for d in list {
                 let mut tags = d.letters.join(" ");
@@ -171,7 +171,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     Report::section("Network");
     match &f.nics {
-        Err(e) => r.line("coletor", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for n in list {
                 println!("  {} ({})", n.alias, n.description);
@@ -184,7 +184,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     Report::section("GPU");
     match &f.gpus {
-        Err(e) => r.line("coletor", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for g in list {
                 println!("  GPU {}", g.index);

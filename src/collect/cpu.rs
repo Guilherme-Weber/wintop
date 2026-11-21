@@ -72,12 +72,12 @@ impl CpuCollector {
             if let Err(e) = &sampled {
                 return fail(e.clone());
             }
-            pdh::read(slot).or_else(fail)
+            pdh::read(&self.query, slot).or_else(fail)
         };
         let usage = pdh_val(&self.total).map(|v| v.clamp(0.0, 100.0));
         let per_logical = match &sampled {
             Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array(&self.per)
+            Ok(()) => pdh::read_array(&self.query, &self.per)
                 .or_else(fail)
                 .and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok)),
         };

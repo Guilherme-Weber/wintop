@@ -4,6 +4,8 @@
 //! os nomes localizados mudam com o idioma. Contadores de taxa só têm valor a partir da segunda
 //! coleta (a primeira devolve "dado inválido").
 
+use std::cell::RefCell;
+
 use windows::Win32::System::Performance::{
     PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER,
     PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_NO_OBJECT, PDH_CSTATUS_VALID_DATA, PDH_FMT,
@@ -39,26 +41,31 @@ fn check(code: u32) -> Result<(), String> {
     }
 }
 
-/// Consulta PDH. Não é `Sync`: cada thread de coleta tem as suas.
-pub struct Query(PDH_HQUERY);
+/// Consulta PDH com os seus contadores. Os handles dos contadores ficam só aqui dentro (o
+/// `PdhCloseQuery` do `Drop` os libera), então nenhum sobrevive à consulta. Não é `Sync`
+/// (`RefCell`): cada thread de coleta tem as suas.
+pub struct Query {
+    handle: PDH_HQUERY,
+    counters: RefCell<Vec<PDH_HCOUNTER>>,
+}
 
-// SAFETY: o handle de consulta pode ser usado de outra thread, desde que não simultaneamente
-// (garantido por `&mut`/posse exclusiva).
+// SAFETY: os handles do PDH podem ser usados de outra thread, desde que não simultaneamente; a
+// consulta não é `Sync`, então só uma thread a usa por vez.
 unsafe impl Send for Query {}
 
-/// Contador de uma consulta (válido enquanto a consulta existir).
-#[derive(Clone, Copy)]
-pub struct Counter(PDH_HCOUNTER);
-
-// SAFETY: ver `Query`.
-unsafe impl Send for Counter {}
+/// Índice de um contador dentro da sua `Query`.
+#[derive(Clone, Copy, Debug)]
+pub struct Counter(usize);
 
 impl Query {
     pub fn open() -> Result<Self, String> {
         let mut h = PDH_HQUERY::default();
         // SAFETY: fonte nula = dados ao vivo; `h` recebe o handle.
         check(unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut h) })?;
-        Ok(Self(h))
+        Ok(Self {
+            handle: h,
+            counters: RefCell::new(Vec::new()),
+        })
     }
 
     /// Adiciona um contador pelo caminho em inglês (ex.: `\Memory\Modified Page List Bytes`).
@@ -66,42 +73,53 @@ impl Query {
         let w = wide(path);
         let mut c = PDH_HCOUNTER::default();
         // SAFETY: consulta aberta; caminho terminado em zero; `c` recebe o handle.
-        check(unsafe { PdhAddEnglishCounterW(self.0, PCWSTR(w.as_ptr()), 0, &raw mut c) })
+        check(unsafe { PdhAddEnglishCounterW(self.handle, PCWSTR(w.as_ptr()), 0, &raw mut c) })
             .map_err(|e| format!("{e} ({path})"))?;
-        Ok(Counter(c))
+        let mut list = self.counters.borrow_mut();
+        list.push(c);
+        Ok(Counter(list.len() - 1))
+    }
+
+    fn counter(&self, c: Counter) -> Result<PDH_HCOUNTER, String> {
+        self.counters
+            .borrow()
+            .get(c.0)
+            .copied()
+            .ok_or_else(|| "PDH counter from another query".into())
     }
 
     pub fn collect(&self) -> Result<(), String> {
         // SAFETY: consulta aberta.
-        check(unsafe { PdhCollectQueryData(self.0) })
+        check(unsafe { PdhCollectQueryData(self.handle) })
     }
 }
 
 impl Drop for Query {
     fn drop(&mut self) {
         // SAFETY: handle aberto em `open`; fecha também os contadores.
-        unsafe { PdhCloseQuery(self.0) };
+        unsafe { PdhCloseQuery(self.handle) };
     }
 }
 
-impl Counter {
+impl Query {
     /// Valor de um contador de instância única.
-    pub fn value(self) -> Result<f64, String> {
+    pub fn value(&self, c: Counter) -> Result<f64, String> {
+        let h = self.counter(c)?;
         let mut v = PDH_FMT_COUNTERVALUE::default();
         // SAFETY: contador de uma consulta aberta; `v` local.
-        check(unsafe { PdhGetFormattedCounterValue(self.0, FMT, None, &raw mut v) })?;
+        check(unsafe { PdhGetFormattedCounterValue(h, FMT, None, &raw mut v) })?;
         valid(&v)
     }
 
     /// Valores de um contador com curinga (`(*)`): `(instância, valor)`, na ordem do PDH.
     /// Instâncias sem dado válido nesta coleta ficam de fora.
-    pub fn array(self) -> Result<Vec<(String, f64)>, String> {
+    pub fn array(&self, c: Counter) -> Result<Vec<(String, f64)>, String> {
+        let h = self.counter(c)?;
         let mut size = 0u32;
         let mut count = 0u32;
         // SAFETY: primeira chamada só mede o buffer.
-        let r = unsafe {
-            PdhGetFormattedCounterArrayW(self.0, FMT, &raw mut size, &raw mut count, None)
-        };
+        let r =
+            unsafe { PdhGetFormattedCounterArrayW(h, FMT, &raw mut size, &raw mut count, None) };
         if r != PDH_MORE_DATA {
             check(r)?;
             return Ok(Vec::new());
@@ -111,7 +129,7 @@ impl Counter {
         let items = buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         // SAFETY: buffer de `size` bytes, alinhado.
         check(unsafe {
-            PdhGetFormattedCounterArrayW(self.0, FMT, &raw mut size, &raw mut count, Some(items))
+            PdhGetFormattedCounterArrayW(h, FMT, &raw mut size, &raw mut count, Some(items))
         })?;
         let fits = buf.len() * 8 / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         let mut out = Vec::with_capacity(count as usize);
@@ -145,13 +163,13 @@ fn valid(v: &PDH_FMT_COUNTERVALUE) -> Result<f64, String> {
 pub type Slot = Result<Counter, String>;
 
 /// Lê um contador simples guardado em `Slot`.
-pub fn read(slot: &Slot) -> Result<f64, String> {
-    slot.clone().and_then(Counter::value)
+pub fn read(q: &Result<Query, String>, slot: &Slot) -> Result<f64, String> {
+    q.as_ref().map_err(Clone::clone)?.value(slot.clone()?)
 }
 
 /// Lê um contador com curinga guardado em `Slot`.
-pub fn read_array(slot: &Slot) -> Result<Vec<(String, f64)>, String> {
-    slot.clone().and_then(Counter::array)
+pub fn read_array(q: &Result<Query, String>, slot: &Slot) -> Result<Vec<(String, f64)>, String> {
+    q.as_ref().map_err(Clone::clone)?.array(slot.clone()?)
 }
 
 #[cfg(test)]
@@ -160,17 +178,21 @@ mod tests {
 
     #[test]
     fn contador_ingles_e_curinga() {
-        let q = Query::open().expect("abrir consulta");
-        let total = q.add(r"\Processor Information(_Total)\% Processor Utility");
-        let per = q.add(r"\Processor Information(*)\% Processor Utility");
-        let bad = q.add(r"\Objeto Inexistente\Contador");
+        let q = Query::open();
+        let qq = q.as_ref().expect("abrir consulta");
+        let total = qq.add(r"\Processor Information(_Total)\% Processor Utility");
+        let per = qq.add(r"\Processor Information(*)\% Processor Utility");
+        let bad = qq.add(r"\Objeto Inexistente\Contador");
         assert!(bad.is_err());
-        q.collect().expect("1ª coleta");
+        qq.collect().expect("1ª coleta");
         std::thread::sleep(std::time::Duration::from_millis(200));
-        q.collect().expect("2ª coleta");
-        let v = read(&total).expect("valor total");
+        qq.collect().expect("2ª coleta");
+        let v = read(&q, &total).expect("valor total");
         assert!(v >= 0.0, "{v}");
-        let a = read_array(&per).expect("valores por processador");
+        // Contador de outra consulta: erro, nunca um handle inválido.
+        let other = Query::open().expect("outra consulta");
+        assert!(other.value(total.expect("contador")).is_err());
+        let a = read_array(&q, &per).expect("valores por processador");
         assert!(a.iter().any(|(n, _)| n == "_Total"), "{a:?}");
     }
 }

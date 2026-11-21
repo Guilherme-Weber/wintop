@@ -41,7 +41,7 @@ pub unsafe fn own(h: HANDLE) -> OwnedHandle {
 pub fn harden_dll_search() {
     // SAFETY: sem pré-condições; afeta só as cargas seguintes deste processo.
     if let Err(e) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } {
-        eprintln!("aviso: SetDefaultDllDirectories: {e}");
+        eprintln!("warning: SetDefaultDllDirectories: {e}");
     }
 }
 

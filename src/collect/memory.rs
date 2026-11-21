@@ -44,7 +44,7 @@ impl MemoryCollector {
         let pdh_val = |slot: &Slot| -> Metric<f64> {
             match &sampled {
                 Err(e) => fail(e.clone()),
-                Ok(()) => pdh::read(slot).or_else(fail),
+                Ok(()) => pdh::read(&self.query, slot).or_else(fail),
             }
         };
 

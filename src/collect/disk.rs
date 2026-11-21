@@ -439,8 +439,9 @@ impl DiskCollector {
     /// Discos novos entram, discos que sumiram saem; letras relidas.
     fn rediscover(&mut self) {
         self.discovered = Instant::now();
-        self.disks
-            .retain(|d| !d.lost || Handle::open(d.number, 0).is_some());
+        // Disco perdido sai; se o número voltar a existir, é redescoberto do zero (handle e
+        // metadados novos: pode ser outro disco).
+        self.disks.retain(|d| !d.lost);
         for n in 0..64 {
             if !self.disks.iter().any(|d| d.number == n)
                 && let Some(inv) = Inventory::discover(n)
@@ -572,7 +573,8 @@ mod tests {
             .find(|(_, l)| l.starts_with(c))
             .expect("disco do sistema")
             .0;
-        let q = Query::open().expect("PDH");
+        let qr = Query::open();
+        let q = qr.as_ref().expect("PDH");
         let names = [
             "% Idle Time",
             "Disk Read Bytes/sec",
@@ -601,7 +603,7 @@ mod tests {
             let pdh: Vec<f64> = slots
                 .iter()
                 .map(|s| {
-                    read_array(s)
+                    read_array(&qr, s)
                         .expect("PDH")
                         .into_iter()
                         .find(|(name, _)| name.split_whitespace().next() == Some(&n.to_string()))
