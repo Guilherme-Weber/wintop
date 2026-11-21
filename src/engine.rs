@@ -36,12 +36,10 @@ struct State {
     fast: Option<Fast>,
     slow: Option<Slow>,
     fps: Option<Fps>,
-    /// Incrementado a cada publicação da thread do RTSS.
-    fps_seq: u64,
-    /// Incrementado a cada publicação (quem exibe sabe se há dado novo).
-    generation: u64,
-    /// Incrementado só pela thread rápida.
+    /// Números de publicação de cada thread (quem exibe sabe o que mudou).
     fast_seq: u64,
+    slow_seq: u64,
+    fps_seq: u64,
     stop: bool,
 }
 
@@ -91,6 +89,22 @@ impl Shared {
     }
 }
 
+/// Últimas publicações já vistas por quem exibe.
+#[derive(Default)]
+pub struct Seen {
+    fast: u64,
+    slow: u64,
+    fps: u64,
+}
+
+/// Dados novos desde a última consulta.
+#[derive(Default)]
+pub struct Updates {
+    pub fast: Option<Fast>,
+    pub slow: Option<Slow>,
+    pub fps: Option<Fps>,
+}
+
 pub struct Engine {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -109,22 +123,23 @@ impl Engine {
             std::thread::Builder::new()
                 .name("coleta-rapida".into())
                 .spawn(move || {
-                    let mut c = FastCollectors::new();
-                    let mut next = Instant::now();
-                    loop {
-                        let snap = c.collect();
-                        {
-                            let mut st = sh.lock();
-                            st.fast = Some(snap);
-                            st.fast_seq += 1;
-                            st.generation += 1;
+                    // Cada coletor já roda sob catch_unwind; este cobre o resto da thread.
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        let mut c = FastCollectors::new();
+                        let mut next = Instant::now();
+                        loop {
+                            let snap = c.collect();
+                            {
+                                let mut st = sh.lock();
+                                st.fast = Some(snap);
+                                st.fast_seq += 1;
+                            }
+                            match sh.wait_tick(next, 1) {
+                                Some(t) => next = t,
+                                None => break,
+                            }
                         }
-                        sh.wake.notify_all();
-                        match sh.wait_tick(next, 1) {
-                            Some(t) => next = t,
-                            None => break,
-                        }
-                    }
+                    }));
                 })
                 .expect("criar a thread de coleta rápida")
         };
@@ -150,21 +165,22 @@ impl Engine {
             std::thread::Builder::new()
                 .name("coleta-lenta".into())
                 .spawn(move || {
-                    let mut c = SlowCollectors::new();
-                    let mut next = Instant::now();
-                    loop {
-                        let snap = c.collect();
-                        {
-                            let mut st = sh.lock();
-                            st.slow = Some(snap);
-                            st.generation += 1;
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        let mut c = SlowCollectors::new();
+                        let mut next = Instant::now();
+                        loop {
+                            let snap = c.collect();
+                            {
+                                let mut st = sh.lock();
+                                st.slow = Some(snap);
+                                st.slow_seq += 1;
+                            }
+                            match sh.wait_tick(next, SLOW_FACTOR) {
+                                Some(t) => next = t,
+                                None => break,
+                            }
                         }
-                        sh.wake.notify_all();
-                        match sh.wait_tick(next, SLOW_FACTOR) {
-                            Some(t) => next = t,
-                            None => break,
-                        }
-                    }
+                    }));
                 })
                 .expect("criar a thread de coleta lenta")
         };
@@ -175,22 +191,36 @@ impl Engine {
         }
     }
 
-    /// Últimos resultados e o número da coleta rápida (para saber se ela mudou).
+    /// Últimos resultados e o número da coleta rápida (testes).
+    #[cfg(test)]
     pub fn latest(&self) -> (Option<Fast>, Option<Slow>, u64) {
         let st = self.shared.lock();
         (st.fast.clone(), st.slow.clone(), st.fast_seq)
+    }
+
+    /// O que mudou desde `seen` (e atualiza `seen`). Só clona o que é novo.
+    pub fn updates(&self, seen: &mut Seen) -> Updates {
+        let st = self.shared.lock();
+        let mut u = Updates::default();
+        if st.fast_seq != seen.fast {
+            seen.fast = st.fast_seq;
+            u.fast.clone_from(&st.fast);
+        }
+        if st.slow_seq != seen.slow {
+            seen.slow = st.slow_seq;
+            u.slow.clone_from(&st.slow);
+        }
+        if st.fps_seq != seen.fps {
+            seen.fps = st.fps_seq;
+            u.fps.clone_from(&st.fps);
+        }
+        u
     }
 
     /// Último estado do RTSS e do jogo.
     #[cfg(test)]
     pub fn fps(&self) -> Option<Fps> {
         self.shared.lock().fps.clone()
-    }
-
-    /// Último estado do RTSS e o número da publicação (para saber se mudou).
-    pub fn fps_seq(&self) -> (Option<Fps>, u64) {
-        let st = self.shared.lock();
-        (st.fps.clone(), st.fps_seq)
     }
 
     pub fn interval_ms(&self) -> u64 {
@@ -228,13 +258,9 @@ impl Drop for Engine {
 /// publica a falha (a interface não fica parada no último valor) e encerra a thread.
 fn rtss_thread(sh: &Shared, stop: HANDLE) {
     let publish = |snap: Fps| {
-        {
-            let mut st = sh.lock();
-            st.fps = Some(snap);
-            st.fps_seq += 1;
-            st.generation += 1;
-        }
-        sh.wake.notify_all();
+        let mut st = sh.lock();
+        st.fps = Some(snap);
+        st.fps_seq += 1;
     };
     let Ok(mut c) = catch_unwind(|| RtssCollector::new(true, true)) else {
         publish(rtss::failed("RTSS collector panicked on startup"));

@@ -123,7 +123,10 @@ impl Widget for Meter {
             } else {
                 Style::new().fg(DIM)
             };
-            buf.set_string(area.x + i as u16, area.y, "■", style);
+            // Só dentro do buffer (área parcialmente fora da tela num terminal pequeno).
+            if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
+                cell.set_symbol("■").set_style(style);
+            }
         }
     }
 }

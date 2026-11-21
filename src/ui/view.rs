@@ -232,7 +232,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         Paragraph::new(Line::from(vec![metric(&c.usage, |v| {
             format!("{}%", num(*v, 0))
         })])),
-        Rect::new(graph.x, graph.y, 6, 1),
+        Rect::new(graph.x, graph.y, 6, 1).intersection(graph),
     );
 
     if let Some(per) = per {
@@ -250,9 +250,12 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     label(&format!("C{i:<2}")),
                     Span::styled(format!("{:>4}%", num(*v, 0)), Style::new().fg(TEXT)),
                 ])),
-                Rect::new(x, y, 9, 1),
+                Rect::new(x, y, 9, 1).intersection(cores),
             );
-            frame.render_widget(Meter { value: v / 100.0 }, Rect::new(x + 10, y, 6, 1));
+            frame.render_widget(
+                Meter { value: v / 100.0 },
+                Rect::new(x + 10, y, 6, 1).intersection(cores),
+            );
         }
     }
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
@@ -348,7 +351,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     frame.render_widget(
         Paragraph::new(metric(&g.usage, |v| format!("{v}%"))),
-        Rect::new(graph.x, graph.y, 6, 1),
+        Rect::new(graph.x, graph.y, 6, 1).intersection(graph),
     );
     bar_line(frame, bars, 0, "VRAM  ", &g.dedicated);
     bar_line(frame, bars, 1, "shared", &g.shared);
@@ -445,16 +448,19 @@ fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<
     let label_w = name.len() as u16 + 1;
     frame.render_widget(
         Paragraph::new(label(name)),
-        Rect::new(area.x, y, label_w, 1),
+        Rect::new(area.x, y, label_w, 1).intersection(area),
     );
     let bar_w = area.width.saturating_sub(label_w + text_w);
     if let Ok((u, t)) = m {
         let v = if *t > 0 { *u as f64 / *t as f64 } else { 0.0 };
-        frame.render_widget(Meter { value: v }, Rect::new(area.x + label_w, y, bar_w, 1));
+        frame.render_widget(
+            Meter { value: v },
+            Rect::new(area.x + label_w, y, bar_w, 1).intersection(area),
+        );
     }
     frame.render_widget(
         Paragraph::new(text),
-        Rect::new(area.x + label_w + bar_w, y, text_w, 1),
+        Rect::new(area.x + label_w + bar_w, y, text_w, 1).intersection(area),
     );
 }
 
@@ -495,7 +501,8 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         inner.y + 3,
         inner.width,
         inner.height.saturating_sub(3),
-    );
+    )
+    .intersection(inner);
     frame.render_widget(Paragraph::new(lines), rest);
 }
 
@@ -551,7 +558,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 truncate(&name, usize::from(name_w)),
                 Style::new().fg(if member { LABEL } else { TEXT }),
             )),
-            Rect::new(inner.x, text_y, name_w, 1),
+            Rect::new(inner.x, text_y, name_w, 1).intersection(inner),
         );
         let graph_w = inner.width.saturating_sub(NAME_W + INFO_W + 1);
         if graph_w > 0
@@ -562,7 +569,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     samples: s.values(),
                     color: None,
                 },
-                Rect::new(inner.x + NAME_W, y, graph_w, rows),
+                Rect::new(inner.x + NAME_W, y, graph_w, rows).intersection(inner),
             );
         }
         let t = temps
@@ -587,7 +594,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         let x = inner.x + inner.width.saturating_sub(INFO_W);
         frame.render_widget(
             Paragraph::new(info),
-            Rect::new(x, text_y, INFO_W.min(inner.width), 1),
+            Rect::new(x, text_y, INFO_W.min(inner.width), 1).intersection(inner),
         );
     }
 }
@@ -636,10 +643,13 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             truncate(&n.alias, usize::from(NAME_W) - 1),
             Style::new().fg(TEXT),
         )]);
-        frame.render_widget(Paragraph::new(head), Rect::new(inner.x, y, NAME_W, 1));
+        frame.render_widget(
+            Paragraph::new(head),
+            Rect::new(inner.x, y, NAME_W, 1).intersection(inner),
+        );
         frame.render_widget(
             Paragraph::new(metric(&n.link, |v| bits(*v as f64))),
-            Rect::new(inner.x, y + 1, NAME_W, 1),
+            Rect::new(inner.x, y + 1, NAME_W, 1).intersection(inner),
         );
         let graph_w = inner.width.saturating_sub(NAME_W + RATE_W);
         for (k, (series, m, color, arrow)) in [
@@ -663,7 +673,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                         samples: &scaled,
                         color: Some(color),
                     },
-                    Rect::new(inner.x + NAME_W, row, graph_w, h),
+                    Rect::new(inner.x + NAME_W, row, graph_w, h).intersection(inner),
                 );
             }
             frame.render_widget(
@@ -671,7 +681,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     Span::styled(format!(" {arrow} "), Style::new().fg(color)),
                     metric(m, |v| bits(*v)),
                 ])),
-                Rect::new(inner.x + NAME_W + graph_w, row, RATE_W, 1),
+                Rect::new(inner.x + NAME_W + graph_w, row, RATE_W, 1).intersection(inner),
             );
         }
         y += half * 2;
@@ -683,7 +693,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 label("disconnected: "),
                 Span::styled(names.join(", "), Style::new().fg(NEUTRAL)),
             ])),
-            Rect::new(inner.x, y, inner.width, 1),
+            Rect::new(inner.x, y, inner.width, 1).intersection(inner),
         );
     }
 }

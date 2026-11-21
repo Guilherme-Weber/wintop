@@ -244,10 +244,58 @@ fn falhas_e_estados_neutros() {
     insta::assert_snapshot!(render(&mut st, 140, 40));
 }
 
+/// As bordas de cada caixa ficam intactas: nada desenhado por cima delas.
+fn bordas_intactas(st: &mut State, w: u16, h: u16) {
+    let mut t = Terminal::new(TestBackend::new(w, h)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, st)).expect("desenho");
+    let buf = t.backend().buffer();
+    for y in 0..h {
+        for x in 0..w {
+            let s = buf[(x, y)].symbol();
+            // Cantos só aparecem em cantos: se um texto sobrescrevesse uma borda, sobraria
+            // borda vertical sem o par do outro lado; aqui basta não haver lixo de controle.
+            assert!(!s.chars().any(char::is_control), "({x},{y}) {s:?}");
+        }
+    }
+}
+
+#[test]
+fn larguras_estreitas_sem_vazamento() {
+    let mut st = filled();
+    // A borda direita da caixa da CPU (largura 58% de 60 = 34) continua sendo borda.
+    let mut t = Terminal::new(TestBackend::new(60, 24)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let buf = t.backend().buffer();
+    let cpu_right = (0..60u16)
+        .find(|&x| buf[(x, 0)].symbol() == "╮")
+        .expect("canto da caixa da CPU");
+    let bottom = (1..24u16)
+        .find(|&y| buf[(cpu_right, y)].symbol() == "╯")
+        .expect("canto inferior da caixa da CPU");
+    for y in 1..bottom {
+        assert_eq!(buf[(cpu_right, y)].symbol(), "│", "linha {y}");
+    }
+    bordas_intactas(&mut st, 60, 24);
+}
+
 #[test]
 fn terminal_minusculo_nao_quebra() {
     let mut st = filled();
-    for (w, h) in [(1, 1), (10, 3), (30, 8), (200, 5)] {
+    // Inclui larguras em que a grade de lógicos, as barras e a rede não cabem (achado da
+    // revisão: escrita fora do buffer e por cima das caixas vizinhas).
+    for (w, h) in [
+        (1, 1),
+        (10, 3),
+        (30, 8),
+        (200, 5),
+        (30, 20),
+        (40, 20),
+        (45, 30),
+        (60, 24),
+        (68, 30),
+        (79, 40),
+        (300, 100),
+    ] {
         let _ = render(&mut st, w, h);
     }
 }
