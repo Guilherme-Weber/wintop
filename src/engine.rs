@@ -13,13 +13,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::collect::{FastCollectors, SlowCollectors};
-use crate::model::{Fast, Slow};
+use crate::collect::{FastCollectors, RtssCollector, SlowCollectors};
+use crate::model::{Fast, Fps, Slow};
 
 pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 pub const MIN_INTERVAL_MS: u64 = 100;
 pub const MAX_INTERVAL_MS: u64 = 10_000;
 pub const STEP_MS: u64 = 100;
+const RTSS_GAME_PERIOD: Duration = Duration::from_millis(250);
+const RTSS_IDLE_PERIOD: Duration = Duration::from_secs(1);
 /// A thread lenta roda a cada 2 intervalos.
 const SLOW_FACTOR: u32 = 2;
 
@@ -27,6 +29,7 @@ const SLOW_FACTOR: u32 = 2;
 struct State {
     fast: Option<Fast>,
     slow: Option<Slow>,
+    fps: Option<Fps>,
     /// Incrementado a cada publicação (quem exibe sabe se há dado novo).
     generation: u64,
     /// Incrementado só pela thread rápida.
@@ -108,6 +111,39 @@ impl Engine {
                 })
                 .expect("criar a thread de coleta rápida")
         };
+        let rtss = {
+            let sh = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("rtss".into())
+                .spawn(move || {
+                    let mut c = RtssCollector::new(true, true);
+                    loop {
+                        let snap =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.sample()));
+                        // Com jogo, 250 ms (fallback da Shared Memory); sem jogo, 1 s.
+                        let period = match &snap {
+                            Ok(f) if f.game.is_ok() => RTSS_GAME_PERIOD,
+                            _ => RTSS_IDLE_PERIOD,
+                        };
+                        let Ok(snap) = snap else { break };
+                        {
+                            let mut st = sh.lock();
+                            if st.stop {
+                                break;
+                            }
+                            st.fps = Some(snap);
+                            st.generation += 1;
+                        }
+                        sh.wake.notify_all();
+                        // O pipe é atendido durante a espera; a parada é vista a cada período.
+                        c.pump(Instant::now() + period);
+                        if sh.lock().stop {
+                            break;
+                        }
+                    }
+                })
+                .expect("criar a thread do RTSS")
+        };
         let slow = {
             let sh = Arc::clone(&shared);
             std::thread::Builder::new()
@@ -133,7 +169,7 @@ impl Engine {
         };
         Self {
             shared,
-            threads: vec![fast, slow],
+            threads: vec![fast, slow, rtss],
         }
     }
 
@@ -141,6 +177,11 @@ impl Engine {
     pub fn latest(&self) -> (Option<Fast>, Option<Slow>, u64) {
         let st = self.shared.lock();
         (st.fast.clone(), st.slow.clone(), st.fast_seq)
+    }
+
+    /// Último estado do RTSS e do jogo.
+    pub fn fps(&self) -> Option<Fps> {
+        self.shared.lock().fps.clone()
     }
 
     /// Espera uma geração maior que `seen` (ou o tempo acabar). Devolve a geração atual.

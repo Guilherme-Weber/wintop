@@ -116,14 +116,14 @@ aberto antes do wintop)"** até o jogo reiniciar.
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Jogo (nome, PID) | `RTSSSharedMemoryV2`: entrada ativa (período de FPS < 2 s) + API 3D + fora da lista de ignorados; primeiro plano desempata | | "nenhum jogo 3D em foco" | Spike (Deadlock; Spotify ignorado) |
+| Jogo (nome, PID) | `RTSSSharedMemoryV2`: entrada ativa (período de FPS < 2 s) + API 3D + fora da lista de ignorados; primeiro plano desempata | | "nenhum jogo 3D em foco" | E3 (sem jogo: "no 3D game in focus"; pipe com jogo: pendente) |
 | API 3D | `dwFlags & 0xFFFF` | | | Spike |
 | Resolução | `dwResolutionX/Y` (v2.20+) | | | Spike |
 | FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (pipe e SHM) |
 | Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)" | Spike (pipe: 7435 frames do Deadlock) |
-| 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | cálculo testado; janela de 60 s: E3 |
+| 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s) |
 | Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
-| RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 |
+| RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 (só no modo normal; o `--check` não inicia o RTSS nem cria o pipe) |
 
 ## Processos (aba)
 

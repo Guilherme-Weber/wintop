@@ -11,6 +11,7 @@ mod fmt;
 mod instance;
 mod model;
 mod pdh;
+mod shm;
 mod win;
 
 use std::time::Duration;
@@ -90,8 +91,20 @@ fn summary_loop() {
             .and_then(|s| s.gpus.ok())
             .and_then(|g| g.into_iter().next())
             .and_then(|g| g.pcie_rx.ok());
+        let fps = engine.fps().map_or_else(
+            || "--".to_string(),
+            |s| match s.game {
+                Ok(g) => format!(
+                    "{} {}{}",
+                    g.name,
+                    g.fps.map_or("--".into(), |v| fmt::num(v, 0)),
+                    if g.approx { " (approx.)" } else { "" }
+                ),
+                Err(e) => e.to_string(),
+            },
+        );
         println!(
-            "CPU {:>6}  RAM {:>9}  GPU {:>4}  PCIe RX {:>10}  collection {:.1} ms",
+            "CPU {:>6}  RAM {:>9}  GPU {:>4}  PCIe RX {:>10}  collection {:.1} ms  FPS {fps}",
             cpu.map_or("--".into(), fmt::pct),
             ram.map_or("--".into(), fmt::bytes),
             gpu.map_or("--".into(), |v| format!("{v}%")),

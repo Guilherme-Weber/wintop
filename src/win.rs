@@ -9,7 +9,8 @@ use windows::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS, RRF_RT_REG_MULTI_SZ, RegGetValueW,
+    HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
+    RRF_SUBKEY_WOW6432KEY, RegGetValueW,
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -96,6 +97,31 @@ pub fn reg_multi_sz(key: &str, value: &str) -> Option<Vec<String>> {
             .map(String::from_utf16_lossy)
             .collect(),
     )
+}
+
+/// Valor `REG_SZ` de `HKLM\<key>` na visão de 32 bits (`WOW6432Node`), como os programas de
+/// 32 bits (RTSS) gravam.
+pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
+    let (k, v) = (wide(key), wide(value));
+    let mut buf = vec![0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    // SAFETY: strings terminadas em zero; buffer local com o tamanho em bytes informado.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(k.as_ptr()),
+            PCWSTR(v.as_ptr()),
+            REG_ROUTINE_FLAGS(RRF_RT_REG_SZ.0 | RRF_SUBKEY_WOW6432KEY.0),
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&raw mut len),
+        )
+    };
+    if r.is_err() {
+        return None;
+    }
+    let s = from_wide(&buf[..(len as usize / 2).min(buf.len())]);
+    (!s.is_empty()).then_some(s)
 }
 
 /// `true` quando o processo atual roda elevado.

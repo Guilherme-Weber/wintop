@@ -226,6 +226,36 @@ pub struct DiskTemp {
     pub source: &'static str,
 }
 
+/// Jogo acompanhado pelo RTSS.
+#[derive(Clone, Debug)]
+pub struct Game {
+    pub pid: u32,
+    pub name: String,
+    pub api: &'static str,
+    pub resolution: Metric<(u32, u32)>,
+    /// `true` = valores da Shared Memory (jogo aberto antes do wintop): aproximados.
+    pub approx: bool,
+    pub fps: Metric<f64>,
+    /// Frametime no último segundo, em ms: médio, mínimo e máximo.
+    pub frametime: Metric<(f64, f64, f64)>,
+    /// 1% e 0,1% low em FPS (janela de 60 s).
+    pub lows: Metric<(f64, f64)>,
+    /// Tempo de GPU ativo e frame de GPU, em ms.
+    pub gpu_time: Metric<(f64, f64)>,
+    /// "GPU" ou "CPU": quem limita o frame.
+    pub bound: Metric<&'static str>,
+}
+
+/// Estado do RTSS e do jogo (thread do RTSS, a cada 250 ms).
+#[derive(Clone, Debug)]
+pub struct Fps {
+    /// RTSS rodando (versão da Shared Memory).
+    pub rtss: Metric<String>,
+    /// Pipe de frametime: quantas instâncias e clientes conectados.
+    pub pipe: Metric<(usize, usize)>,
+    pub game: Metric<Game>,
+}
+
 /// Uma coleta da thread rápida.
 #[derive(Clone, Debug)]
 pub struct Fast {

@@ -8,6 +8,7 @@ mod gpu;
 mod memory;
 mod net;
 mod pawnio;
+mod rtss;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -15,6 +16,8 @@ use std::time::Instant;
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 
 use crate::model::{Fast, Metric, Slow, fail};
+
+pub use rtss::RtssCollector;
 
 /// Executa um coletor; pânico vira falha com a mensagem.
 fn guarded<T>(name: &str, f: impl FnOnce() -> Metric<T>) -> Metric<T> {

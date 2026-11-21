@@ -3,9 +3,9 @@
 
 use std::time::Duration;
 
-use crate::collect::{FastCollectors, SlowCollectors};
+use crate::collect::{FastCollectors, RtssCollector, SlowCollectors};
 use crate::fmt::{bits, bytes, num, pct};
-use crate::model::{Fast, Metric, Missing, Slow};
+use crate::model::{Fast, Fps, Metric, Missing, Slow};
 
 const WARMUP: Duration = Duration::from_millis(300);
 
@@ -56,10 +56,13 @@ pub fn run() -> i32 {
     std::thread::sleep(WARMUP);
     let f = fast.collect();
     let s = slow.collect();
+    // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
+    let fps = RtssCollector::new(false, false).sample();
 
     let mut r = Report::default();
     fast_report(&mut r, &f);
     slow_report(&mut r, &s);
+    fps_report(&mut r, &fps);
     println!(
         "\nFast collection: {:.1} ms; slow: {:.1} ms",
         f.took.as_secs_f64() * 1e3,
@@ -292,6 +295,39 @@ fn slow_report(r: &mut Report, s: &Slow) {
                     format!("{c} °C ({source})")
                 });
             }
+        }
+    }
+}
+
+fn fps_report(r: &mut Report, f: &Fps) {
+    Report::section("FPS (RTSS)");
+    r.line("RTSS", &f.rtss, Clone::clone);
+    r.line("Frametime pipe", &f.pipe, |(n, c)| {
+        format!("{n} instances, {c} clients")
+    });
+    match &f.game {
+        Err(e) => r.line("Game", &Err::<(), _>(e.clone()), |()| String::new()),
+        Ok(g) => {
+            let approx = if g.approx {
+                " (approx.: game opened before wintop)"
+            } else {
+                ""
+            };
+            println!("  Game: {} (PID {}, {}){approx}", g.name, g.pid, g.api);
+            r.line("  Resolution", &g.resolution, |(x, y)| format!("{x}x{y}"));
+            r.line("  FPS", &g.fps, |v| num(*v, 1));
+            r.line(
+                "  Frametime avg / min / max",
+                &g.frametime,
+                |(a, lo, hi)| format!("{} / {} / {} ms", num(*a, 2), num(*lo, 2), num(*hi, 2)),
+            );
+            r.line("  1% / 0.1% low", &g.lows, |(a, b)| {
+                format!("{} / {} FPS", num(*a, 1), num(*b, 1))
+            });
+            r.line("  GPU active / GPU frame", &g.gpu_time, |(a, b)| {
+                format!("{} / {} ms", num(*a, 2), num(*b, 2))
+            });
+            r.line("  Limited by", &g.bound, ToString::to_string);
         }
     }
 }
