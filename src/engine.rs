@@ -29,6 +29,8 @@ struct State {
     slow: Option<Slow>,
     /// Incrementado a cada publicação (quem exibe sabe se há dado novo).
     generation: u64,
+    /// Incrementado só pela thread rápida.
+    fast_seq: u64,
     stop: bool,
 }
 
@@ -94,6 +96,7 @@ impl Engine {
                         {
                             let mut st = sh.lock();
                             st.fast = Some(snap);
+                            st.fast_seq += 1;
                             st.generation += 1;
                         }
                         sh.wake.notify_all();
@@ -134,10 +137,10 @@ impl Engine {
         }
     }
 
-    /// Últimos resultados e a geração (para saber se mudaram).
+    /// Últimos resultados e o número da coleta rápida (para saber se ela mudou).
     pub fn latest(&self) -> (Option<Fast>, Option<Slow>, u64) {
         let st = self.shared.lock();
-        (st.fast.clone(), st.slow.clone(), st.generation)
+        (st.fast.clone(), st.slow.clone(), st.fast_seq)
     }
 
     /// Espera uma geração maior que `seen` (ou o tempo acabar). Devolve a geração atual.

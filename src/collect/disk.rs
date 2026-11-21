@@ -1,5 +1,7 @@
 //! Discos físicos: inventário (modelo, barramento, SSD/HDD, capacidade, membro de pool) e
-//! atividade pelo PDH (`\PhysicalDisk(*)`). As temperaturas entram na Etapa 2 (thread lenta).
+//! atividade pelos contadores do driver (`IOCTL_DISK_PERFORMANCE`, a mesma fonte do PDH
+//! `\PhysicalDisk(*)`, sem os ~54 MB de memória privada que o provedor do PDH reserva). Letras
+//! das unidades pelas extensões de cada volume. As temperaturas entram na Etapa 2 (thread lenta).
 //!
 //! Offsets das estruturas conferidos com o compilador MSVC (winioctl.h) na Etapa 0.
 
@@ -8,17 +10,18 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
+    GetLogicalDrives, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+    IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_PERFORMANCE,
+    IOCTL_STORAGE_QUERY_PROPERTY,
 };
 use windows::Win32::System::Power::GetDevicePowerState;
 use windows::core::{BOOL, PCWSTR};
 
 use crate::model::{Bus, Disk, Metric, fail, neutral};
-use crate::pdh::{self, Query, Slot};
 use crate::win::{self, own, wide};
 
 const PROP_DEVICE: u32 = 0; // StorageDeviceProperty
@@ -48,7 +51,11 @@ struct Handle(OwnedHandle);
 
 impl Handle {
     fn open(n: u32, access: u32) -> Option<Self> {
-        let path = wide(&format!(r"\\.\PhysicalDrive{n}"));
+        Self::open_path(&format!(r"\\.\PhysicalDrive{n}"), access)
+    }
+
+    fn open_path(path: &str, access: u32) -> Option<Self> {
+        let path = wide(path);
         // SAFETY: caminho terminado em zero; o handle passa a ter dono.
         unsafe {
             CreateFileW(
@@ -149,11 +156,133 @@ fn is_pool_member(layout: &[u8]) -> bool {
     })
 }
 
-/// Instância do `\PhysicalDisk(*)`: `"7 C:"` → (7, ["C:"]); `"1"` → (1, []); `_Total` → None.
-fn parse_instance(name: &str) -> Option<(u32, Vec<String>)> {
-    let mut it = name.split_whitespace();
-    let n = it.next()?.parse().ok()?;
-    Some((n, it.map(str::to_ascii_uppercase).collect()))
+// DISK_PERFORMANCE (winioctl.h): tempos e QueryTime em unidades de 100 ns.
+const P_BYTES_READ: usize = 0;
+const P_BYTES_WRITTEN: usize = 8;
+const P_READ_TIME: usize = 16;
+const P_WRITE_TIME: usize = 24;
+const P_IDLE_TIME: usize = 32;
+const P_READ_COUNT: usize = 40;
+const P_WRITE_COUNT: usize = 44;
+const P_QUERY_TIME: usize = 56;
+const PERF_SIZE: usize = 88;
+// VOLUME_DISK_EXTENTS: contagem u32, extensões a partir do byte 8 (DISK_EXTENT de 24 bytes,
+// DiskNumber u32 no início).
+const X_COUNT: usize = 0;
+const X_ENTRIES: usize = 8;
+const X_SIZE: usize = 24;
+const MAX_EXTENTS: usize = 32;
+// GetDriveTypeW
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+
+/// Redescoberta de discos (hot-plug) e das letras das unidades.
+const REDISCOVER: Duration = Duration::from_secs(30);
+
+/// Contadores brutos do `IOCTL_DISK_PERFORMANCE` (os mesmos de onde o PDH calcula
+/// `\PhysicalDisk(*)`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PerfSample {
+    bytes_read: u64,
+    bytes_written: u64,
+    read_time: u64,
+    write_time: u64,
+    idle_time: u64,
+    reads: u32,
+    writes: u32,
+    query_time: u64,
+}
+
+fn u64_at(b: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        b.get(off..off.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+fn parse_perf(b: &[u8]) -> Option<PerfSample> {
+    Some(PerfSample {
+        bytes_read: u64_at(b, P_BYTES_READ)?,
+        bytes_written: u64_at(b, P_BYTES_WRITTEN)?,
+        read_time: u64_at(b, P_READ_TIME)?,
+        write_time: u64_at(b, P_WRITE_TIME)?,
+        idle_time: u64_at(b, P_IDLE_TIME)?,
+        reads: u32_at(b, P_READ_COUNT)?,
+        writes: u32_at(b, P_WRITE_COUNT)?,
+        query_time: u64_at(b, P_QUERY_TIME)?,
+    })
+}
+
+/// Atividade entre duas amostras: (tempo ativo %, leitura B/s, escrita B/s, resposta média s).
+/// Igual ao PDH: ativo = 100 - ocioso/decorrido; resposta = tempo das transferências / número
+/// de transferências (0 sem transferências). `None` se algum contador voltou (disco reiniciado).
+fn activity(prev: &PerfSample, now: &PerfSample) -> Option<(f64, f64, f64, f64)> {
+    let dt = now.query_time.checked_sub(prev.query_time)?;
+    if dt == 0 {
+        return None;
+    }
+    let secs = dt as f64 / 1e7;
+    let idle = now.idle_time.checked_sub(prev.idle_time)?;
+    let read = now.bytes_read.checked_sub(prev.bytes_read)?;
+    let written = now.bytes_written.checked_sub(prev.bytes_written)?;
+    let busy =
+        now.read_time.checked_sub(prev.read_time)? + now.write_time.checked_sub(prev.write_time)?;
+    // Contagens de 32 bits: a volta é normal em uptime longo.
+    let transfers = u64::from(now.reads.wrapping_sub(prev.reads))
+        + u64::from(now.writes.wrapping_sub(prev.writes));
+    let active = (100.0 - idle as f64 / dt as f64 * 100.0).clamp(0.0, 100.0);
+    let response = if transfers == 0 {
+        0.0
+    } else {
+        busy as f64 / 1e7 / transfers as f64
+    };
+    Some((active, read as f64 / secs, written as f64 / secs, response))
+}
+
+/// Discos de um `VOLUME_DISK_EXTENTS`.
+fn parse_extents(b: &[u8]) -> Vec<u32> {
+    let count = (u32_at(b, X_COUNT).unwrap_or(0) as usize).min(MAX_EXTENTS);
+    let mut disks: Vec<u32> = (0..count)
+        .filter_map(|i| u32_at(b, X_ENTRIES + i * X_SIZE))
+        .collect();
+    disks.sort_unstable();
+    disks.dedup();
+    disks
+}
+
+/// Letras das unidades locais (fixas e removíveis) por disco físico: `(disco, "C:")`.
+/// Unidades de rede e de CD ficam de fora (abri-las pode travar ou não ter disco).
+fn volume_letters() -> Vec<(u32, String)> {
+    // SAFETY: sem pré-condições.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u8 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = char::from(b'A' + i);
+        let root = wide(&format!(r"{letter}:\"));
+        // SAFETY: caminho terminado em zero.
+        let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE {
+            continue;
+        }
+        let Some(vol) = Handle::open_path(&format!(r"\\.\{letter}:"), 0) else {
+            continue;
+        };
+        let Ok(b) = vol.ioctl(
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            None,
+            X_ENTRIES + MAX_EXTENTS * X_SIZE,
+        ) else {
+            continue;
+        };
+        out.extend(
+            parse_extents(&b)
+                .into_iter()
+                .map(|d| (d, format!("{letter}:"))),
+        );
+    }
+    out
 }
 
 /// Inventário de um disco (lido na descoberta; capacidade e layout de novo se estava em repouso).
@@ -165,6 +294,11 @@ struct Inventory {
     capacity: Metric<u64>,
     pool_member: Metric<bool>,
     asleep_since: Option<Instant>,
+    /// Handle de metadados mantido aberto; USB não (não impedir a remoção segura).
+    handle: Option<Handle>,
+    last: Option<PerfSample>,
+    /// A última leitura de desempenho falhou (disco removido?).
+    lost: bool,
 }
 
 impl Inventory {
@@ -195,8 +329,14 @@ impl Inventory {
             capacity: fail("not read"),
             pool_member: fail("not read"),
             asleep_since: None,
+            handle: None,
+            last: None,
+            lost: false,
         };
         inv.read_details(&meta);
+        if inv.bus != Ok(Bus::Usb) {
+            inv.handle = Some(meta);
+        }
         Some(inv)
     }
 
@@ -218,12 +358,7 @@ impl Inventory {
         };
         self.capacity = reader
             .ioctl(IOCTL_DISK_GET_LENGTH_INFO, None, 8)
-            .and_then(|b| {
-                b.get(..8)
-                    .and_then(|s| s.try_into().ok())
-                    .map(u64::from_le_bytes)
-                    .ok_or_else(|| "response too short".into())
-            })
+            .and_then(|b| u64_at(&b, 0).ok_or_else(|| "response too short".into()))
             .or_else(fail);
         self.pool_member = reader
             .ioctl(
@@ -244,119 +379,117 @@ impl Inventory {
             self.read_details(&meta);
         }
     }
+
+    /// Atividade desde a última leitura. Não acorda o disco: os contadores são do driver.
+    fn activity(&mut self) -> Metric<(f64, f64, f64, f64)> {
+        let temp;
+        let h = if let Some(h) = &self.handle {
+            h
+        } else {
+            temp = Handle::open(self.number, 0);
+            let Some(h) = &temp else {
+                self.lost = true;
+                return fail("disk not found");
+            };
+            h
+        };
+        let now = match h.ioctl(IOCTL_DISK_PERFORMANCE, None, PERF_SIZE) {
+            Ok(b) => parse_perf(&b),
+            Err(e) => {
+                self.lost = true;
+                return fail(e);
+            }
+        };
+        self.lost = false;
+        let Some(now) = now else {
+            return fail("response too short");
+        };
+        match self.last.replace(now) {
+            None => fail("waiting for a second sample"),
+            Some(prev) => activity(&prev, &now)
+                .map_or_else(|| fail("counters went backwards (disk reset)"), Ok),
+        }
+    }
 }
 
-/// Valores de um contador por disco: (número, letras, valor).
-type PerDisk = Result<Vec<(u32, Vec<String>, f64)>, String>;
-
 pub struct DiskCollector {
-    query: Result<Query, String>,
-    idle: Slot,
-    read: Slot,
-    write: Slot,
-    response: Slot,
     disks: Vec<Inventory>,
+    letters: Vec<(u32, String)>,
+    discovered: Instant,
     system_drive: Option<char>,
     pagefile_drives: Vec<char>,
 }
 
 impl DiskCollector {
     pub fn new() -> Self {
-        let query = Query::open();
-        let add = |c: &str| match &query {
-            Ok(q) => q.add(&format!(r"\PhysicalDisk(*)\{c}")),
-            Err(e) => Err(e.clone()),
-        };
-        let idle = add("% Idle Time");
-        let read = add("Disk Read Bytes/sec");
-        let write = add("Disk Write Bytes/sec");
-        let response = add("Avg. Disk sec/Transfer");
         let pagefile_drives = win::reg_multi_sz(PAGEFILES_KEY, "ExistingPageFiles")
             .unwrap_or_default()
             .iter()
             .filter_map(|p| win::drive_letter(p))
             .collect();
         Self {
-            query,
-            idle,
-            read,
-            write,
-            response,
             disks: (0..64).filter_map(Inventory::discover).collect(),
+            letters: volume_letters(),
+            discovered: Instant::now(),
             system_drive: win::windows_drive(),
             pagefile_drives,
         }
     }
 
+    /// Discos novos entram, discos que sumiram saem; letras relidas.
+    fn rediscover(&mut self) {
+        self.discovered = Instant::now();
+        self.disks
+            .retain(|d| !d.lost || Handle::open(d.number, 0).is_some());
+        for n in 0..64 {
+            if !self.disks.iter().any(|d| d.number == n)
+                && let Some(inv) = Inventory::discover(n)
+            {
+                self.disks.push(inv);
+            }
+        }
+        self.disks.sort_by_key(|d| d.number);
+        self.letters = volume_letters();
+    }
+
     pub fn read(&mut self) -> Metric<Vec<Disk>> {
+        if self.discovered.elapsed() >= REDISCOVER {
+            self.rediscover();
+        }
         if self.disks.is_empty() {
             return fail("no physical disk could be opened");
         }
-        for d in &mut self.disks {
-            d.retry_if_asleep();
-        }
-        let sampled = match &self.query {
-            Ok(q) => q.collect(),
-            Err(e) => Err(e.clone()),
-        };
-        let arr = |slot: &Slot| -> PerDisk {
-            sampled.clone()?;
-            Ok(pdh::read_array(slot)?
-                .into_iter()
-                .filter_map(|(name, v)| parse_instance(&name).map(|(n, l)| (n, l, v)))
-                .collect())
-        };
-        let idle = arr(&self.idle);
-        let read = arr(&self.read);
-        let write = arr(&self.write);
-        let response = arr(&self.response);
-        let pick = |a: &PerDisk, n: u32| -> Metric<f64> {
-            match a {
-                Err(e) => fail(e.clone()),
-                Ok(v) => v
-                    .iter()
-                    .find(|(m, ..)| *m == n)
-                    .map_or_else(|| fail("no PDH instance"), |x| Ok(x.2)),
-            }
-        };
-        // Letras: de qualquer contador que tenha respondido (o nome da instância é igual).
-        let names: Vec<(u32, Vec<String>)> = [&idle, &read, &write, &response]
-            .into_iter()
-            .find_map(|a| a.as_ref().ok())
-            .map_or_else(Vec::new, |v| {
-                v.iter().map(|(n, l, _)| (*n, l.clone())).collect()
-            });
-
         let has = |letters: &[String], c: char| {
             letters
                 .iter()
                 .any(|l| l.starts_with(c) && l.len() == 2 && l.ends_with(':'))
         };
-        let out = self
-            .disks
-            .iter()
-            .map(|inv| {
-                let letters = names
-                    .iter()
-                    .find(|(n, _)| *n == inv.number)
-                    .map_or_else(Vec::new, |(_, l)| l.clone());
-                Disk {
-                    number: inv.number,
-                    model: inv.model.clone(),
-                    bus: inv.bus.clone(),
-                    ssd: inv.ssd.clone(),
-                    capacity: inv.capacity.clone(),
-                    pool_member: inv.pool_member.clone(),
-                    system: self.system_drive.is_some_and(|c| has(&letters, c)),
-                    pagefile: self.pagefile_drives.iter().any(|&c| has(&letters, c)),
-                    letters,
-                    active: pick(&idle, inv.number).map(|v| (100.0 - v).clamp(0.0, 100.0)),
-                    read: pick(&read, inv.number),
-                    write: pick(&write, inv.number),
-                    response: pick(&response, inv.number),
-                }
-            })
-            .collect();
+        let mut out = Vec::with_capacity(self.disks.len());
+        for inv in &mut self.disks {
+            inv.retry_if_asleep();
+            let act = inv.activity();
+            let letters: Vec<String> = self
+                .letters
+                .iter()
+                .filter(|(n, _)| *n == inv.number)
+                .map(|(_, l)| l.clone())
+                .collect();
+            out.push(Disk {
+                number: inv.number,
+                model: inv.model.clone(),
+                bus: inv.bus.clone(),
+                ssd: inv.ssd.clone(),
+                capacity: inv.capacity.clone(),
+                pool_member: inv.pool_member.clone(),
+                system: self.system_drive.is_some_and(|c| has(&letters, c)),
+                pagefile: self.pagefile_drives.iter().any(|&c| has(&letters, c)),
+                letters,
+                active: act.clone().map(|a| a.0),
+                read: act.clone().map(|a| a.1),
+                write: act.clone().map(|a| a.2),
+                response: act.map(|a| a.3),
+            });
+        }
         Ok(out)
     }
 }
@@ -365,15 +498,43 @@ impl DiskCollector {
 mod tests {
     use super::*;
 
+    fn perf(read: u64, idle: u64, reads: u32, time: u64, query: u64) -> Vec<u8> {
+        let mut b = vec![0u8; PERF_SIZE];
+        b[P_BYTES_READ..P_BYTES_READ + 8].copy_from_slice(&read.to_le_bytes());
+        b[P_READ_TIME..P_READ_TIME + 8].copy_from_slice(&time.to_le_bytes());
+        b[P_IDLE_TIME..P_IDLE_TIME + 8].copy_from_slice(&idle.to_le_bytes());
+        b[P_READ_COUNT..P_READ_COUNT + 4].copy_from_slice(&reads.to_le_bytes());
+        b[P_QUERY_TIME..P_QUERY_TIME + 8].copy_from_slice(&query.to_le_bytes());
+        b
+    }
+
     #[test]
-    fn instancia_do_physicaldisk() {
-        assert_eq!(parse_instance("7 c:"), Some((7, vec!["C:".to_string()])));
-        assert_eq!(
-            parse_instance("2 d: e:"),
-            Some((2, vec!["D:".to_string(), "E:".to_string()]))
-        );
-        assert_eq!(parse_instance("1"), Some((1, vec![])));
-        assert_eq!(parse_instance("_Total"), None);
+    fn atividade_igual_ao_pdh() {
+        // 1 s (1e7 × 100 ns), 0,75 s ocioso, 4 MB lidos em 8 leituras de 2 ms cada.
+        let a = parse_perf(&perf(0, 0, u32::MAX - 3, 0, 0)).expect("amostra");
+        let b = parse_perf(&perf(4 << 20, 7_500_000, 4, 160_000, 10_000_000)).expect("amostra");
+        let (active, read, write, resp) = activity(&a, &b).expect("atividade");
+        assert!((active - 25.0).abs() < 1e-9);
+        assert!((read - f64::from(4u32 << 20)).abs() < 1e-6);
+        assert!(write.abs() < 1e-9);
+        assert!((resp - 0.002).abs() < 1e-12, "{resp}");
+        // Contador voltou: sem atividade; mesmo instante: sem atividade.
+        assert_eq!(activity(&b, &a), None);
+        assert_eq!(activity(&b, &b), None);
+        assert_eq!(parse_perf(&[0u8; 40]), None);
+    }
+
+    #[test]
+    fn extensoes_do_volume() {
+        let mut b = vec![0u8; X_ENTRIES + 3 * X_SIZE];
+        b[X_COUNT..X_COUNT + 4].copy_from_slice(&3u32.to_le_bytes());
+        for (i, d) in [5u32, 2, 5].iter().enumerate() {
+            let o = X_ENTRIES + i * X_SIZE;
+            b[o..o + 4].copy_from_slice(&d.to_le_bytes());
+        }
+        assert_eq!(parse_extents(&b), vec![2, 5]);
+        b[X_COUNT..X_COUNT + 4].copy_from_slice(&1000u32.to_le_bytes());
+        assert_eq!(parse_extents(&b), vec![2, 5]);
     }
 
     #[test]
@@ -397,5 +558,68 @@ mod tests {
         assert_eq!(model_name(&d).as_deref(), Some("WDC X1"));
         d[48..56].copy_from_slice(b"X2\0\0\0\0\0\0");
         assert_eq!(model_name(&d).as_deref(), Some("WDC X2"));
+    }
+
+    /// Compara com o PDH na mesma janela. Rodar elevado, com carga no disco do sistema:
+    /// `winsat disk -seq -read -drive c` em outro terminal.
+    #[test]
+    #[ignore = "hardware: compara com o PDH sob carga (terminal elevado)"]
+    fn compara_com_pdh() {
+        use crate::pdh::{Query, read_array};
+        let c = win::windows_drive().expect("unidade do Windows");
+        let n = volume_letters()
+            .into_iter()
+            .find(|(_, l)| l.starts_with(c))
+            .expect("disco do sistema")
+            .0;
+        let q = Query::open().expect("PDH");
+        let names = [
+            "% Idle Time",
+            "Disk Read Bytes/sec",
+            "Disk Write Bytes/sec",
+            "Avg. Disk sec/Transfer",
+        ];
+        let slots: Vec<_> = names
+            .iter()
+            .map(|c| q.add(&format!(r"\PhysicalDisk(*)\{c}")))
+            .collect();
+        let h = Handle::open(n, 0).expect("disco");
+        let sample = || {
+            parse_perf(
+                &h.ioctl(IOCTL_DISK_PERFORMANCE, None, PERF_SIZE)
+                    .expect("IOCTL"),
+            )
+            .expect("amostra")
+        };
+        for _ in 0..5 {
+            let a = sample();
+            q.collect().expect("coleta");
+            std::thread::sleep(Duration::from_secs(1));
+            let b = sample();
+            q.collect().expect("coleta");
+            let ours = activity(&a, &b).expect("atividade");
+            let pdh: Vec<f64> = slots
+                .iter()
+                .map(|s| {
+                    read_array(s)
+                        .expect("PDH")
+                        .into_iter()
+                        .find(|(name, _)| name.split_whitespace().next() == Some(&n.to_string()))
+                        .expect("instância")
+                        .1
+                })
+                .collect();
+            println!(
+                "IOCTL: ativo {:6.2}% leit {:12.0} escr {:12.0} resp {:.6} s | PDH: ativo {:6.2}% leit {:12.0} escr {:12.0} resp {:.6} s",
+                ours.0,
+                ours.1,
+                ours.2,
+                ours.3,
+                100.0 - pdh[0],
+                pdh[1],
+                pdh[2],
+                pdh[3]
+            );
+        }
     }
 }

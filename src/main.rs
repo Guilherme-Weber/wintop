@@ -68,10 +68,15 @@ fn summary_loop() {
         env!("CARGO_PKG_VERSION"),
         engine.interval_ms()
     );
-    let mut seen = 0;
+    let (mut seen, mut printed) = (0, 0);
     loop {
         seen = engine.wait_newer(seen, Duration::from_secs(5));
-        let (fast, slow, _) = engine.latest();
+        let (fast, slow, fast_seq) = engine.latest();
+        // Só a coleta rápida gera linha (a lenta também acorda a espera).
+        if fast_seq == printed {
+            continue;
+        }
+        printed = fast_seq;
         let Some(f) = fast else { continue };
         let cpu = f.cpu.as_ref().ok().and_then(|c| c.usage.clone().ok());
         let ram = f.memory.as_ref().ok().and_then(|m| m.used.clone().ok());
