@@ -851,7 +851,8 @@ impl RtssCollector {
             } else {
                 "CPU"
             }),
-            (Err(e), _) => Err(e.clone()),
+            // O estado de quem falta (neutro num travamento curto) passa adiante.
+            (Err(e), _) | (_, Err(e)) => Err(e.clone()),
             _ => fail("no frametime"),
         };
         Game {
