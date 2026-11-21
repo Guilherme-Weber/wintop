@@ -61,7 +61,7 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
 | Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s) | Spike |
 | Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "vários pools: associação pendente" (com mais de um pool); "em repouso" (como a capacidade) | Spike (1 pool, 5 membros) |
-| Letras das unidades | `GetLogicalDrives` (só unidades fixas e removíveis) + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` em `\.\X:` → números dos discos; relido a cada 30 s; membros do pool não têm letra | | | E1 |
+| Letras das unidades | `GetLogicalDrives` (só unidades fixas e removíveis) + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` em `\\.\X:` → números dos discos; relido a cada 30 s; membros do pool não têm letra | | | E1 |
 | Disco do sistema / arquivo de paginação | letra do Windows (`GetSystemWindowsDirectoryW`) e dos pagefiles (`ExistingPageFiles` no registro) → disco pelas letras | | | E1 |
 | Tempo ativo (%) | `IOCTL_DISK_PERFORMANCE` (handle sem acesso; não acorda o disco): `100 - Δidle/ΔQueryTime`, limitado a 0-100. Mesma fonte do PDH `\PhysicalDisk`, sem os ~54 MB que o provedor do PDH reserva | | | E1 (= PDH na mesma janela) |
 | Leitura / escrita (B/s) | `IOCTL_DISK_PERFORMANCE`: Δ`BytesRead` / Δ`BytesWritten` por segundo | | | E1 (= PDH) |
