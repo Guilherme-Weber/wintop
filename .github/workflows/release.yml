@@ -1,0 +1,68 @@
+name: release
+
+# Push de uma tag v<versão> (igual à do Cargo.toml): mesmas checagens da CI, pacote pelo
+# scripts/package.ps1, atestado de procedência do zip e do exe, e a release criada como
+# RASCUNHO: nada fica público até a publicação manual na página do GitHub.
+# Disparado à mão (workflow_dispatch): ensaio completo sem tag e sem release; o zip fica como
+# artefato da execução.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write      # criar a release (rascunho)
+      id-token: write      # atestado de procedência
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: rustup toolchain install
+      - name: Tag igual à versão do Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME, Cargo.toml $v" }
+      # Sem cache: o binário publicado sai de um build limpo.
+      - name: Formatação
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Testes
+        run: cargo test --locked
+      - name: Pacote
+        shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.zip
+            target/release/wintop.exe
+      - name: Pacote do ensaio
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: wintop-ensaio
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/notes.md
+          if-no-files-found: error
+      - name: Release (rascunho)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME --draft --verify-tag `
+            --title "wintop $($env:GITHUB_REF_NAME.TrimStart('v'))" `
+            --notes-file dist/notes.md `
+            $zip.FullName "$($zip.FullName).sha256"

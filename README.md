@@ -8,13 +8,29 @@ de jogos.
 
 ## Estado
 
-Em desenvolvimento. Concluídas as etapas de base e provas de viabilidade
-([docs/spike-etapa0.md](docs/spike-etapa0.md)), coletores nativos, fontes elevadas (PawnIO e
-temperatura dos discos), FPS pelo RTSS, motor de coleta e as quatro abas da interface (geral,
-processos, GPU por processo e sensores), configuração, temas e o atalho sem UAC. O empacotamento
-ainda está por vir. O inventário
-completo de métricas está em [docs/metricas.md](docs/metricas.md), e as diferenças conhecidas em
-relação ao Gerenciador de Tarefas em [docs/divergencias.md](docs/divergencias.md).
+Funcional e em validação final antes da primeira versão (0.1.0). O histórico está em
+[CHANGELOG.md](CHANGELOG.md), o inventário completo de métricas em
+[docs/metricas.md](docs/metricas.md), as diferenças conhecidas em relação ao Gerenciador de
+Tarefas em [docs/divergencias.md](docs/divergencias.md) e as provas de viabilidade de cada fonte
+em [docs/spike-etapa0.md](docs/spike-etapa0.md).
+
+## Instalação
+
+Baixe o `wintop-<versão>-windows-x64.zip` da página de
+[releases](https://github.com/Guilherme-Weber/wintop/releases), extraia e, num terminal como
+administrador dentro da pasta extraída:
+
+```powershell
+.\wintop.exe --install
+```
+
+O wintop fica em `C:\Program Files\wintop`, com um atalho no Menu Iniciar que o abre sem a
+janela do UAC (ver [Atalho sem UAC](#atalho-sem-uac)). Também é possível rodar o `wintop.exe`
+direto da pasta extraída, sem instalar; a pasta `modules` precisa ficar ao lado do executável.
+
+Para conferir o download: o hash SHA-256 do zip está no arquivo `.sha256` da release, e a
+procedência (compilado pelo GitHub Actions a partir deste repositório) pode ser verificada com
+`gh attestation verify wintop-<versão>-windows-x64.zip -R Guilherme-Weber/wintop`.
 
 ## Uso
 
@@ -87,6 +103,14 @@ cargo run --example spike_pawnio
 cargo run --example spike_discos
 cargo run --example spike_nvml
 cargo run --example spike_rtss 60
+```
+
+O pacote de distribuição (o mesmo que a release publica) sai de `.\scripts\package.ps1`, em
+`dist\`. Fuzz longo dos parsers e teste de longa duração:
+
+```powershell
+$env:WINTOP_FUZZ_ITERS = 2000000; cargo test --profile fuzz --locked fuzz_
+.\scripts\soak.ps1 -Hours 8   # terminal elevado, com o wintop aberto
 ```
 
 ## Licença

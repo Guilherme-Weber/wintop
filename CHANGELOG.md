@@ -1,43 +1,46 @@
 # Changelog
 
 Todas as mudanças relevantes do projeto. Formato baseado em
-[Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
+[Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); versões no
+[Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+Primeira versão.
+
 ### Adicionado
 
-- Etapa 0: base do projeto (toolchain fixa, lints, CI, manifesto `requireAdministrator`,
-  CRT estático), inventário de métricas e provas de viabilidade de cada fonte de dados
-  (PawnIO, discos, RTSS, NVML) em `examples/`.
-- Instância única por sessão de usuário.
-- Código-fonte do módulo `AMDFamily17` (LGPL-2.1) em `modules/source/`.
-- Membros de Storage Spaces identificados pela partição GPT de proteção, sem WMI.
-- Etapa 1: coletores nativos (CPU, memória, discos por `IOCTL_DISK_PERFORMANCE`, rede, GPU pelo
-  NVML) e o diagnóstico `--check`.
-- Etapa 2: temperatura e potência da CPU pelo PawnIO; temperatura dos discos (nativa e SMART,
-  sem acordar HDD em repouso); nome amigável dos discos.
-- Etapa 3: FPS, frametime e lows pelo RTSS, com pipe de frametime exato e modo aproximado pela
-  Shared Memory.
-- Etapa 4: motor com três threads, consumo do próprio wintop, intervalo ajustável com `+`/`-` e
-  parada limpa (Ctrl+C, Ctrl+Break, fechar a janela).
-- Etapa 5: aba geral da interface (ratatui): gráficos de uso com tempo de kernel, grade por
-  núcleo, VRAM por categoria, RAM por composição, rede espelhada, discos, caixa do jogo,
-  mínimos e máximos da sessão (`r`), linhas que quebram em vez de cortar.
-- Etapa 8: fuzz dos parsers (`src/fuzz.rs`: topologia da CPU, layout e desempenho dos discos,
-  temperatura nativa e SMART, lista de processos, Shared Memory e pipe do RTSS, lows, arquivo de
-  configuração, instâncias do PDH), na suíte normal e em rodada longa (perfil `fuzz`, com
-  checagem de overflow); monitor de longa duração `scripts/soak.ps1`.
+- Interface em terminal no estilo do btop, com quatro abas:
+  - **Geral:** uso de CPU (total e por núcleo, com a parte do kernel), temperatura (Tctl e CCD)
+    e potência do processador, RAM por composição e memória confirmada, discos (atividade,
+    leitura e escrita, resposta média, temperatura, membros de Storage Spaces), rede por placa,
+    GPU (engine mais usada, temperatura, potência, clocks, PCIe) e VRAM por categoria, FPS,
+    frametime e lows (1% e 0,1%) do jogo em foco, com mínimos e máximos da sessão (`r`).
+  - **Processos:** lista sem abrir nenhum processo, com ordem, filtro e seleção estável.
+  - **GPU:** uso de engine e VRAM por processo; runtimes de GPU sob demanda (`Enter`), nunca em
+    aplicativos com o hook do RTSS.
+  - **Sensores:** todas as leituras físicas (temperaturas, potências, clocks, ventoinhas) numa
+    tabela, com mínimo e máximo.
+- Fontes: APIs nativas do Windows (sem WMI), NVML para a GPU NVIDIA, PawnIO para a CPU AMD
+  (módulo LGPL em arquivo separado), RTSS para FPS (pipe de frametime exato; modo aproximado
+  pela Shared Memory quando o jogo abriu antes do wintop). Temperatura de disco nativa (NVMe) ou
+  SMART (SATA), sem acordar HDD em repouso.
+- Intervalo de atualização ajustável com `+` e `-` (passos de 100 ms), valendo na hora.
+- `wintop --check`: diagnóstico de todas as métricas, sem interface.
+- `%APPDATA%\wintop\config.toml`: intervalo, tema (`t`: default, nord, gruvbox, dracula, mono),
+  cores avulsas, recolhimento do Storage Space, aplicativos que não são jogos; regravado
+  preservando os comentários.
+- `wintop --install` / `--uninstall`: cópia para `C:\Program Files\wintop` e atalho no Menu
+  Iniciar que abre o wintop elevado sem a janela do UAC (tarefa agendada).
+- Instância única por sessão; parada limpa com `q`, `Esc`, Ctrl+C, Ctrl+Break ou fechando a
+  janela.
+- Consumo medido do próprio wintop (fica abaixo de 0,1% de CPU somando o terminal, ~26 MB).
 
-### Corrigido (revisão Gemini Neon + Argon)
+### Segurança
 
-- Atividade de disco: soma dos tempos de leitura e escrita sem overflow com contadores
-  corrompidos (achado pelo fuzz).
-- Configuração: `AppData\Roaming` com dono Administradores (perfis criados por imagem, runners
-  do GitHub) aceito só no caminho padrão do perfil.
-- Manifesto de administrador só no executável principal (testes e exemplos rodam sem elevação).
-- Provas: HDD em repouso não é consultado; pipe do RTSS com várias instâncias e tratamento
-  correto de I/O overlapped; leituras de Shared Memory voláteis e com limites checados; idade do
-  aplicativo sem underflow; handles com dono (RAII); `nvml.dll` por `GetSystemDirectoryW` e busca
-  de DLLs restrita a System32; capacidades em unidade binária.
-- `.gitattributes`, permissões mínimas e build de release no CI.
+- Processo elevado endurecido: DLLs só de System32 (inclusive as importações estáticas),
+  caminhos do registro só locais e sem expansão, Shared Memory só leitura e com limites, pipe do
+  RTSS com DACL própria e tetos de memória, arquivos do usuário sem seguir links nem
+  redirecionamentos, instalação recusada se um usuário sem elevação puder alterar a pasta.
+- Nunca lê a memória do jogo em foco (anticheat): acesso negado aparece como "protected".
+- Parsers de dados externos cobertos por fuzz (milhões de entradas, com checagem de overflow).
