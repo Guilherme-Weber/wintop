@@ -33,6 +33,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
 ] }
 nvml-wrapper = "0.13"
+ratatui = "0.30"
 
 [build-dependencies]
 winresource = "0.1.34"
@@ -75,3 +76,6 @@ test = true
 [[example]]
 name = "spike_rtss"
 test = true
+
+[dev-dependencies]
+insta = "1.49.0"

@@ -36,6 +36,8 @@ struct State {
     fast: Option<Fast>,
     slow: Option<Slow>,
     fps: Option<Fps>,
+    /// Incrementado a cada publicação da thread do RTSS.
+    fps_seq: u64,
     /// Incrementado a cada publicação (quem exibe sabe se há dado novo).
     generation: u64,
     /// Incrementado só pela thread rápida.
@@ -57,24 +59,32 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn interval(&self) -> Duration {
-        Duration::from_millis(self.interval_ms.load(Ordering::Relaxed))
-    }
-
-    /// Espera até `deadline` ou até a parada. `true` = parar.
-    fn wait_until(&self, deadline: Instant) -> bool {
+    /// Espera a próxima coleta: `base` é o instante agendado da anterior e o período é
+    /// `intervalo × factor`. Um intervalo novo (teclas `+`/`-`) vale na hora: o prazo é refeito a
+    /// partir de `base` (se já passou, coleta agora). Devolve a nova base, ou `None` = parar.
+    fn wait_tick(&self, base: Instant, factor: u32) -> Option<Instant> {
+        let period = |ms: u64| Duration::from_millis(ms) * factor;
         let mut st = self.lock();
+        // Lido com o lock: `set_interval_ms` grava com o lock, então nenhuma mudança se perde
+        // entre esta leitura e a espera.
+        let mut seen = self.interval_ms.load(Ordering::Relaxed);
+        let mut target = next_tick(base, period(seen), Instant::now());
         loop {
             if st.stop {
-                return true;
+                return None;
             }
+            let ms = self.interval_ms.load(Ordering::Relaxed);
             let now = Instant::now();
-            if now >= deadline {
-                return false;
+            if ms != seen {
+                seen = ms;
+                target = (base + period(ms)).max(now);
+            }
+            if now >= target {
+                return Some(target);
             }
             st = self
                 .wake
-                .wait_timeout(st, deadline - now)
+                .wait_timeout(st, target - now)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -110,9 +120,9 @@ impl Engine {
                             st.generation += 1;
                         }
                         sh.wake.notify_all();
-                        next = next_tick(next, sh.interval(), Instant::now());
-                        if sh.wait_until(next) {
-                            break;
+                        match sh.wait_tick(next, 1) {
+                            Some(t) => next = t,
+                            None => break,
                         }
                     }
                 })
@@ -150,9 +160,9 @@ impl Engine {
                             st.generation += 1;
                         }
                         sh.wake.notify_all();
-                        next = next_tick(next, sh.interval() * SLOW_FACTOR, Instant::now());
-                        if sh.wait_until(next) {
-                            break;
+                        match sh.wait_tick(next, SLOW_FACTOR) {
+                            Some(t) => next = t,
+                            None => break,
                         }
                     }
                 })
@@ -172,19 +182,15 @@ impl Engine {
     }
 
     /// Último estado do RTSS e do jogo.
+    #[cfg(test)]
     pub fn fps(&self) -> Option<Fps> {
         self.shared.lock().fps.clone()
     }
 
-    /// Espera uma geração maior que `seen` (ou o tempo acabar). Devolve a geração atual.
-    pub fn wait_newer(&self, seen: u64, timeout: Duration) -> u64 {
+    /// Último estado do RTSS e o número da publicação (para saber se mudou).
+    pub fn fps_seq(&self) -> (Option<Fps>, u64) {
         let st = self.shared.lock();
-        let (st, _) = self
-            .shared
-            .wake
-            .wait_timeout_while(st, timeout, |s| s.generation <= seen && !s.stop)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        st.generation
+        (st.fps.clone(), st.fps_seq)
     }
 
     pub fn interval_ms(&self) -> u64 {
@@ -192,10 +198,14 @@ impl Engine {
     }
 
     /// Ajusta o intervalo (teclas `+`/`-`); vale a partir da próxima espera.
-    #[cfg_attr(not(test), expect(dead_code, reason = "teclas + e - na TUI (Etapa 5)"))]
     pub fn set_interval_ms(&self, ms: u64) -> u64 {
         let ms = clamp_interval(ms);
-        self.shared.interval_ms.store(ms, Ordering::Relaxed);
+        {
+            let _st = self.shared.lock();
+            self.shared.interval_ms.store(ms, Ordering::Relaxed);
+        }
+        // Acorda as threads para refazerem o prazo com o intervalo novo.
+        self.shared.wake.notify_all();
         ms
     }
 }
@@ -221,6 +231,7 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
         {
             let mut st = sh.lock();
             st.fps = Some(snap);
+            st.fps_seq += 1;
             st.generation += 1;
         }
         sh.wake.notify_all();
@@ -292,6 +303,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
         assert_eq!(e.set_interval_ms(250), 200, "passos de 100 ms");
         assert_eq!(e.set_interval_ms(300), 300);
+        // A troca acorda a espera antiga: a próxima coleta sai em <= 300 ms.
         let (_, _, before) = e.latest();
         std::thread::sleep(Duration::from_secs(3));
         let (_, _, after) = e.latest();

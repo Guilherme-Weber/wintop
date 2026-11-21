@@ -107,9 +107,10 @@ mod tests {
         // Gasta um pouco de CPU entre as leituras.
         let mut x = 0u64;
         for i in 0..5_000_000u64 {
-            x = x.wrapping_add(i * i);
+            x = std::hint::black_box(x.wrapping_add(i * i));
         }
-        std::hint::black_box(x);
+        // GetSystemTimes avança em ticks de ~15,6 ms: espera alguns.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let u = c.read().expect("consumo");
         assert!(u.private_ws.expect("memória") > 0);
         assert!(u.cpu.is_ok(), "{:?}", u.cpu);
