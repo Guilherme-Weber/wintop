@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
-    HANDLE, HLOCAL, HMODULE, LocalFree, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, FreeLibrary, HANDLE, HLOCAL, HMODULE, LocalFree, WAIT_ABANDONED,
+    WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -20,10 +21,11 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
-use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows::Win32::System::Threading::{
+    CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
+    SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::core::{HRESULT, PCSTR, PCWSTR, w};
 
 use crate::model::{CpuSensors, Metric, Missing, fail, neutral};
@@ -129,7 +131,25 @@ struct PawnIo {
     exec_fn: FnExec,
     pci_mutex: OwnedHandle,
     executor: Executor,
+    /// Por último: a DLL só é liberada depois do `pawnio_close` do executor.
+    _lib: Library,
 }
+
+/// `PawnIOLib.dll` carregada; `FreeLibrary` no Drop (também nos caminhos de erro de `open`).
+struct Library(HMODULE);
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        // SAFETY: módulo carregado por LoadLibraryExW; nenhum ponteiro de função dele é usado
+        // depois daqui (o executor, declarado depois na função e antes na struct, já fechou).
+        unsafe {
+            let _ = FreeLibrary(self.0);
+        }
+    }
+}
+
+// SAFETY: o módulo pode ser liberado de qualquer thread.
+unsafe impl Send for Library {}
 
 /// Guarda do mutex `Access_PCI`: libera no Drop.
 struct PciLock<'a>(&'a OwnedHandle);
@@ -148,8 +168,8 @@ impl PawnIo {
         let dll = install_dir()?.join("PawnIOLib.dll");
         let dll_w = wide(&dll.to_string_lossy());
         // SAFETY: caminho absoluto terminado em zero; busca restrita à pasta da DLL e System32.
-        // A DLL fica carregada até o fim do processo (os ponteiros de função dependem dela).
-        let lib: HMODULE = unsafe {
+        // `Library` libera a DLL quando `PawnIo` (ou um erro abaixo) a solta.
+        let lib = unsafe {
             LoadLibraryExW(
                 PCWSTR(dll_w.as_ptr()),
                 None,
@@ -157,6 +177,7 @@ impl PawnIo {
             )
         }
         .map_err(|e| format!("PawnIOLib.dll at {}: {e}", dll.display()))?;
+        let library = Library(lib);
         let sym = |name: &CStr| {
             // SAFETY: `lib` é válido; o nome é uma string C estática.
             unsafe { GetProcAddress(lib, PCSTR(name.as_ptr().cast())) }
@@ -186,6 +207,7 @@ impl PawnIo {
             exec_fn,
             pci_mutex: open_pci_mutex()?,
             executor,
+            _lib: library,
         })
     }
 
@@ -272,13 +294,33 @@ fn open_pci_mutex() -> Result<OwnedHandle, String> {
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
-    // SAFETY: CreateMutexW teve sucesso; handle válido e sem outro dono.
-    r.map(|h| unsafe { own(h) })
-        .map_err(|e| format!("Access_PCI mutex: {e}"))
+    let h = match r {
+        Ok(h) => h,
+        // Já criado por um serviço (SYSTEM) com DACL restrita: o CreateMutexW pede acesso
+        // total; basta esperar e liberar.
+        Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            // SAFETY: nome estático.
+            unsafe {
+                OpenMutexW(
+                    SYNCHRONIZATION_ACCESS_RIGHTS(
+                        SYNCHRONIZATION_SYNCHRONIZE.0 | MUTEX_MODIFY_STATE.0,
+                    ),
+                    false,
+                    w!("Global\\Access_PCI"),
+                )
+            }
+            .map_err(|e| format!("Access_PCI mutex: {e}"))?
+        }
+        Err(e) => return Err(format!("Access_PCI mutex: {e}")),
+    };
+    // SAFETY: handle válido e sem outro dono.
+    Ok(unsafe { own(h) })
 }
 
 /// Pasta de instalação do PawnIO pelo registro. Sem fallback fixo: valor ausente, vazio ou
-/// relativo é erro (processo elevado não carrega DLL de caminho incerto).
+/// relativo é erro (processo elevado não carrega DLL de caminho incerto). Só `REG_SZ` (o que o
+/// instalador grava): um `REG_EXPAND_SZ` seria expandido com o ambiente herdado do processo
+/// sem elevação que abriu o wintop.
 fn install_dir() -> Result<PathBuf, String> {
     let mut buf = [0u16; 520];
     let mut len = (buf.len() * 2) as u32;
@@ -288,7 +330,7 @@ fn install_dir() -> Result<PathBuf, String> {
             HKEY_LOCAL_MACHINE,
             w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO"),
             w!("InstallLocation"),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ,
             None,
             Some(buf.as_mut_ptr().cast::<c_void>()),
             Some(&raw mut len),

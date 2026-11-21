@@ -384,7 +384,7 @@ impl Inventory {
             .or_else(fail);
     }
 
-    fn retry_if_asleep(&mut self) {
+    pub(super) fn retry_if_asleep(&mut self) {
         if self
             .asleep_since
             .is_some_and(|t| t.elapsed() >= RETRY_ASLEEP)
@@ -470,6 +470,17 @@ fn friendly_names() -> Vec<(u32, String)> {
     }) else {
         return Vec::new();
     };
+    // Destrói a lista também em pânico (os coletores rodam sob catch_unwind).
+    struct List(HDEVINFO);
+    impl Drop for List {
+        fn drop(&mut self) {
+            // SAFETY: lista criada por SetupDiGetClassDevsW, destruída uma única vez.
+            unsafe {
+                let _ = SetupDiDestroyDeviceInfoList(self.0);
+            }
+        }
+    }
+    let _list = List(set);
     let mut out = Vec::new();
     for i in 0.. {
         let mut iface = SP_DEVICE_INTERFACE_DATA {
@@ -485,10 +496,6 @@ fn friendly_names() -> Vec<(u32, String)> {
         if let Some(entry) = interface_name(set, &iface) {
             out.push(entry);
         }
-    }
-    // SAFETY: lista criada acima, não usada depois.
-    unsafe {
-        let _ = SetupDiDestroyDeviceInfoList(set);
     }
     out
 }

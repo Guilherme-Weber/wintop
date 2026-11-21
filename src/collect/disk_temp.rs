@@ -58,6 +58,8 @@ enum Method {
     Unknown,
     Native,
     Smart,
+    /// Nem nativa nem SMART responderam: nova tentativa no ritmo do SMART.
+    None,
 }
 
 struct State {
@@ -78,10 +80,9 @@ impl State {
     }
 
     fn due(&self, now: Instant) -> bool {
-        let every = if self.method == Method::Smart {
-            SMART_EVERY
-        } else {
-            NATIVE_EVERY
+        let every = match self.method {
+            Method::Smart | Method::None => SMART_EVERY,
+            Method::Unknown | Method::Native => NATIVE_EVERY,
         };
         self.last.is_none_or(|t| now.duration_since(t) >= every)
     }
@@ -137,10 +138,20 @@ impl DiskTempCollector {
         }
         let now = Instant::now();
         for (d, st) in &mut self.disks {
-            if d.bus != Ok(Bus::Spaces) && st.due(now) {
-                read_one(d, st);
-                st.last = Some(now);
+            if !st.due(now) {
+                continue;
             }
+            st.last = Some(now);
+            if d.bus == Ok(Bus::Spaces) {
+                // O disco virtual não é lido; só confere que continua existindo.
+                if Handle::open(d.number, 0).is_none() {
+                    d.lost = true;
+                }
+                continue;
+            }
+            // Membro que estava em repouso na descoberta: relê o layout quando acordar.
+            d.retry_if_asleep();
+            read_one(d, st);
         }
         let pools = self
             .disks
@@ -153,6 +164,11 @@ impl DiskTempCollector {
             .filter(|(d, _)| d.pool_member == Ok(true))
             .map(|(_, st)| &st.value)
             .collect();
+        // Discos cujo layout ainda não foi lido porque estavam em repouso: podem ser membros.
+        let unknown_asleep = self
+            .disks
+            .iter()
+            .any(|(d, _)| matches!(d.pool_member, Err(Missing::Neutral(_))));
         Ok(self
             .disks
             .iter()
@@ -160,7 +176,7 @@ impl DiskTempCollector {
                 if d.bus == Ok(Bus::Spaces) {
                     DiskTemp {
                         number: d.number,
-                        celsius: pool_temp(pools, &members),
+                        celsius: pool_temp(pools, &members, unknown_asleep),
                         source: "pool members",
                     }
                 } else {
@@ -176,18 +192,18 @@ impl DiskTempCollector {
 }
 
 /// Máximo dos membros do pool. Com mais de um pool, a associação membro-pool é pendente.
-fn pool_temp(pools: usize, members: &[&Metric<i16>]) -> Metric<i16> {
+/// `unknown_asleep`: há discos em repouso cujo layout (membro ou não) ainda não foi lido.
+fn pool_temp(pools: usize, members: &[&Metric<i16>], unknown_asleep: bool) -> Metric<i16> {
     if pools > 1 {
         return neutral("several pools: association pending");
     }
     if let Some(max) = members.iter().filter_map(|m| m.as_ref().ok()).max() {
         return Ok(*max);
     }
-    if !members.is_empty()
-        && members
-            .iter()
-            .all(|m| matches!(m, Err(Missing::Neutral(_))))
-    {
+    let all_asleep = members
+        .iter()
+        .all(|m| matches!(m, Err(Missing::Neutral(_))));
+    if (members.is_empty() && unknown_asleep) || (!members.is_empty() && all_asleep) {
         return neutral("asleep");
     }
     fail("no member temperature")
@@ -212,17 +228,25 @@ fn read_one(d: &mut Inventory, st: &mut State) {
         st.value = neutral("asleep");
         return;
     }
-    if st.method != Method::Smart
-        && let Some(t) = meta
-            .property(PROP_TEMPERATURE)
-            .ok()
-            .as_deref()
-            .and_then(native_temp)
-    {
-        st.method = Method::Native;
-        st.value = Ok(t);
-        st.source = "native";
-        return;
+    if st.method != Method::Smart {
+        let native = meta.property(PROP_TEMPERATURE);
+        match native.as_deref().ok().and_then(native_temp) {
+            Some(t) => {
+                st.method = Method::Native;
+                st.value = Ok(t);
+                st.source = "native";
+                return;
+            }
+            // Disco com sensor nativo que falhou agora: não cai no SMART (handle de escrita).
+            None if st.method == Method::Native => {
+                if Handle::open(d.number, 0).is_none() {
+                    d.lost = true;
+                }
+                st.value = fail(native.err().unwrap_or_else(|| "no native reading".into()));
+                return;
+            }
+            None => {}
+        }
     }
     // Sem temperatura nativa: SMART (exige handle de leitura e escrita).
     let smart = Handle::open(d.number, GENERIC_READ.0 | GENERIC_WRITE.0)
@@ -240,7 +264,13 @@ fn read_one(d: &mut Inventory, st: &mut State) {
             st.source = if id == 194 { "SMART 194" } else { "SMART 190" };
         }
         Err(e) => {
-            // Volta a tentar a nativa na próxima vez só se ela nunca funcionou.
+            // O disco sumiu (o handle guardado não percebe): sai na redescoberta.
+            if Handle::open(d.number, 0).is_none() {
+                d.lost = true;
+            }
+            if st.method == Method::Unknown {
+                st.method = Method::None;
+            }
             st.value = fail(e);
         }
     }
@@ -280,12 +310,18 @@ mod tests {
         let (a, b): (Metric<i16>, Metric<i16>) = (Ok(35), Ok(41));
         let asleep: Metric<i16> = neutral("asleep");
         let bad: Metric<i16> = fail("x");
-        assert_eq!(pool_temp(1, &[&a, &asleep, &b]), Ok(41));
-        assert_eq!(pool_temp(1, &[&asleep, &asleep]), neutral("asleep"));
+        assert_eq!(pool_temp(1, &[&a, &asleep, &b], false), Ok(41));
+        assert_eq!(pool_temp(1, &[&asleep, &asleep], false), neutral("asleep"));
         assert!(matches!(
-            pool_temp(1, &[&asleep, &bad]),
+            pool_temp(1, &[&asleep, &bad], false),
             Err(Missing::Fail(_))
         ));
-        assert!(matches!(pool_temp(2, &[&a]), Err(Missing::Neutral(_))));
+        assert!(matches!(
+            pool_temp(2, &[&a], false),
+            Err(Missing::Neutral(_))
+        ));
+        // Todos os membros dormiam na descoberta: o layout não foi lido, o pool está em repouso.
+        assert_eq!(pool_temp(1, &[], true), neutral("asleep"));
+        assert!(matches!(pool_temp(1, &[], false), Err(Missing::Fail(_))));
     }
 }
