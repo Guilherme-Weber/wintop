@@ -1,5 +1,6 @@
 ---
 source: src/ui/tests.rs
+assertion_line: 245
 expression: "render(&mut filled(), 160, 48)"
 ---
 " [1 Overview]   2 Processes    3 GPU    4 Sensors                                                                            interval 1000 ms  │  up 0d 05:08:00"
@@ -49,4 +50,4 @@ expression: "render(&mut filled(), 160, 48)"
 "│                            ⠉⠉⠙⠛⠛⠿⠿⢿⣿                                   ││  GPU busy 5.20 ms / frame 6.80 ms                                                  │"
 "│disconnected: Ethernet                                                  ││limited by GPU  │  lows over 60 s  │  graphs synced to the 1000 ms tick             │"
 "╰────────────────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────╯"
-" 1-4 tabs  +/- interval 1000 ms  r reset min/max  d fold pool  q quit           wintop 0.01% 25.0 MB (33.0 MB commit)  │  collection 1.8 ms  │  sources: all OK "
+" 1-4 tabs  r reset min/max  d fold pool  +/- interval 1000 ms  q quit           wintop 0.01% 25.0 MB (33.0 MB commit)  │  collection 1.8 ms  │  sources: all OK "

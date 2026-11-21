@@ -643,6 +643,7 @@ pub fn failed(cause: &str) -> Fps {
         rtss: Err(m.clone()),
         pipe: Err(m.clone()),
         game: Err(m),
+        hooked: Vec::new(),
     }
 }
 
@@ -798,6 +799,7 @@ impl RtssCollector {
                 rtss: Err(missing.clone()),
                 pipe,
                 game: Err(missing),
+                hooked: Vec::new(),
             };
         }
         let read = self.view.as_ref().map(read_apps);
@@ -811,6 +813,7 @@ impl RtssCollector {
                     rtss: fail(e.clone()),
                     pipe,
                     game: fail(e),
+                    hooked: Vec::new(),
                 };
             }
             None => unreachable!("view aberta em open_view"),
@@ -836,7 +839,13 @@ impl RtssCollector {
             None => neutral("no 3D game in focus"),
             Some(g) => Ok(self.game(g, now)),
         };
-        Fps { rtss, pipe, game }
+        let hooked = apps.iter().map(|a| a.pid).collect();
+        Fps {
+            rtss,
+            pipe,
+            game,
+            hooked,
+        }
     }
 
     fn game(&mut self, g: &App, now: Instant) -> Game {

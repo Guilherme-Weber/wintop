@@ -65,7 +65,7 @@ fn parse_instance(name: &str) -> Option<(u32, &str)> {
 }
 
 /// PID → nome do executável, pelo snapshot do Toolhelp.
-fn process_names() -> HashMap<u32, String> {
+pub(super) fn process_names() -> HashMap<u32, String> {
     let mut out = HashMap::new();
     // SAFETY: snapshot de processos (não abre nenhum processo); o handle passa a ter dono.
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
@@ -144,10 +144,17 @@ pub(super) fn breakdown(
     }
 }
 
-/// Coletor (thread lenta): uma consulta PDH com o uso por processo e o do adaptador.
+/// VRAM de um processo em bytes: local, não local (spill para a RAM) e confirmada.
+pub(super) type ProcMem = (u64, u64, u64);
+
+/// Coletor (thread lenta): uma consulta PDH com o uso por processo e o do adaptador. A não
+/// local e a confirmada só são lidas com a aba GPU visível (mesmo objeto PDH da local: a
+/// coleta custa o mesmo).
 pub(super) struct VramCollector {
     query: Result<Query, String>,
     local: Slot,
+    non_local: Slot,
+    committed: Slot,
     adapter: Slot,
 }
 
@@ -159,12 +166,45 @@ impl VramCollector {
             Err(e) => Err(e.clone()),
         };
         let local = add(r"\GPU Process Memory(*)\Local Usage");
+        let non_local = add(r"\GPU Process Memory(*)\Non Local Usage");
+        let committed = add(r"\GPU Process Memory(*)\Total Committed");
         let adapter = add(r"\GPU Adapter Memory(*)\Dedicated Usage");
         Self {
             query,
             local,
+            non_local,
+            committed,
             adapter,
         }
+    }
+
+    /// Soma por PID de um contador de processo, só das instâncias do adaptador.
+    fn per_process(&self, slot: &Slot, luid: &str) -> Result<HashMap<u32, u64>, String> {
+        let rows = pdh::read_array(&self.query, slot)?;
+        let mut out: HashMap<u32, u64> = HashMap::new();
+        for (name, v) in &rows {
+            if let Some((pid, rest)) = parse_instance(name)
+                && rest.to_ascii_lowercase().starts_with(luid)
+            {
+                *out.entry(pid).or_default() += *v as u64;
+            }
+        }
+        Ok(out)
+    }
+
+    /// VRAM local, não local e confirmada por PID (aba GPU), da coleta feita pelo `read`.
+    pub(super) fn per_process_detail(&self, luid: &str) -> Result<HashMap<u32, ProcMem>, String> {
+        let mut out: HashMap<u32, ProcMem> = HashMap::new();
+        for (pid, v) in self.per_process(&self.local, luid)? {
+            out.entry(pid).or_default().0 = v;
+        }
+        for (pid, v) in self.per_process(&self.non_local, luid)? {
+            out.entry(pid).or_default().1 = v;
+        }
+        for (pid, v) in self.per_process(&self.committed, luid)? {
+            out.entry(pid).or_default().2 = v;
+        }
+        Ok(out)
     }
 
     /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML).
@@ -172,16 +212,8 @@ impl VramCollector {
         if let Ok(q) = &self.query {
             q.collect().or_else(fail)?;
         }
-        let rows = pdh::read_array(&self.query, &self.local).or_else(fail)?;
+        let per_process = self.per_process(&self.local, luid).or_else(fail)?;
         let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;
-        let mut per_process: HashMap<u32, u64> = HashMap::new();
-        for (name, v) in &rows {
-            if let Some((pid, rest)) = parse_instance(name)
-                && rest.to_ascii_lowercase().starts_with(luid)
-            {
-                *per_process.entry(pid).or_default() += *v as u64;
-            }
-        }
         let mine: Vec<u64> = adapter
             .iter()
             .filter(|(n, _)| n.to_ascii_lowercase().starts_with(luid))

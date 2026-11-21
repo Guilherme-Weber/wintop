@@ -1,0 +1,20 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut st, 140, 16)"
+---
+"  1 Overview   [2 Processes]   3 GPU    4 Sensors                                                        interval 1000 ms  │  up 0d 05:08:00"
+"╭ processes ────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 6 processes ╮"
+"│      PID Name                                            CPU%▼       Memory       Commit   Threads    Handles          Read         Write│"
+"│     4242 deadlock.exe                                     31.2       6.0 GB      11.9 GB         3        652             0             0│"
+"│     9120 firefox.exe                                       4.7       1.4 GB       2.8 GB         1        130    585.9 KB/s             0│"
+"│     1784 dwm.exe                                           2.1     180.0 MB     360.0 MB        25        894    585.9 KB/s             0│"
+"│     2244 Code.exe                                          1.3     820.0 MB       1.6 GB         5        454    390.6 KB/s             0│"
+"│        4 System                                            0.4          0 B          0 B         5         14    390.6 KB/s             0│"
+"│    15000 um nome de processo bem comprido que não ca…      0.0       3.0 MB       6.0 MB         1        610    585.9 KB/s             0│"
+"│                                                                                                                                          │"
+"│                                                                                                                                          │"
+"│                                                                                                                                          │"
+"│                                                                                                                                          │"
+"│                                                                                                                                          │"
+"╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
+" 1-4 tabs  ↑↓ select  ←→ sort  i invert  / filter  +/- interwintop 0.01% 25.0 MB (33.0 MB commit)  │  collection 1.8 ms  │  sources: all OK "

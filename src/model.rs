@@ -210,6 +210,57 @@ pub struct GpuSlow {
     pub pcie_rx: Metric<u64>,
     /// VRAM dedicada por categoria (como o gputaskman).
     pub vram: Metric<VramBreakdown>,
+    /// Processos com VRAM ou uso de engine (só com a aba GPU visível; `None` fora dela).
+    pub procs: Option<Metric<Vec<GpuProc>>>,
+}
+
+/// Um processo na GPU (aba GPU).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuProc {
+    pub pid: u32,
+    pub name: String,
+    /// VRAM local (dedicada), não local (na RAM) e confirmada, bytes.
+    pub local: u64,
+    pub non_local: u64,
+    pub committed: u64,
+    /// Uso por tipo de engine ("3D", "Copy", "VideoEncode", "Compute_0"...), 0-100; `Err` =
+    /// ainda sem taxa (aba recém-aberta) ou falha do contador.
+    pub engines: Metric<Vec<(String, f64)>>,
+}
+
+impl GpuProc {
+    /// Memória paginada: o confirmado que não está nem na VRAM nem na RAM compartilhada.
+    pub fn paged(&self) -> u64 {
+        self.committed
+            .saturating_sub(self.local)
+            .saturating_sub(self.non_local)
+    }
+}
+
+/// Um processo (aba Processos; RAM e CPU da aba GPU).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proc {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+    /// % do sistema inteiro (todos os lógicos), como o Task Manager.
+    pub cpu: f64,
+    /// Working set privado (coluna "Memory" do Task Manager), bytes.
+    pub mem: u64,
+    /// Bytes privados confirmados.
+    pub commit: u64,
+    pub threads: u32,
+    pub handles: u32,
+    /// Bytes por segundo (todo I/O do processo).
+    pub io_read: f64,
+    pub io_write: f64,
+}
+
+/// Quais abas com coleta própria estão visíveis (o motor só coleta o que aparece).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct View {
+    pub procs: bool,
+    pub gpu: bool,
 }
 
 /// Categoria de uso da VRAM.
@@ -313,6 +364,9 @@ pub struct Fps {
     /// Pipe de frametime: quantas instâncias e clientes conectados.
     pub pipe: Metric<(usize, usize)>,
     pub game: Metric<Game>,
+    /// PIDs com o hook do RTSS (apps 3D, possivelmente jogos com anticheat): a leitura de
+    /// módulos sob demanda nunca abre estes processos.
+    pub hooked: Vec<u32>,
 }
 
 /// Consumo do próprio wintop.
@@ -345,5 +399,7 @@ pub struct Fast {
 pub struct Slow {
     pub gpus: Metric<Vec<GpuSlow>>,
     pub disk_temps: Metric<Vec<DiskTemp>>,
+    /// Processos (só com a aba Processos ou GPU visível; `None` fora delas).
+    pub procs: Option<Metric<Vec<Proc>>>,
     pub took: Duration,
 }

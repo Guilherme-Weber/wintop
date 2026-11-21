@@ -58,7 +58,14 @@ pub fn run() -> i32 {
     let _ = fast.collect();
     std::thread::sleep(WARMUP);
     let f = fast.collect();
-    let s = slow.collect(&std::sync::atomic::AtomicBool::new(false));
+    // Com as abas Processos e GPU "visíveis": prova também as fontes delas (com aquecimento).
+    let s = slow.collect(
+        &std::sync::atomic::AtomicBool::new(false),
+        crate::model::View {
+            procs: true,
+            gpu: true,
+        },
+    );
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
     let fps = RtssCollector::new(false, false).sample();
 
@@ -293,8 +300,30 @@ fn slow_report(r: &mut Report, s: &Slow) {
                         .collect();
                     format!("{} ({} processes)", parts.join(", "), v.processes.len())
                 });
+                if let Some(p) = &g.procs {
+                    r.line(&format!("GPU {} processes", g.index), p, |list| {
+                        let busy = list
+                            .iter()
+                            .filter(|p| p.engines.as_ref().is_ok_and(|e| !e.is_empty()))
+                            .count();
+                        let engines = list
+                            .iter()
+                            .find_map(|p| p.engines.as_ref().err())
+                            .map_or_else(String::new, |e| format!("; engines: {e}"));
+                        format!(
+                            "{} processes, {busy} with engine samples{engines}",
+                            list.len()
+                        )
+                    });
+                }
             }
         }
+    }
+    if let Some(p) = &s.procs {
+        r.line("Processes", p, |list| {
+            let cpu: f64 = list.iter().map(|p| p.cpu).sum();
+            format!("{} processes, CPU sum {:.1}%", list.len(), cpu)
+        });
     }
     match &s.disk_temps {
         Err(e) => r.line("Disk temperature", &Err::<(), _>(e.clone()), |()| {

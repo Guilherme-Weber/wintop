@@ -10,6 +10,7 @@ rust-version = "1.100"
 
 [dependencies]
 windows = { version = "0.62.2", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
@@ -80,3 +81,14 @@ test = true
 
 [dev-dependencies]
 insta = "1.49.0"
+# Só para o `fps_probe` (janela D3D11 que gera FPS conhecido): não entram no binário.
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[example]]
+name = "fps_probe"
+test = false

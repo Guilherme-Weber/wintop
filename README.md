@@ -10,8 +10,8 @@ de jogos.
 
 Em desenvolvimento. Concluídas as etapas de base e provas de viabilidade
 ([docs/spike-etapa0.md](docs/spike-etapa0.md)), coletores nativos, fontes elevadas (PawnIO e
-temperatura dos discos), FPS pelo RTSS, motor de coleta e a aba geral da interface. As abas de
-processos, GPU e sensores, a configuração e o empacotamento ainda estão por vir. O inventário
+temperatura dos discos), FPS pelo RTSS, motor de coleta e as quatro abas da interface (geral,
+processos, GPU por processo e sensores). A configuração e o empacotamento ainda estão por vir. O inventário
 completo de métricas está em [docs/metricas.md](docs/metricas.md), e as diferenças conhecidas em
 relação ao Gerenciador de Tarefas em [docs/divergencias.md](docs/divergencias.md).
 
@@ -25,7 +25,11 @@ wintop --version
 
 Na interface: `1` a `4` trocam de aba, `+` e `-` ajustam o intervalo de atualização (passos de
 100 ms), `r` zera os mínimos e máximos da sessão, `d` recolhe os membros do Storage Space e `q`
-(ou `Esc`, `Ctrl+C`) sai. A interface é em inglês.
+(ou `Esc`, `Ctrl+C`) sai. Nas abas Processos e GPU, as setas (ou `j`/`k`, `PgUp`/`PgDn`,
+`Home`/`End`) selecionam; na aba Processos, `←`/`→` mudam a coluna da ordem, `i` inverte e `/`
+filtra pelo nome ou PID; na aba GPU, `Enter` lista os runtimes de GPU do processo selecionado
+(lendo os módulos carregados; nunca em aplicativos com o hook do RTSS, que podem ser jogos com
+anticheat). A interface é em inglês.
 
 ## Requisitos
 

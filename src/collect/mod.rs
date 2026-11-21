@@ -5,10 +5,15 @@ mod cpu;
 mod disk;
 mod disk_temp;
 mod gpu;
+mod gpu_engine;
 mod memory;
+pub mod modules;
 mod net;
 mod own;
 mod pawnio;
+#[cfg(test)]
+mod probe_tests;
+mod procs;
 pub mod rtss;
 mod vram;
 
@@ -19,7 +24,7 @@ use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFO
 
 use std::sync::atomic::AtomicBool;
 
-use crate::model::{Fast, Metric, Slow, fail};
+use crate::model::{Fast, Metric, Slow, View, fail};
 
 pub use gpu::SharedNvml;
 
@@ -120,10 +125,28 @@ impl FastCollectors {
     }
 }
 
-/// Coletores da thread lenta (leituras caras).
+/// Coletores da thread lenta (leituras caras e as das abas Processos e GPU).
 pub struct SlowCollectors {
     gpu: Result<gpu::GpuSlowCollector, String>,
     disk_temp: Result<disk_temp::DiskTempCollector, String>,
+    procs: procs::ProcCollector,
+    /// Engines por processo já em coleta (aba GPU visível no ciclo anterior).
+    engines_open: bool,
+}
+
+/// Espera entre a 1ª leitura das taxas (aba recém-aberta) e a publicada.
+const TAB_WARMUP: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Dorme `d` em fatias, desistindo se a parada for pedida. `true` = parar.
+fn nap(d: std::time::Duration, stop: &AtomicBool) -> bool {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20).min(end - Instant::now()));
+    }
+    stop.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl SlowCollectors {
@@ -131,17 +154,77 @@ impl SlowCollectors {
         Self {
             gpu: create("GPU PCIe", || gpu::GpuSlowCollector::new(nvml)),
             disk_temp: create("disk temperature", disk_temp::DiskTempCollector::new),
+            procs: procs::ProcCollector::new(),
+            engines_open: false,
         }
     }
 
     /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro).
-    pub fn collect(&mut self, stop: &AtomicBool) -> Slow {
+    /// `view`: abas visíveis; processos e engines da GPU só são coletados com elas à vista
+    /// (ao abrir, uma leitura de aquecimento e ~300 ms de espera: as taxas precisam de duas).
+    pub fn collect(&mut self, stop: &AtomicBool, view: View) -> Slow {
         let start = Instant::now();
-        let gpus = run("GPU PCIe", &mut self.gpu, gpu::GpuSlowCollector::read);
+        let want_procs = view.procs || view.gpu;
+        if !want_procs {
+            self.procs.reset();
+        }
+        if !view.gpu && self.engines_open {
+            if let Ok(g) = &mut self.gpu {
+                g.close_engines();
+            }
+            self.engines_open = false;
+        }
+        // Aquecimento das taxas que acabaram de entrar em vista.
+        let mut warm = false;
+        if want_procs && !self.procs.primed() {
+            let _ = guarded("process", || self.procs.read());
+            warm = true;
+        }
+        if view.gpu
+            && !self.engines_open
+            && let Ok(g) = &mut self.gpu
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| g.collect_engines()));
+            self.engines_open = true;
+            warm = true;
+        }
+        if warm && nap(TAB_WARMUP, stop) {
+            return Slow {
+                gpus: fail("stopping"),
+                disk_temps: fail("stopping"),
+                procs: None,
+                took: start.elapsed(),
+            };
+        }
+        let procs = want_procs.then(|| guarded("process", || self.procs.read()));
+        let engines = if view.gpu {
+            match &mut self.gpu {
+                Ok(g) => catch_unwind(AssertUnwindSafe(|| g.collect_engines()))
+                    .unwrap_or_else(|_| Err("GPU engine collector panicked".into())),
+                Err(e) => Err(e.clone()),
+            }
+        } else {
+            Ok(false)
+        };
+        let gpus = run("GPU PCIe", &mut self.gpu, |g| {
+            let mut list = g.read(view.gpu)?;
+            // Falha da consulta das engines: os processos ficam com a causa.
+            if let Err(e) = &engines {
+                for s in &mut list {
+                    if let Some(Ok(p)) = &mut s.procs {
+                        for x in p.iter_mut() {
+                            x.engines = fail(e.clone());
+                        }
+                    }
+                }
+            }
+            Ok(list)
+        });
         let disk_temps = run("disk temperature", &mut self.disk_temp, |c| c.read(stop));
         Slow {
             gpus,
             disk_temps,
+            procs,
             took: start.elapsed(),
         }
     }

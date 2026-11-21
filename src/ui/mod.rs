@@ -63,7 +63,7 @@ fn event_loop(
             dirty = true;
         }
         if let Some(s) = u.slow {
-            st.slow = Some(s);
+            st.push_slow(s);
             dirty = true;
         }
         if let Some(s) = u.fps {
@@ -87,6 +87,27 @@ fn event_loop(
         // Drena a fila (ex.: dezenas de Resize ao arrastar a janela) antes de redesenhar.
         loop {
             match event::read()? {
+                // Digitando o filtro da aba Processos: as teclas vão para o texto.
+                Event::Key(k) if k.kind == KeyEventKind::Press && st.filtering => {
+                    match k.code {
+                        KeyCode::Esc => {
+                            st.filter.clear();
+                            st.filtering = false;
+                        }
+                        KeyCode::Enter => st.filtering = false,
+                        KeyCode::Backspace => {
+                            st.filter.pop();
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
+                        KeyCode::Char(c) if !c.is_control() && st.filter.chars().count() < 64 => {
+                            st.filter.push(c);
+                        }
+                        _ => {}
+                    }
+                    dirty = true;
+                }
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -111,15 +132,16 @@ fn event_loop(
                         dirty = true;
                     }
                     KeyCode::Char(c @ '1'..='4') => {
-                        st.tab = match c {
+                        st.set_tab(match c {
                             '1' => view::Tab::Overview,
                             '2' => view::Tab::Processes,
                             '3' => view::Tab::Gpu,
                             _ => view::Tab::Sensors,
-                        };
+                        });
+                        engine.set_view(st.view());
                         dirty = true;
                     }
-                    _ => {}
+                    code => dirty |= list_key(&mut st, code),
                 },
                 Event::Resize(..) => dirty = true,
                 _ => {}
@@ -130,6 +152,39 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Teclas das listas (abas Processos e GPU). `true` = redesenhar.
+fn list_key(st: &mut view::State, code: KeyCode) -> bool {
+    let cursor = match st.tab {
+        view::Tab::Processes => &mut st.proc_cursor,
+        view::Tab::Gpu => &mut st.gpu_cursor,
+        _ => return false,
+    };
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => cursor.up(1),
+        KeyCode::Down | KeyCode::Char('j') => cursor.down(1),
+        KeyCode::PageUp => cursor.page_up(),
+        KeyCode::PageDown => cursor.page_down(),
+        KeyCode::Home => cursor.home(),
+        KeyCode::End => cursor.end(),
+        KeyCode::Left if st.tab == view::Tab::Processes => st.proc_sort = st.proc_sort.prev(),
+        KeyCode::Right if st.tab == view::Tab::Processes => st.proc_sort = st.proc_sort.next(),
+        KeyCode::Char('i') if st.tab == view::Tab::Processes => {
+            st.proc_reverse = !st.proc_reverse;
+        }
+        KeyCode::Char('/') if st.tab == view::Tab::Processes => st.filtering = true,
+        KeyCode::Enter if st.tab == view::Tab::Gpu => {
+            // Sob demanda: abre o processo selecionado (nunca o jogo nem apps com o hook do
+            // RTSS, recusados antes de abrir).
+            if let Some(pid) = st.gpu_cursor.pid() {
+                let r = crate::collect::modules::runtimes(pid, &st.protected_pids());
+                st.runtimes.insert(pid, r);
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Hora local (hora, minuto, segundo) para a barra de abas.

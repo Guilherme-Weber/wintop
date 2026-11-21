@@ -18,9 +18,14 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::widgets::{DIM, Graph, GraphColor, Meter, Segmented};
 use crate::fmt::{bits, bytes, num};
 use crate::model::{
-    Disk, Fast, Fps, Gpu, Memory, Metric, Missing, Nic, Slow, VramBreakdown, VramKind,
+    Disk, Fast, Fps, Gpu, GpuProc, Memory, Metric, Missing, Nic, Proc, Slow, View, VramBreakdown,
+    VramKind,
 };
 use crate::win::printable;
+
+mod tabs;
+
+pub use tabs::{Cursor, ProcSort};
 
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
 const HISTORY: usize = 1000;
@@ -127,6 +132,8 @@ struct Session {
     recv: HashMap<String, MinMax>,
     fps: MinMax,
     ft: MinMax,
+    /// Aba Sensores: extremos de cada sensor numérico, pela chave "grupo/nome".
+    sensors: HashMap<String, MinMax>,
 }
 
 /// Estado da interface: os últimos dados, o histórico dos gráficos e os extremos da sessão.
@@ -156,6 +163,19 @@ pub struct State {
     pending_fps: Option<f64>,
     pending_ft: Option<f64>,
     session: Session,
+    /// Aba Processos: a última lista (só chega com a aba visível), cursor, ordem e filtro.
+    pub procs: Option<Metric<Vec<Proc>>>,
+    pub proc_cursor: Cursor,
+    pub proc_sort: ProcSort,
+    /// Inverte a ordem natural da coluna (tecla `i`).
+    pub proc_reverse: bool,
+    pub filter: String,
+    /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
+    pub filtering: bool,
+    /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
+    pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
+    pub gpu_cursor: Cursor,
+    pub runtimes: HashMap<u32, Metric<Vec<&'static str>>>,
 }
 
 impl State {
@@ -169,6 +189,61 @@ impl State {
     /// Zera os extremos da sessão (tecla `r`).
     /// O histórico do jogo também: só o `r` o zera (jogos trocam de executável e congelam ao
     /// carregar, e isso não deve apagar o gráfico).
+    /// Abas com coleta própria visíveis (o motor só coleta o que aparece).
+    pub fn view(&self) -> View {
+        View {
+            procs: self.tab == Tab::Processes,
+            gpu: self.tab == Tab::Gpu,
+        }
+    }
+
+    /// Troca de aba: a lista da aba que sai é descartada (ao voltar, espera dado novo em vez
+    /// de mostrar um retrato velho).
+    pub fn set_tab(&mut self, t: Tab) {
+        if t != self.tab {
+            self.tab = t;
+            self.procs = None;
+            self.gpu_procs = None;
+            self.filtering = false;
+        }
+    }
+
+    /// Nova coleta da thread lenta.
+    pub fn push_slow(&mut self, s: Slow) {
+        if let Some(p) = &s.procs
+            && self.tab == Tab::Processes
+        {
+            self.procs = Some(p.clone());
+        }
+        if self.tab == Tab::Gpu {
+            if let Some(p) = &s.procs {
+                self.procs = Some(p.clone());
+            }
+            match &s.gpus {
+                Ok(list) => {
+                    if let Some(p) = list.first().and_then(|g| g.procs.clone()) {
+                        self.gpu_procs = Some(p);
+                    }
+                }
+                Err(e) => self.gpu_procs = Some(Err(e.clone())),
+            }
+        }
+        self.slow = Some(s);
+        self.update_sensors();
+    }
+
+    /// PIDs que a leitura de módulos nunca abre: o jogo e os apps com o hook do RTSS.
+    pub fn protected_pids(&self) -> Vec<u32> {
+        let mut v = Vec::new();
+        if let Some(f) = &self.fps {
+            v.extend(&f.hooked);
+            if let Ok(g) = &f.game {
+                v.push(g.pid);
+            }
+        }
+        v
+    }
+
     pub fn reset_session(&mut self) {
         self.session = Session::default();
         self.game_fps = Series::default();
@@ -282,6 +357,7 @@ impl State {
             self.game_ft.push(ft.unwrap_or(0.0));
         }
         self.fast = Some(f);
+        self.update_sensors();
     }
 
     /// Novo estado do RTSS (a cada 250 ms com jogo): o número de FPS atualiza na hora; os
@@ -302,6 +378,15 @@ impl State {
             }
         }
         self.fps = Some(s);
+    }
+
+    /// Extremos da sessão de cada sensor numérico (aba Sensores), com os dados atuais.
+    fn update_sensors(&mut self) {
+        for r in tabs::sensor_rows(self) {
+            if let (Some(key), tabs::SensorValue::Num(Ok(v), ..)) = (r.key(), &r.value) {
+                self.session.sensors.entry(key).or_default().update(*v);
+            }
+        }
     }
 }
 
@@ -410,20 +495,11 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     .areas(frame.area());
     draw_tabs(frame, tabs, st);
     draw_footer(frame, footer, st);
-    if st.tab != Tab::Overview {
-        let name = match st.tab {
-            Tab::Processes => "processes",
-            Tab::Gpu => "gpu",
-            _ => "sensors",
-        };
-        frame.render_widget(
-            Paragraph::new(label(
-                "this tab arrives in stage 6 (press 1 for the overview)",
-            ))
-            .block(boxed(name, "")),
-            body,
-        );
-        return;
+    match st.tab {
+        Tab::Overview => {}
+        Tab::Processes => return tabs::draw_processes(frame, body, st),
+        Tab::Gpu => return tabs::draw_gpu_tab(frame, body, st),
+        Tab::Sensors => return tabs::draw_sensors(frame, body, st),
     }
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(body);
@@ -499,18 +575,34 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
         )
     };
-    let left = Line::from(vec![
-        key(" 1-4"),
-        label(" tabs  "),
+    // Atalhos da aba primeiro (o que sobra da largura corta o fim da ajuda).
+    let mut left = vec![key(" 1-4"), label(" tabs  ")];
+    let pairs: &[(&str, &str)] = match st.tab {
+        Tab::Overview => &[("r", " reset min/max  "), ("d", " fold pool  ")],
+        Tab::Processes if st.filtering => &[
+            ("type", " to filter  "),
+            ("enter", " keep  "),
+            ("esc", " clear  "),
+        ],
+        Tab::Processes => &[
+            ("↑↓", " select  "),
+            ("←→", " sort  "),
+            ("i", " invert  "),
+            ("/", " filter  "),
+        ],
+        Tab::Gpu => &[("↑↓", " select  "), ("enter", " runtimes  ")],
+        Tab::Sensors => &[("r", " reset min/max  ")],
+    };
+    for (k, l) in pairs {
+        left.extend([key(k), label(l)]);
+    }
+    left.extend([
         key("+/-"),
         label(&format!(" interval {} ms  ", st.interval_ms)),
-        key("r"),
-        label(" reset min/max  "),
-        key("d"),
-        label(" fold pool  "),
         key("q"),
         label(" quit"),
     ]);
+    let left = Line::from(left);
     let mut right = Vec::new();
     if let Some(f) = &st.fast {
         match &f.own {

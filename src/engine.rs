@@ -12,7 +12,7 @@
 //! número de sequência; quem exibe só copia o que mudou. A parada é imediata: as esperas
 //! acordam pela `Condvar` (e pelo evento de parada, no pipe).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use crate::collect::{FastCollectors, RtssCollector, SlowCollectors, rtss};
-use crate::model::{Fast, Fps, Slow};
+use crate::model::{Fast, Fps, Slow, View};
 
 pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 pub const MIN_INTERVAL_MS: u64 = 100;
@@ -57,6 +57,10 @@ struct Shared {
     interval_ms: AtomicU64,
     /// Cópia de `State::stop` legível sem o lock (laços longos dos coletores).
     stopping: AtomicBool,
+    /// Abas visíveis com coleta própria (bit 0: processos; bit 1: GPU por processo).
+    view: AtomicU8,
+    /// Uma aba acabou de entrar em vista: a thread lenta coleta já, sem esperar o período.
+    kick: AtomicBool,
 }
 
 impl Shared {
@@ -90,7 +94,14 @@ impl Shared {
     /// Espera a próxima coleta: `base` é o instante agendado da anterior e o período é
     /// `intervalo × factor`. Um intervalo novo (teclas `+`/`-`) vale na hora: o prazo é refeito a
     /// partir de `base` (se já passou, coleta agora). Devolve a nova base, ou `None` = parar.
-    fn wait_tick(&self, base: Instant, factor: u32, floor: Duration) -> Option<Instant> {
+    /// `kick`: com `Some`, um chute (aba aberta) encerra a espera na hora.
+    fn wait_tick(
+        &self,
+        base: Instant,
+        factor: u32,
+        floor: Duration,
+        kick: Option<&AtomicBool>,
+    ) -> Option<Instant> {
         let period = |ms: u64| (Duration::from_millis(ms) * factor).max(floor);
         let mut st = self.lock();
         // Lido com o lock: `set_interval_ms` grava com o lock, então nenhuma mudança se perde
@@ -100,6 +111,9 @@ impl Shared {
         loop {
             if st.stop {
                 return None;
+            }
+            if kick.is_some_and(|k| k.swap(false, Ordering::Relaxed)) {
+                return Some(Instant::now());
             }
             let ms = self.interval_ms.load(Ordering::Relaxed);
             let now = Instant::now();
@@ -148,6 +162,8 @@ impl Engine {
             wake: Condvar::new(),
             interval_ms: AtomicU64::new(clamp_interval(interval_ms)),
             stopping: AtomicBool::new(false),
+            view: AtomicU8::new(0),
+            kick: AtomicBool::new(false),
         });
         // Um NVML para as duas threads (iniciado aqui, antes delas: sem nvmlInit simultâneo).
         let nvml = crate::collect::shared_nvml();
@@ -177,7 +193,7 @@ impl Engine {
                                 st.fast = Some(snap);
                                 st.fast_seq += 1;
                             }
-                            match sh.wait_tick(next, 1, Duration::ZERO) {
+                            match sh.wait_tick(next, 1, Duration::ZERO, None) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -216,13 +232,14 @@ impl Engine {
                             if sh.stopping.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let snap = c.collect(&sh.stopping);
+                            let view = view_from_bits(sh.view.load(Ordering::Relaxed));
+                            let snap = c.collect(&sh.stopping, view);
                             {
                                 let mut st = sh.lock();
                                 st.slow = Some(snap);
                                 st.slow_seq += 1;
                             }
-                            match sh.wait_tick(next, SLOW_FACTOR, SLOW_FLOOR) {
+                            match sh.wait_tick(next, SLOW_FACTOR, SLOW_FLOOR, Some(&sh.kick)) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -272,6 +289,20 @@ impl Engine {
 
     pub fn interval_ms(&self) -> u64 {
         self.shared.interval_ms.load(Ordering::Relaxed)
+    }
+
+    /// Abas visíveis. Uma aba que entra em vista acorda a thread lenta na hora; uma que sai
+    /// para a coleta dela no ciclo seguinte.
+    pub fn set_view(&self, v: View) {
+        let bits = u8::from(v.procs) | (u8::from(v.gpu) << 1);
+        let old = {
+            let _st = self.shared.lock();
+            self.shared.view.swap(bits, Ordering::Relaxed)
+        };
+        if bits & !old != 0 {
+            self.shared.kick.store(true, Ordering::Relaxed);
+            self.shared.wake.notify_all();
+        }
     }
 
     /// Ajusta o intervalo (teclas `+`/`-`); vale a partir da próxima espera.
@@ -345,6 +376,13 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
                 return;
             }
         }
+    }
+}
+
+fn view_from_bits(b: u8) -> View {
+    View {
+        procs: b & 1 != 0,
+        gpu: b & 2 != 0,
     }
 }
 

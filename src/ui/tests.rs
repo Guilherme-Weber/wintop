@@ -190,6 +190,7 @@ fn slow() -> Slow {
                 ],
                 processes: vec![],
             }),
+            procs: None,
         }]),
         disk_temps: Ok(vec![
             t(0, Ok(39), "SMART 194"),
@@ -197,6 +198,7 @@ fn slow() -> Slow {
             t(7, Ok(47), "native"),
             t(8, Ok(40), "pool members"),
         ]),
+        procs: None,
         took: Duration::from_millis(60),
     }
 }
@@ -218,6 +220,7 @@ fn game() -> Fps {
             bound: Ok("GPU"),
             peak_ms: Some(11.4),
         }),
+        hooked: vec![4242],
     }
 }
 
@@ -272,6 +275,7 @@ fn falhas_e_estados_neutros() {
         rtss: Err(Missing::Fail("RTSS not running".into())),
         pipe: Ok((8, 0)),
         game: Err(Missing::Fail("RTSS not running".into())),
+        hooked: vec![],
     });
     insta::assert_snapshot!(render(&mut st, 140, 40));
 }
@@ -450,6 +454,7 @@ fn sem_jogo_fica_idle_com_os_graficos() {
         rtss: Ok("shared memory 2.21".into()),
         pipe: Ok((8, 1)),
         game: Err(Missing::Neutral("no 3D game in focus".into())),
+        hooked: vec![],
     });
     st.push_fast(fast(200));
     let out = render(&mut st, 160, 48);
@@ -477,5 +482,199 @@ fn causa_longa_de_falha_quebra_sem_cortar() {
         let flat: String = out.split('\n').collect::<Vec<_>>().join(" ");
         assert!(flat.contains("194/190)"), "{w}x{h}:\n{out}");
         assert!(flat.contains("! E: temp: SMART:"), "{out}");
+    }
+}
+
+// --- Abas Processos, GPU e Sensores ---
+
+fn proc(pid: u32, name: &str, cpu: f64, mem_mb: u64) -> crate::model::Proc {
+    crate::model::Proc {
+        pid,
+        parent: 4,
+        name: name.into(),
+        cpu,
+        mem: mem_mb * MB,
+        commit: mem_mb * 2 * MB,
+        threads: pid % 40 + 1,
+        handles: pid % 900 + 10,
+        io_read: f64::from(pid % 7) * 100_000.0,
+        io_write: 0.0,
+    }
+}
+
+fn proc_list() -> Vec<crate::model::Proc> {
+    vec![
+        proc(4, "System", 0.4, 0),
+        proc(4242, "deadlock.exe", 31.2, 6100),
+        proc(1784, "dwm.exe", 2.1, 180),
+        proc(9120, "firefox.exe", 4.7, 1450),
+        proc(2244, "Code.exe", 1.3, 820),
+        proc(
+            15000,
+            "um nome de processo bem comprido que não cabe.exe",
+            0.0,
+            3,
+        ),
+    ]
+}
+
+fn gpu_list() -> Vec<crate::model::GpuProc> {
+    let p = |pid, name: &str, local, engines: Vec<(&str, f64)>| crate::model::GpuProc {
+        pid,
+        name: name.into(),
+        local,
+        non_local: local / 20,
+        committed: local + local / 10,
+        engines: Ok(engines
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()),
+    };
+    vec![
+        p(1784, "dwm.exe", 546 * MB, vec![("3D", 3.0), ("Copy", 0.4)]),
+        p(
+            4242,
+            "deadlock.exe",
+            7 * GB,
+            vec![("3D", 92.5), ("Copy", 4.0), ("VideoDecode", 0.0)],
+        ),
+        p(9120, "firefox.exe", 855 * MB, vec![("VideoDecode", 12.0)]),
+        p(7000, "ollama.exe", 0, vec![("Compute_0", 0.0)]),
+    ]
+}
+
+fn tab_state(tab: view::Tab) -> State {
+    let mut st = filled();
+    st.set_tab(tab);
+    let mut s = slow();
+    s.procs = Some(Ok(proc_list()));
+    if let Ok(g) = &mut s.gpus {
+        g[0].procs = Some(Ok(gpu_list()));
+    }
+    st.push_slow(s);
+    st
+}
+
+#[test]
+fn aba_processos() {
+    let mut st = tab_state(view::Tab::Processes);
+    insta::assert_snapshot!(render(&mut st, 140, 16));
+}
+
+#[test]
+fn aba_gpu() {
+    let mut st = tab_state(view::Tab::Gpu);
+    st.runtimes.insert(1784, Ok(vec!["D3D11", "D3D12"]));
+    insta::assert_snapshot!(render(&mut st, 160, 20));
+}
+
+#[test]
+fn aba_sensores() {
+    let mut st = tab_state(view::Tab::Sensors);
+    insta::assert_snapshot!(render(&mut st, 160, 30));
+}
+
+#[test]
+fn sensores_em_colunas_quando_nao_cabem() {
+    let mut st = tab_state(view::Tab::Sensors);
+    let out = render(&mut st, 160, 16);
+    // Os grupos vão para a coluna ao lado em vez de sumir.
+    for g in ["CPU", "GPU 0", "Disks", "Tctl", "Fan 2 RPM"] {
+        assert!(out.contains(g), "{g}\n{out}");
+    }
+}
+
+#[test]
+fn abas_novas_sem_vazamento_em_qualquer_tamanho() {
+    for tab in [view::Tab::Processes, view::Tab::Gpu, view::Tab::Sensors] {
+        let mut st = tab_state(tab);
+        for (w, h) in [
+            (1, 1),
+            (10, 3),
+            (30, 8),
+            (45, 12),
+            (60, 24),
+            (100, 30),
+            (300, 100),
+        ] {
+            let _ = render(&mut st, w, h);
+        }
+        bordas_intactas(&mut st, 60, 24);
+    }
+}
+
+#[test]
+fn ordem_e_filtro_dos_processos() {
+    let mut st = tab_state(view::Tab::Processes);
+    let out = render(&mut st, 140, 16);
+    let pos = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s}\n{out}"));
+    // CPU decrescente por padrão.
+    assert!(pos("deadlock.exe") < pos("firefox.exe"));
+    assert!(pos("firefox.exe") < pos("dwm.exe"));
+    // Por nome (←), crescente.
+    st.proc_sort = view::ProcSort::Name;
+    let out = render(&mut st, 140, 16);
+    let pos = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s}\n{out}"));
+    assert!(pos("Code.exe") < pos("deadlock.exe"));
+    // Filtro por parte do nome, sem diferenciar maiúsculas.
+    st.filter = "FIRE".into();
+    let out = render(&mut st, 140, 16);
+    assert!(
+        out.contains("firefox.exe") && !out.contains("dwm.exe"),
+        "{out}"
+    );
+    assert!(out.contains("1 of 6"), "{out}");
+}
+
+#[test]
+fn selecao_segue_o_pid_entre_coletas() {
+    let mut st = tab_state(view::Tab::Processes);
+    let _ = render(&mut st, 140, 16);
+    st.proc_cursor.down(1);
+    let _ = render(&mut st, 140, 16);
+    // 2º por CPU = firefox.
+    assert_eq!(st.proc_cursor.pid(), Some(9120));
+    // Nova coleta muda a ordem: a seleção continua no firefox.
+    let mut list = proc_list();
+    list[3].cpu = 90.0;
+    let mut s = slow();
+    s.procs = Some(Ok(list));
+    st.push_slow(s);
+    let _ = render(&mut st, 140, 16);
+    assert_eq!(st.proc_cursor.pid(), Some(9120));
+    st.proc_cursor.end();
+    let _ = render(&mut st, 140, 16);
+    assert_eq!(st.proc_cursor.pid(), Some(15000));
+}
+
+#[test]
+fn troca_de_aba_descarta_a_lista_velha() {
+    let mut st = tab_state(view::Tab::Processes);
+    st.set_tab(view::Tab::Overview);
+    st.set_tab(view::Tab::Processes);
+    let out = render(&mut st, 140, 16);
+    assert!(out.contains("waiting for the first collection"), "{out}");
+}
+
+#[test]
+fn protegidos_incluem_jogo_e_apps_com_hook() {
+    let mut st = filled();
+    let mut f = game();
+    f.hooked = vec![1784, 4242];
+    st.push_fps(f);
+    let p = st.protected_pids();
+    assert!(p.contains(&1784) && p.contains(&4242), "{p:?}");
+}
+
+#[test]
+fn sensores_em_tela_larga_nao_cortam_nomes() {
+    let mut st = tab_state(view::Tab::Sensors);
+    for w in [200, 216, 230, 247, 300] {
+        let out = render(&mut st, w, 60);
+        assert!(
+            out.contains("Disk 8 Microsoft Storage Space Device"),
+            "{w}
+{out}"
+        );
     }
 }

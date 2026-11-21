@@ -101,10 +101,10 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| VRAM local, não local (spill), paginada | PDH `\GPU Process Memory(*)`: `Local Usage`, `Non Local Usage`, `Total Committed` (paginada = max(committed - local - non local, 0)) | | | PS |
-| Uso por engine (3D, Copy, Video Encode, Video Decode, Compute) | PDH `\GPU Engine(*)\Utilization Percentage` (query aberta só com a aba visível) | | | E6 |
+| VRAM local, não local (spill), paginada | PDH `\GPU Process Memory(*)`: `Local Usage`, `Non Local Usage`, `Total Committed` (paginada = max(committed - local - non local, 0)) | | | E6 (fps_probe: 256 MB alocados → 270 MB locais) |
+| Uso por engine (3D, Copy, Video Encode, Video Decode, Compute) | PDH `\GPU Engine(*)\Utilization Percentage` (consulta aberta só com a aba visível; por processo e tipo, o maior entre as engines do tipo; coluna "GPU%" = engine mais usada, como o Task Manager) | | "waiting for a second sample" (aba recém-aberta) | E6 (fps_probe: engine 3D do PID do probe; ~800 instâncias em 2,4 ms) |
 | RAM e CPU % do processo | `SystemProcessInformation` | | | E6 |
-| Runtimes (CUDA, Vulkan, D3D11/12, OpenGL, ONNX) | **sob demanda** (tecla no processo selecionado), módulos carregados; nunca no jogo ativo | A | "protegido" (acesso negado) | E6 |
+| Runtimes (CUDA, Vulkan, D3D9/10/11/12, OpenGL, OpenCL, ONNX, DirectML, NVENC/NVDEC) | **sob demanda** (Enter no processo selecionado), módulos carregados pelo Toolhelp; nunca no jogo ativo nem em PID com o hook do RTSS | A | "protected" (acesso negado); "skipped: 3D app hooked by RTSS" | E6 |
 
 ## FPS (jogo em primeiro plano, via RTSS)
 
@@ -120,8 +120,8 @@ aberto antes do wintop)"** até o jogo reiniciar.
 | API 3D | `dwFlags & 0xFFFF` | | | Spike |
 | Resolução | `dwResolutionX/Y` (v2.20+) | | | Spike |
 | FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (pipe e SHM) |
-| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock) |
-| 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s) |
+| Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock); E6 (fps_probe, frametime pelo pipe: 10-50 ms programados = 8,5-50,3 ms medidos, diferença do jitter do próprio probe) |
+| 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s); E6 (fps_probe: 1% low 19,96 e 0,1% low 19,90 × 20,00 esperado; FPS 92,62 × 92,59) |
 | Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
 | RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 (só no modo normal; o `--check` não inicia o RTSS nem cria o pipe) |
 
@@ -129,7 +129,15 @@ aberto antes do wintop)"** até o jogo reiniciar.
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
-| Nome, PID, CPU %, memória (working set, privada), threads, handles, I/O de leitura/escrita | `NtQuerySystemInformation(SystemProcessInformation)` (uma chamada) | A (para ver todos) | | E6 |
+| Nome, PID, CPU %, memória (working set privado, como a coluna "Memory" do Task Manager; commit privado), threads, handles, I/O de leitura/escrita por segundo | `NtQuerySystemInformation(SystemProcessInformation)` (uma chamada, sem abrir nenhum processo; thread lenta, só com a aba Processos ou GPU visível); CPU = Δ(kernel + user) ÷ Δ tempo do sistema | | "waiting for the first collection" (aba recém-aberta) | E6 (carga conhecida: 1 lógico ocupado = 6,25% × 6,25% esperado; 64 MB gravados = 64,0 MB) |
+
+## Sensores (aba)
+
+Todas as leituras físicas já coletadas para a aba geral, numa tabela com valor atual, mínimo e
+máximo da sessão (`r` zera): CPU (Tctl, CCDs, potência do pacote, clock), GPU (temperatura,
+limite de slowdown, potência e limite, clocks, fans em % e RPM, P-state, throttling, link PCIe) e
+temperatura de cada disco. Temperaturas só número, sem cor. Mesmas fontes e estados neutros das
+seções acima; nenhuma fonte nova. Prova: E6 (aba conferida em tela cheia).
 
 ## Diagnóstico
 
