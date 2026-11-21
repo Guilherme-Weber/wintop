@@ -273,7 +273,9 @@ impl PawnIo {
 /// monitores sem elevação esperar e liberar o mutex (SYNCHRONIZE | MUTEX_MODIFY_STATE para
 /// usuários autenticados).
 fn open_pci_mutex() -> Result<OwnedHandle, String> {
-    let sddl = wide("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;AU)");
+    // S:(ML;;NW;;;ME): sem o rótulo, o objeto criado por um processo elevado fica com
+    // integridade alta e a escrita (MUTEX_MODIFY_STATE) é negada a quem roda em média.
+    let sddl = wide("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;AU)S:(ML;;NW;;;ME)");
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: SDDL terminado em zero; o descritor é liberado logo após o uso.
     unsafe {
@@ -343,7 +345,7 @@ fn install_dir() -> Result<PathBuf, String> {
     .map_err(|e| format!("PawnIO not installed (InstallLocation: {e})"))?;
     let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let dir = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-    if dir.as_os_str().is_empty() || !dir.is_absolute() {
+    if !crate::win::is_local_absolute(&dir) {
         return Err(format!(
             "invalid PawnIO InstallLocation: {:?}",
             dir.display()

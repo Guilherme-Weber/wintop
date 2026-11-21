@@ -76,6 +76,10 @@ fn main() {
         }
     }
 
+    // O --check só diagnostica (não cria o pipe nem inicia o RTSS): roda com a TUI aberta.
+    if arg.is_some() {
+        std::process::exit(check::run());
+    }
     let _instance = match instance::acquire() {
         Ok(guard) => guard,
         Err(instance::Error::AlreadyRunning) => {
@@ -88,9 +92,6 @@ fn main() {
         }
     };
 
-    if arg.is_some() {
-        std::process::exit(check::run());
-    }
     run_ui();
 }
 
@@ -108,10 +109,9 @@ fn run_ui() {
         DONE.store(true, Ordering::SeqCst);
         return;
     }
-    let engine = engine::Engine::start(engine::DEFAULT_INTERVAL_MS);
-    let result = ui::run(&engine, &STOP);
-    // Para as threads antes de sair (handles fechados, PawnIO e NVML liberados).
-    drop(engine);
+    // O motor é iniciado dentro da TUI, depois do terminal e do panic hook prontos, e parado
+    // antes de o terminal ser restaurado.
+    let result = ui::run(|| engine::Engine::start(engine::DEFAULT_INTERVAL_MS), &STOP);
     DONE.store(true, Ordering::SeqCst);
     if let Err(e) = result {
         eprintln!("wintop: terminal error: {e}");

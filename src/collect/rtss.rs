@@ -14,6 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -912,13 +913,17 @@ fn min_max_ms(us: &[u32]) -> Option<(f64, f64)> {
 fn start_rtss() -> Result<(), String> {
     let path = win::reg_sz_32(RTSS_KEY, "InstallPath").ok_or("RTSS not installed")?;
     let path = std::path::PathBuf::from(path);
-    if !path.is_absolute() || !path.is_file() {
+    if !win::is_local_absolute(&path) || !path.is_file() {
         return Err(format!("invalid RTSS InstallPath {}", path.display()));
     }
     let dir = path.parent().ok_or("RTSS InstallPath has no folder")?;
     // Diretório de trabalho = pasta do RTSS (não o do wintop, que pode ser gravável pelo
     // usuário) e sem herdar a entrada e a saída do wintop.
+    // Processo próprio e fora do grupo de console do wintop (Ctrl+C no wintop não o atinge).
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     std::process::Command::new(&path)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

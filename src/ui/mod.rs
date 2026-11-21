@@ -17,7 +17,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use crate::engine::{Engine, STEP_MS, Seen};
 
 /// Roda até `q`, Esc, Ctrl+C ou `stop` (Ctrl+Break / fechar a janela, pelo handler do console).
-pub fn run(engine: &Engine, stop: &AtomicBool) -> std::io::Result<()> {
+/// `start` inicia o motor depois do terminal e do panic hook (um pânico precoce de coletor não
+/// desfaz o terminal); o motor é parado antes de o terminal ser restaurado.
+pub fn run(start: impl FnOnce() -> Engine, stop: &AtomicBool) -> std::io::Result<()> {
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -32,7 +34,10 @@ pub fn run(engine: &Engine, stop: &AtomicBool) -> std::io::Result<()> {
             ratatui_hook(info);
         }
     }));
-    let result = event_loop(&mut terminal, engine, stop);
+    let engine = start();
+    let result = event_loop(&mut terminal, &engine, stop);
+    // Threads paradas (handles fechados, PawnIO e NVML liberados) antes de restaurar.
+    drop(engine);
     ratatui::restore();
     result
 }

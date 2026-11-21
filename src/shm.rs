@@ -108,7 +108,15 @@ impl SharedView {
     pub fn cstr(&self, off: usize, max: usize) -> Option<String> {
         let b = self.bytes(off, max)?;
         let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-        Some(b[..end].iter().map(|&c| char::from(c)).collect())
+        // Controles (C0 e os C1 que o Latin-1 mapeia de 0x80-0x9F) viram '?': nada de
+        // sequências de terminal vindas de outro processo.
+        Some(
+            b[..end]
+                .iter()
+                .map(|&c| char::from(c))
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect(),
+        )
     }
 
     /// Deslocamento da entrada `i` de um array `[base + i*size]`, só se a entrada inteira

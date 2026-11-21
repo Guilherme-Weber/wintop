@@ -3,7 +3,8 @@
 
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::ProcessStatus::{
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    PROCESS_MEMORY_COUNTERS_EX2,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
 
@@ -78,12 +79,39 @@ impl OwnCollector {
                 pm.cb,
             )
         }
-        .map(|()| (pm.PrivateWorkingSetSize as u64, pm.PrivateUsage as u64))
-        .map_err(|e| format!("GetProcessMemoryInfo: {e}"));
+        .map(|()| (pm.PrivateWorkingSetSize as u64, pm.PrivateUsage as u64));
+        let (private_ws, commit) = match mem {
+            Ok((ws, c)) => (Ok(ws), Ok(c)),
+            // Antes do Windows 11 22H2 a versão EX2 é recusada: a EX dá a confirmada.
+            Err(e2) => {
+                let mut ex = PROCESS_MEMORY_COUNTERS_EX {
+                    cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                    ..Default::default()
+                };
+                // SAFETY: estrutura local com cb preenchido.
+                let r = unsafe {
+                    GetProcessMemoryInfo(
+                        GetCurrentProcess(),
+                        (&raw mut ex).cast::<PROCESS_MEMORY_COUNTERS>(),
+                        ex.cb,
+                    )
+                };
+                match r {
+                    Ok(()) => (
+                        fail(format!("private working set needs Windows 11 22H2+ ({e2})")),
+                        Ok(ex.PrivateUsage as u64),
+                    ),
+                    Err(e) => (
+                        fail(format!("GetProcessMemoryInfo: {e}")),
+                        fail(format!("GetProcessMemoryInfo: {e}")),
+                    ),
+                }
+            }
+        };
         Ok(OwnUsage {
             cpu,
-            private_ws: mem.clone().map(|m| m.0).or_else(fail),
-            commit: mem.map(|m| m.1).or_else(fail),
+            private_ws,
+            commit,
         })
     }
 }

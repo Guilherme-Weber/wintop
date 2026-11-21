@@ -24,6 +24,10 @@ fn main() {
     );
 
     copy_module();
+    // Processo elevado: o loader resolve as importações estáticas (pdh, dxgi, iphlpapi,
+    // setupapi, ...) só em System32, nunca na pasta do exe (DLL planting antes do `main`, onde o
+    // SetDefaultDllDirectories ainda não rodou). 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32.
+    println!("cargo:rustc-link-arg-bin=wintop=/DEPENDENTLOADFLAG:0x800");
 
     let mut res = winresource::WindowsResource::new();
     res.set_manifest_file("wintop.exe.manifest");

@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::widgets::{DIM, Graph, Meter, gradient};
 use crate::fmt::{bits, bytes, num};
 use crate::model::{Disk, Fast, Fps, Metric, Missing, Slow};
+use crate::win::printable;
 
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
 const HISTORY: usize = 1000;
@@ -209,7 +210,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         return;
     };
-    let name = c.name.as_ref().map_or("cpu".to_string(), Clone::clone);
+    let name = c.name.as_ref().map_or("cpu".to_string(), |n| printable(n));
     let block = boxed(&format!("cpu  {name}"), BORDER_CPU);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -332,7 +333,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let Some(g) = list.first() else {
         return;
     };
-    let name = g.name.as_ref().map_or("gpu".to_string(), Clone::clone);
+    let name = g.name.as_ref().map_or("gpu".to_string(), |n| printable(n));
     let block = boxed(&format!("gpu  {name}"), BORDER_GPU);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -512,7 +513,7 @@ fn disk_name(d: &Disk) -> String {
     } else {
         d.letters.join(" ")
     };
-    let model = d.model.as_ref().map_or(String::new(), Clone::clone);
+    let model = d.model.as_ref().map_or(String::new(), |m| printable(m));
     format!("{letters} {model}")
 }
 
@@ -640,7 +641,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             break;
         }
         let head = Line::from(vec![Span::styled(
-            truncate(&n.alias, usize::from(NAME_W) - 1),
+            truncate(&printable(&n.alias), usize::from(NAME_W) - 1),
             Style::new().fg(TEXT),
         )]);
         frame.render_widget(
@@ -687,7 +688,7 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         y += half * 2;
     }
     if !down.is_empty() && y < bottom {
-        let names: Vec<String> = down.iter().map(|n| n.alias.clone()).collect();
+        let names: Vec<String> = down.iter().map(|n| printable(&n.alias)).collect();
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 label("disconnected: "),
@@ -717,7 +718,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     };
     let title = format!(
         "game  {} ({}){}",
-        g.name,
+        printable(&g.name),
         g.api,
         if g.approx { "  approx." } else { "" }
     );

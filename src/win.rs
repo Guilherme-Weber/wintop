@@ -9,7 +9,7 @@ use windows::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
+    HKEY_LOCAL_MACHINE, REG_ROUTINE_FLAGS, RRF_NOEXPAND, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
     RRF_SUBKEY_WOW6432KEY, RegGetValueW,
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
@@ -25,6 +25,14 @@ pub fn wide(s: &str) -> Vec<u16> {
 pub fn from_wide(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
+}
+
+/// Texto vindo de fora (nomes de dispositivos, interfaces): controles viram '?', para não
+/// chegarem ao terminal como sequências.
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Dono de um `HANDLE` do Win32: fecha no `Drop` (inclusive em caminhos de erro).
@@ -111,7 +119,8 @@ pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
             HKEY_LOCAL_MACHINE,
             PCWSTR(k.as_ptr()),
             PCWSTR(v.as_ptr()),
-            REG_ROUTINE_FLAGS(RRF_RT_REG_SZ.0 | RRF_SUBKEY_WOW6432KEY.0),
+            // NOEXPAND: REG_EXPAND_SZ é recusado (o ambiente é herdado de quem abriu o wintop).
+            REG_ROUTINE_FLAGS(RRF_RT_REG_SZ.0 | RRF_SUBKEY_WOW6432KEY.0 | RRF_NOEXPAND.0),
             None,
             Some(buf.as_mut_ptr().cast()),
             Some(&raw mut len),
@@ -122,6 +131,16 @@ pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
     }
     let s = from_wide(&buf[..(len as usize / 2).min(buf.len())]);
     (!s.is_empty()).then_some(s)
+}
+
+/// Caminho local e absoluto (`C:\...`): sem UNC (`\\servidor\...`), sem `\\?\` e sem `..`.
+/// Para caminhos lidos do registro antes de carregar ou executar algo elevado.
+pub fn is_local_absolute(p: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut c = p.components();
+    matches!(c.next(), Some(Component::Prefix(x)) if matches!(x.kind(), Prefix::Disk(_)))
+        && matches!(c.next(), Some(Component::RootDir))
+        && c.all(|x| matches!(x, Component::Normal(_)))
 }
 
 /// `true` quando o processo atual roda elevado.
@@ -164,6 +183,17 @@ mod tests {
         assert_eq!(drive_letter(r"\??\d:\pagefile.sys"), Some('D'));
         assert_eq!(drive_letter(r"\\?\Volume{x}"), None);
         assert_eq!(drive_letter("1"), None);
+    }
+
+    #[test]
+    fn caminho_local_absoluto() {
+        use std::path::Path;
+        assert!(is_local_absolute(Path::new(r"C:\Program Files\PawnIO")));
+        assert!(!is_local_absolute(Path::new(r"\\server\share\RTSS.exe")));
+        assert!(!is_local_absolute(Path::new(r"\\?\C:\x")));
+        assert!(!is_local_absolute(Path::new(r"C:\a\..\b")));
+        assert!(!is_local_absolute(Path::new(r"C:relative")));
+        assert!(!is_local_absolute(Path::new(r"relative\x")));
     }
 
     #[test]
