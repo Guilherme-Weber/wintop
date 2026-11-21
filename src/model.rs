@@ -62,6 +62,8 @@ pub struct Cpu {
     pub usage: Metric<f64>,
     /// Uso por processador lógico, na ordem (grupo, número), 0-100.
     pub per_logical: Metric<Vec<f64>>,
+    /// Tempo de kernel por lógico, na mesma ordem, 0-100 (parte de `per_logical`).
+    pub kernel_per_logical: Metric<Vec<f64>>,
     /// Parcela do tempo total gasta em modo kernel, 0-100.
     pub kernel: Metric<f64>,
     pub freq_mhz: Metric<f64>,
@@ -76,6 +78,9 @@ pub struct Memory {
     pub commit: Metric<(u64, u64)>,
     /// Standby + Modified (igual ao "Em cache" do Gerenciador de Tarefas).
     pub cached: Metric<u64>,
+    /// As duas partes do "em cache": standby (livre para reuso) e modificada (a gravar).
+    pub standby: Metric<u64>,
+    pub modified: Metric<u64>,
     pub paged_pool: Metric<u64>,
     pub nonpaged_pool: Metric<u64>,
     /// Uso do arquivo de paginação (`_Total`), 0-100.

@@ -30,6 +30,7 @@ fn cpu() -> Cpu {
         virtualization: Ok(true),
         usage: Ok(23.6),
         per_logical: Ok((0..16).map(|i| f64::from(i * 6 % 100)).collect()),
+        kernel_per_logical: Ok((0..16).map(|i| f64::from(i * 2 % 30)).collect()),
         kernel: Ok(5.6),
         freq_mhz: Ok(3812.0),
         counts: Ok(Counts {
@@ -113,6 +114,8 @@ fn fast(step: u32) -> Fast {
             used: Ok(21 * GB),
             commit: Ok((40 * GB, 48 * GB)),
             cached: Ok(7 * GB),
+            standby: Ok(6 * GB),
+            modified: Ok(GB),
             paged_pool: Ok(GB),
             nonpaged_pool: Ok(889 * MB),
             pagefile_usage: Ok(0.8),
@@ -374,4 +377,28 @@ fn falha_do_pipe_com_jogo_aparece() {
     assert!(out.contains("approx. (frametime pipe failed)"), "{out}");
     assert!(out.contains("! frametime pipe (another server"), "{out}");
     assert!(!out.contains("game opened before wintop"), "{out}");
+}
+
+#[test]
+fn troca_de_pid_do_jogo_nao_zera_o_historico() {
+    // Jogos trocam de executável (launcher, tela de carregamento): só o `r` zera.
+    let mut st = State::new(1000);
+    let with = |pid: u32, fps: f64| {
+        let mut s = game();
+        if let Ok(g) = &mut s.game {
+            g.pid = pid;
+            g.fps = Ok(fps);
+        }
+        s
+    };
+    st.push_fps(with(1, 100.0));
+    st.push_fast(fast(0));
+    st.push_fps(with(2, 200.0));
+    st.push_fast(fast(1));
+    st.slow = Some(slow());
+    let tela = render(&mut st, 160, 48);
+    assert!(tela.contains("FPS 200  min 100 · max 200"), "{tela}");
+    st.reset_session();
+    let tela = render(&mut st, 160, 48);
+    assert!(!tela.contains("min 100"), "{tela}");
 }

@@ -21,6 +21,7 @@ use crate::win::filetime;
 pub struct CpuCollector {
     query: Result<Query, String>,
     per: Slot,
+    per_kernel: Slot,
     perf: Slot,
     name: Metric<String>,
     topology: Metric<Topology>,
@@ -38,6 +39,7 @@ impl CpuCollector {
             Err(e) => Err(e.clone()),
         };
         let per = add(r"\Processor Information(*)\% Processor Time");
+        let per_kernel = add(r"\Processor Information(*)\% Privileged Time");
         let perf = add(r"\Processor Information(_Total)\% Processor Performance");
         let topology = topology();
         // Sem topologia, o número de lógicos vem do sistema (com 1, o buffer do
@@ -52,6 +54,7 @@ impl CpuCollector {
         Self {
             query,
             per,
+            per_kernel,
             perf,
             name: cpu_name().map_or_else(|| fail("CPUID has no brand string leaf"), Ok),
             topology,
@@ -88,6 +91,13 @@ impl CpuCollector {
                 .map(|(_, v)| v.clamp(0.0, 100.0))
                 .map_or_else(|| fail("no _Total instance"), Ok)
         });
+        // Antes de `per_logical` (a variável esconderia a função de mesmo nome).
+        let kernel_per_logical = match &sampled {
+            Err(e) => fail(e.clone()),
+            Ok(()) => pdh::read_array(&self.query, &self.per_kernel)
+                .or_else(fail)
+                .and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok)),
+        };
         let per_logical =
             array.and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok));
         let freq_mhz = match (pdh_val(&self.perf), &self.base_mhz) {
@@ -102,6 +112,7 @@ impl CpuCollector {
             virtualization: self.virtualization.clone(),
             usage,
             per_logical,
+            kernel_per_logical,
             kernel: self.kernel_share(),
             freq_mhz,
             counts: perf_info.map_or_else(

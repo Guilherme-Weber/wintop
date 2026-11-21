@@ -17,7 +17,9 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use super::widgets::{DIM, Graph, GraphColor, Meter, Segmented};
 use crate::fmt::{bits, bytes, num};
-use crate::model::{Disk, Fast, Fps, Gpu, Metric, Missing, Nic, Slow, VramBreakdown, VramKind};
+use crate::model::{
+    Disk, Fast, Fps, Gpu, Memory, Metric, Missing, Nic, Slow, VramBreakdown, VramKind,
+};
 use crate::win::printable;
 
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
@@ -141,13 +143,15 @@ pub struct State {
     pub clock: String,
     cpu: Series,
     cores: Vec<Series>,
+    /// Tempo de kernel (total e por lógico), alinhado com `cpu` e `cores`.
+    cpu_kernel: Series,
+    cores_kernel: Vec<Series>,
     gpu: Series,
     disks: HashMap<u32, Series>,
     send: HashMap<String, Series>,
     recv: HashMap<String, Series>,
     game_fps: Series,
     game_ft: Series,
-    game_pid: Option<u32>,
     /// FPS mais recente e o pior frametime (ms) desde o último tick da UI.
     pending_fps: Option<f64>,
     pending_ft: Option<f64>,
@@ -163,8 +167,12 @@ impl State {
     }
 
     /// Zera os extremos da sessão (tecla `r`).
+    /// O histórico do jogo também: só o `r` o zera (jogos trocam de executável e congelam ao
+    /// carregar, e isso não deve apagar o gráfico).
     pub fn reset_session(&mut self) {
         self.session = Session::default();
+        self.game_fps = Series::default();
+        self.game_ft = Series::default();
     }
 
     /// Nova coleta da thread rápida: guarda, alimenta os históricos (inclusive os do jogo, no
@@ -173,13 +181,18 @@ impl State {
         let usage = |m: &Metric<f64>| m.as_ref().map_or(0.0, |v| v / 100.0);
         if let Ok(c) = &f.cpu {
             self.cpu.push(usage(&c.usage));
+            self.cpu_kernel.push(usage(&c.kernel));
             if let Ok(v) = &c.usage {
                 self.session.cpu.update(*v);
             }
             if let Ok(per) = &c.per_logical {
                 self.cores.resize_with(per.len(), Series::default);
-                for (s, v) in self.cores.iter_mut().zip(per) {
+                self.cores_kernel.resize_with(per.len(), Series::default);
+                let kern = c.kernel_per_logical.as_ref().ok();
+                for (i, (s, v)) in self.cores.iter_mut().zip(per).enumerate() {
                     s.push(v / 100.0);
+                    let k = kern.and_then(|k| k.get(i)).copied().unwrap_or(0.0);
+                    self.cores_kernel[i].push(k / 100.0);
                 }
             }
         }
@@ -273,13 +286,6 @@ impl State {
     /// gráficos esperam o tick da UI.
     pub fn push_fps(&mut self, s: Fps) {
         if let Ok(g) = &s.game {
-            if self.game_pid != Some(g.pid) {
-                self.game_pid = Some(g.pid);
-                self.game_fps = Series::default();
-                self.game_ft = Series::default();
-                self.session.fps = MinMax::default();
-                self.session.ft = MinMax::default();
-            }
             if let Ok(v) = &g.fps {
                 self.pending_fps = Some(*v);
             }
@@ -325,7 +331,7 @@ fn bar_sep() -> Span<'static> {
 /// "min X max Y" de um extremo da sessão.
 fn minmax(m: MinMax, f: impl Fn(f64) -> String) -> Span<'static> {
     match m.get() {
-        Some((lo, hi)) => label(&format!("min {} max {}", f(lo), f(hi))),
+        Some((lo, hi)) => label(&format!("min {} · max {}", f(lo), f(hi))),
         None => label(""),
     }
 }
@@ -417,7 +423,7 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
         Layout::horizontal([Constraint::Percentage(59), Constraint::Percentage(41)]).areas(top);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(bottom);
-    let [mem, net] = Layout::vertical([Constraint::Length(10), Constraint::Min(4)]).areas(left);
+    let [mem, net] = Layout::vertical([Constraint::Length(8), Constraint::Min(4)]).areas(left);
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
     let disk_rows = disk_order(st).len() as u16;
     let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
@@ -602,8 +608,10 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [graphs, info] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
-    // Total à esquerda (30 colunas = 60 s a 1 s), grade por lógico no resto.
-    let total_w = (graphs.width / 4).clamp(16, 34);
+    // Total à esquerda (~45%), grade por lógico no resto.
+    let total_w = (graphs.width * 9 / 20)
+        .max(16)
+        .min(graphs.width.saturating_sub(16));
     let [total, grid] =
         Layout::horizontal([Constraint::Length(total_w), Constraint::Min(8)]).areas(graphs);
 
@@ -624,12 +632,12 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         total.height.saturating_sub(2),
     );
     frame.render_widget(
-        Graph::new(st.cpu.values(), GraphColor::Height),
+        Graph::new(st.cpu.values(), GraphColor::Height).with_under(st.cpu_kernel.values()),
         g.intersection(total),
     );
 
     match &c.per_logical {
-        Ok(per) => draw_core_grid(frame, grid, &mut st.cores, per),
+        Ok(per) => draw_core_grid(frame, grid, &mut st.cores, &mut st.cores_kernel, per),
         Err(e) => line(
             frame,
             vec![label("per core "), missing(e)],
@@ -714,7 +722,13 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
 
 /// Grade de gráficos por lógico (4×4 com 16 threads), sempre com todos: se a célula ficar
 /// pequena demais para gráfico, vira uma lista compacta de percentuais.
-fn draw_core_grid(frame: &mut Frame<'_>, area: Rect, cores: &mut [Series], per: &[f64]) {
+fn draw_core_grid(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cores: &mut [Series],
+    kernel: &mut [Series],
+    per: &[f64],
+) {
     let n = per.len();
     if n == 0 || area.width == 0 || area.height == 0 {
         return;
@@ -763,10 +777,11 @@ fn draw_core_grid(frame: &mut Frame<'_>, area: Rect, cores: &mut [Series], per: 
                 cell.width,
                 cell.height.saturating_sub(1),
             );
-            frame.render_widget(
-                Graph::new(s.values(), GraphColor::Height),
-                g.intersection(cell),
-            );
+            let mut graph = Graph::new(s.values(), GraphColor::Height);
+            if let Some(k) = kernel.get_mut(i) {
+                graph = graph.with_under(k.values());
+            }
+            frame.render_widget(graph, g.intersection(cell));
         }
     }
 }
@@ -818,7 +833,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     let [top, bottom] = Layout::vertical([Constraint::Min(4), Constraint::Length(8)]).areas(inner);
     let [graph, panel] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(27)]).areas(top);
+        Layout::horizontal([Constraint::Min(10), Constraint::Length(30)]).areas(top);
 
     // Gráfico da engine dominante, com o nome dela no canto.
     let head = if g.usage.is_ok() {
@@ -856,11 +871,24 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             metric(m, |v| format!("{v:>3}%")),
         ]
     };
-    let mm = |m: MinMax, f: &dyn Fn(f64) -> String| -> Span<'static> {
+    // Extremos da sessão: "min x · max y unidade" (a unidade só no fim, para caber).
+    let mm = |m: MinMax, f: &dyn Fn(f64) -> String, unit: &str| -> Vec<Span<'static>> {
         m.get().map_or_else(
-            || label("-"),
-            |(lo, hi)| text(format!("{} / {}", f(lo), f(hi))),
+            || vec![label("-")],
+            |(lo, hi)| {
+                vec![
+                    label("min "),
+                    text(f(lo)),
+                    label(" · max "),
+                    text(format!("{}{unit}", f(hi))),
+                ]
+            },
         )
+    };
+    let row = |name: &str, spans: Vec<Span<'static>>| -> (Vec<Span<'static>>, Option<f64>) {
+        let mut v = vec![label(&format!("{name:<6}"))];
+        v.extend(spans);
+        (v, None)
     };
     let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = vec![
         (eng("3D", &g.usage), Some(f64::from(pct(&g.usage)))),
@@ -870,43 +898,17 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             eng("mem act", &g.mem_activity),
             Some(f64::from(pct(&g.mem_activity))),
         ),
-        (vec![label("session min / max")], None),
+        (vec![label("session (r resets)")], None),
     ];
-    rows.push((
-        vec![
-            label("util  "),
-            mm(st.session.gpu, &|v| format!("{}%", num(v, 0))),
-        ],
-        None,
+    let n0 = |v: f64| num(v, 0);
+    rows.push(row("util", mm(st.session.gpu, &n0, "%")));
+    rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
+    rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
+    rows.push(row(
+        "VRAM",
+        mm(st.session.vram, &|v| short_bytes(v as u64), ""),
     ));
-    rows.push((
-        vec![
-            label("temp  "),
-            mm(st.session.gpu_temp, &|v| format!("{} °C", num(v, 0))),
-        ],
-        None,
-    ));
-    rows.push((
-        vec![
-            label("power "),
-            mm(st.session.gpu_power, &|v| format!("{} W", num(v, 0))),
-        ],
-        None,
-    ));
-    rows.push((
-        vec![
-            label("VRAM  "),
-            mm(st.session.vram, &|v| short_bytes(v as u64)),
-        ],
-        None,
-    ));
-    rows.push((
-        vec![
-            label("gfx   "),
-            mm(st.session.gfx_clock, &|v| format!("{} MHz", num(v, 0))),
-        ],
-        None,
-    ));
+    rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
     for (i, (spans, meter)) in rows.into_iter().enumerate() {
         let y = panel.y + i as u16;
         if y >= panel.y + panel.height {
@@ -924,8 +926,6 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Meter { value: v / 100.0 },
                 Rect::new(panel.x + 15, y, panel.width.saturating_sub(15), 1).intersection(panel),
             );
-        } else if i > 4 {
-            // As linhas de extremos usam a largura toda (o texto já veio inteiro no `spans`).
         }
     }
 
@@ -1185,73 +1185,31 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let ram = m.used.clone().and_then(|u| Ok((u, m.total.clone()?)));
-    let avail = m
-        .used
-        .clone()
-        .and_then(|u| Ok(m.total.clone()?.saturating_sub(u)));
     let gb = |v: f64| bytes(v as u64);
+    ram_bar(frame, inner, m, &ram);
+    bar_line(frame, inner, 2, "commit  ", &m.commit);
     line(
         frame,
         vec![
-            label("RAM      "),
-            metric(&ram, |(u, t)| {
-                format!(
-                    "{} / {} ({}%)",
-                    bytes(*u),
-                    bytes(*t),
-                    num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
-                )
-            }),
-            sep(),
-            label("avail "),
-            metric(&avail, |v| bytes(*v)),
-            sep(),
+            label("session RAM "),
             minmax(st.session.ram, gb),
-        ],
-        inner.x,
-        inner.y,
-        inner.width,
-        inner,
-    );
-    meter_line(frame, inner, 1, &ram);
-    line(
-        frame,
-        vec![
-            label("commit   "),
-            metric(&m.commit, |(c, l)| {
-                format!(
-                    "{} / {} ({}%)",
-                    bytes(*c),
-                    bytes(*l),
-                    num(*c as f64 / (*l).max(1) as f64 * 100.0, 0)
-                )
-            }),
-            sep(),
+            label("   commit "),
             minmax(st.session.commit, gb),
         ],
         inner.x,
-        inner.y + 2,
+        inner.y + 3,
         inner.width,
         inner,
     );
-    meter_line(frame, inner, 3, &m.commit);
-    let cached = m.cached.clone().and_then(|c| Ok((c, m.total.clone()?)));
-    bar_line(frame, inner, 4, "cached  ", &cached);
-    let page = m
-        .pagefile_usage
-        .clone()
-        .map(|p| ((p * 100.0) as u64, 10_000));
-    if inner.height > 5 {
-        let y = inner.y + 5;
+    if inner.height > 4 {
+        let y = inner.y + 4;
         line(frame, vec![label("pagefile ")], inner.x, y, 9, inner);
         let t = metric(&m.pagefile_usage, |v| format!(" {}%", num(*v, 1)));
         let tw = (t.width() as u16).min(inner.width / 2);
         let bw = inner.width.saturating_sub(9 + tw);
-        if let Ok((u, t)) = page {
+        if let Ok(v) = &m.pagefile_usage {
             frame.render_widget(
-                Meter {
-                    value: u as f64 / t as f64,
-                },
+                Meter { value: v / 100.0 },
                 Rect::new(inner.x + 9, y, bw, 1).intersection(inner),
             );
         }
@@ -1271,24 +1229,96 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             metric(&m.nonpaged_pool, |v| bytes(*v)),
         ],
         inner.x,
-        inner.y + 7,
+        inner.y + 5,
         inner.width,
         inner,
     );
 }
 
-/// Barra cheia de largura total na linha `row` (RAM e confirmada, abaixo do texto).
-fn meter_line(frame: &mut Frame<'_>, area: Rect, row: u16, m: &Metric<(u64, u64)>) {
-    if row >= area.height {
+const RAM_IN_USE: Color = Color::Rgb(78, 184, 176);
+const RAM_MODIFIED: Color = Color::Rgb(224, 138, 60);
+const RAM_STANDBY: Color = Color::Rgb(92, 120, 170);
+
+/// RAM como o Task Manager: em uso, modificada, standby (cache) e livre, com legenda (linha 1).
+fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64)>) {
+    if area.height == 0 {
         return;
     }
-    if let Ok((u, t)) = m {
-        let v = if *t > 0 { *u as f64 / *t as f64 } else { 0.0 };
-        frame.render_widget(
-            Meter { value: v },
-            Rect::new(area.x, area.y + row, area.width, 1).intersection(area),
-        );
+    let t = metric(ram, |(u, t)| {
+        format!(
+            " {} / {} ({}%)",
+            bytes(*u),
+            bytes(*t),
+            num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
+        )
+    });
+    let label_w = 8u16.min(area.width);
+    let text_w = (t.width() as u16).min(area.width / 2);
+    line(
+        frame,
+        vec![label("RAM     ")],
+        area.x,
+        area.y,
+        label_w,
+        area,
+    );
+    let bar_w = area.width.saturating_sub(label_w + text_w);
+    let bar = Rect::new(area.x + label_w, area.y, bar_w, 1).intersection(area);
+    let pad = || Span::raw(" ".repeat(usize::from(label_w)));
+    match (ram, &m.standby, &m.modified) {
+        (Ok((used, total)), Ok(sb), Ok(md)) => {
+            // Em uso = usado - modificada; disponível = standby + livre.
+            let in_use = used.saturating_sub(*md);
+            let free = total.saturating_sub(*used).saturating_sub(*sb);
+            frame.render_widget(
+                Segmented {
+                    parts: &[
+                        (in_use, RAM_IN_USE),
+                        (*md, RAM_MODIFIED),
+                        (*sb, RAM_STANDBY),
+                    ],
+                    total: *total,
+                },
+                bar,
+            );
+            if area.height > 1 {
+                let mut legend = vec![pad()];
+                for (name, v, c) in [
+                    ("in use", in_use, RAM_IN_USE),
+                    ("modified", *md, RAM_MODIFIED),
+                    ("standby", *sb, RAM_STANDBY),
+                    ("free", free, DIM),
+                ] {
+                    legend.push(Span::styled("■ ", Style::new().fg(c)));
+                    legend.push(label(&format!("{name} ")));
+                    legend.push(text(format!("{}  ", short_bytes(v))));
+                }
+                line(frame, legend, area.x, area.y + 1, area.width, area);
+            }
+        }
+        (Ok((u, t)), sb, md) => {
+            // Sem a divisão do cache: barra simples do usado e a causa embaixo.
+            let v = if *t > 0 { *u as f64 / *t as f64 } else { 0.0 };
+            frame.render_widget(Meter { value: v }, bar);
+            if let Some(e) = sb.as_ref().err().or(md.as_ref().err()) {
+                line(
+                    frame,
+                    vec![pad(), label("cache "), missing(e)],
+                    area.x,
+                    area.y + 1,
+                    area.width,
+                    area,
+                );
+            }
+        }
+        (Err(_), _, _) => {}
     }
+    put(
+        frame,
+        Paragraph::new(t),
+        Rect::new(area.x + label_w + bar_w, area.y, text_w, 1),
+        area,
+    );
 }
 
 // --- Rede ---
@@ -1343,6 +1373,10 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         let half_down = body - half_up;
         let gw = inner.width.saturating_sub(RATE_W + 1);
         let n_samples = usize::from(gw) * 2;
+        // Mesma escala para envio e recebimento: a proporção entre os dois fica visível.
+        let peak =
+            |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples));
+        let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
         for (k, h, series, m, color, arrow, mm) in [
             (
                 0u16,
@@ -1367,10 +1401,6 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 continue;
             }
             let row = y + 1 + k;
-            let scale = series
-                .as_ref()
-                .map_or(NET_FLOOR, |s| s.max_of_ref(n_samples))
-                .max(NET_FLOOR);
             if let Some(s) = series {
                 let data = s.over(n_samples, scale);
                 let g = Graph::new(&data, GraphColor::Fixed(color));

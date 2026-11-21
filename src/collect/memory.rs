@@ -57,12 +57,14 @@ impl MemoryCollector {
             .map(|()| (ms.ullTotalPhys, ms.ullAvailPhys))
             .map_err(|e| format!("GlobalMemoryStatusEx: {e}"));
 
-        let cached = self
-            .cache
+        // As três prioridades do standby e a lista modificada (a última do `CACHE`).
+        let standby = self.cache[..3]
             .iter()
             .map(pdh_val)
             .sum::<Metric<f64>>()
             .map(|v| v as u64);
+        let modified = pdh_val(&self.cache[3]).map(|v| v as u64);
+        let cached = standby.clone().and_then(|s| Ok(s + modified.clone()?));
         let pages = |f: fn(&PERFORMANCE_INFORMATION) -> usize| -> Metric<u64> {
             match perf_info {
                 Ok(p) => Ok((f(p) as u64).saturating_mul(p.PageSize as u64)),
@@ -74,6 +76,8 @@ impl MemoryCollector {
             used: status.map(|(t, a)| t.saturating_sub(a)).or_else(fail),
             commit: pages(|p| p.CommitTotal).and_then(|c| Ok((c, pages(|p| p.CommitLimit)?))),
             cached,
+            standby,
+            modified,
             paged_pool: pages(|p| p.KernelPaged),
             nonpaged_pool: pages(|p| p.KernelNonpaged),
             pagefile_usage: pdh_val(&self.pagefile).map(|v| v.clamp(0.0, 100.0)),

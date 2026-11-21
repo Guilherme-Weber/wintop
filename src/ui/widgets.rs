@@ -25,6 +25,14 @@ pub fn gradient(t: f64) -> Color {
     Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
+/// O mesmo tom com metade do brilho (parte de kernel dos gráficos de CPU).
+pub fn darker(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        other => other,
+    }
+}
+
 /// Cor apagada das partes vazias.
 pub const DIM: Color = Color::Rgb(60, 60, 70);
 
@@ -54,6 +62,9 @@ pub struct Graph<'a> {
     pub samples: &'a [f64],
     pub color: GraphColor,
     pub invert: bool,
+    /// Parte de cada amostra pintada num tom mais escuro (tempo de kernel, como o Task Manager
+    /// com "Show kernel times"), na mesma escala e alinhamento de `samples`.
+    pub under: Option<&'a [f64]>,
 }
 
 impl<'a> Graph<'a> {
@@ -62,7 +73,13 @@ impl<'a> Graph<'a> {
             samples,
             color,
             invert: false,
+            under: None,
         }
+    }
+
+    pub fn with_under(mut self, under: &'a [f64]) -> Self {
+        self.under = Some(under);
+        self
     }
 
     pub fn inverted(mut self) -> Self {
@@ -98,10 +115,22 @@ impl Widget for Graph<'_> {
                 .copied()
                 .unwrap_or(0.0)
         };
+        // A série de baixo, alinhada à direita do mesmo jeito.
+        let under = self.under.map(|u| &u[u.len() - (w * 2).min(u.len())..]);
+        let under_dots = |i: usize| -> usize {
+            under.map_or(0, |u| {
+                let off = w * 2 - u.len();
+                i.checked_sub(off)
+                    .and_then(|k| u.get(k))
+                    .map_or(0, |&v| dots(v, max))
+            })
+        };
         for col in 0..w {
             let (sl, sr) = (sample(col * 2), sample(col * 2 + 1));
             let (l, r) = (dots(sl, max), dots(sr, max));
             let peak = sl.max(sr);
+            // Kernel da coluna: o menor dos dois (a célula só escurece se estiver toda por baixo).
+            let k = under_dots(col * 2).min(under_dots(col * 2 + 1));
             for row in 0..h {
                 // Linha 0 = a da base (a de baixo; a de cima se invertido).
                 let base = row * 4;
@@ -140,6 +169,8 @@ impl Widget for Graph<'_> {
                         }
                     }
                 };
+                // Célula inteira dentro da parte de kernel: o mesmo tom, mais escuro.
+                let color = if k >= base + 4 { darker(color) } else { color };
                 let y = if self.invert { row } else { h - 1 - row };
                 if let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + y as u16)) {
                     cell.set_char(ch).set_fg(color);
@@ -215,6 +246,18 @@ mod tests {
             .inverted()
             .render(area, &mut buf);
         assert_eq!(buf[(2, 0)].symbol(), "⡟");
+    }
+
+    #[test]
+    fn parte_de_kernel_mais_escura() {
+        // 2 linhas (8 pontos); uso 100%, kernel 50%: a linha de baixo escurece, a de cima não.
+        let area = Rect::new(0, 0, 1, 2);
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[1.0, 1.0], GraphColor::Fixed(Color::Rgb(200, 100, 50)))
+            .with_under(&[0.5, 0.5])
+            .render(area, &mut buf);
+        assert_eq!(buf[(0, 1)].fg, Color::Rgb(100, 50, 25));
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(200, 100, 50));
     }
 
     #[test]
