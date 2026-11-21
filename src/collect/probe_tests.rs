@@ -249,10 +249,12 @@ fn probe_congelamento_derruba_o_fps() {
     println!("FPS durante o congelamento: {during:?}; sem frames: {stalled_state}");
     assert!(!approx, "frametime pelo pipe o tempo todo");
     let normal = 1000.0 / expected_avg_ms();
-    assert!(
-        during.iter().all(|f| *f < normal * 0.7) || stalled_state,
-        "FPS não caiu: {during:?}"
-    );
+    // O FPS cai aos poucos (a janela de 1 s vai ficando com mais tempo parado): cada amostra
+    // abaixo da anterior e a última abaixo da metade, ou já "sem frames".
+    let falling = during.windows(2).all(|w| w[1] < w[0] + 1.0);
+    let low = during.last().is_some_and(|f| *f < normal * 0.5);
+    assert!(falling, "FPS não caiu de forma contínua: {during:?}");
+    assert!(low || stalled_state, "FPS não caiu: {during:?}");
     assert!(
         !during.is_empty() || stalled_state,
         "sem amostras do congelamento"
