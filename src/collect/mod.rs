@@ -7,6 +7,7 @@ mod disk_temp;
 mod gpu;
 mod memory;
 mod net;
+mod own;
 mod pawnio;
 pub mod rtss;
 
@@ -55,6 +56,7 @@ pub struct FastCollectors {
     disk: Result<disk::DiskCollector, String>,
     net: Result<net::NetCollector, String>,
     gpu: Result<gpu::GpuCollector, String>,
+    own: Result<own::OwnCollector, String>,
 }
 
 fn run<C, T>(
@@ -77,6 +79,7 @@ impl FastCollectors {
             disk: create("disk", disk::DiskCollector::new),
             net: create("network", net::NetCollector::new),
             gpu: create("GPU", gpu::GpuCollector::new),
+            own: create("wintop usage", own::OwnCollector::new),
         }
     }
 
@@ -93,6 +96,7 @@ impl FastCollectors {
         let disks = run("disk", &mut self.disk, disk::DiskCollector::read);
         let nics = run("network", &mut self.net, net::NetCollector::read);
         let gpus = run("GPU", &mut self.gpu, gpu::GpuCollector::read);
+        let own = run("wintop usage", &mut self.own, own::OwnCollector::read);
         Fast {
             cpu,
             cpu_sensors,
@@ -100,6 +104,7 @@ impl FastCollectors {
             disks,
             nics,
             gpus,
+            own,
             took: start.elapsed(),
         }
     }

@@ -63,6 +63,7 @@ pub fn run() -> i32 {
     fast_report(&mut r, &f);
     slow_report(&mut r, &s);
     fps_report(&mut r, &fps);
+    own_report(&mut r, &f);
     println!(
         "\nFast collection: {:.1} ms; slow: {:.1} ms",
         f.took.as_secs_f64() * 1e3,
@@ -328,6 +329,20 @@ fn fps_report(r: &mut Report, f: &Fps) {
                 format!("{} / {} ms", num(*a, 2), num(*b, 2))
             });
             r.line("  Limited by", &g.bound, ToString::to_string);
+        }
+    }
+}
+
+fn own_report(r: &mut Report, f: &Fast) {
+    Report::section("Diagnostics");
+    match &f.own {
+        Err(e) => r.line("wintop usage", &Err::<(), _>(e.clone()), |()| String::new()),
+        Ok(o) => {
+            r.line("wintop CPU (whole system)", &o.cpu, |v| {
+                format!("{}%", num(*v, 3))
+            });
+            r.line("wintop memory (private WS)", &o.private_ws, |v| bytes(*v));
+            r.line("wintop committed memory", &o.commit, |v| bytes(*v));
         }
     }
 }

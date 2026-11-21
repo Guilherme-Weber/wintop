@@ -192,7 +192,7 @@ impl Engine {
     }
 
     /// Ajusta o intervalo (teclas `+`/`-`); vale a partir da próxima espera.
-    #[expect(dead_code, reason = "teclas + e - na TUI (Etapa 5)")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "teclas + e - na TUI (Etapa 5)"))]
     pub fn set_interval_ms(&self, ms: u64) -> u64 {
         let ms = clamp_interval(ms);
         self.shared.interval_ms.store(ms, Ordering::Relaxed);
@@ -282,6 +282,22 @@ mod tests {
         let took = t.elapsed();
         println!("parada em {took:?}");
         assert!(took < Duration::from_millis(300), "{took:?}");
+    }
+
+    /// O intervalo novo vale a partir da próxima espera: de 1 s para 300 ms, ~10 coletas em 3 s.
+    #[test]
+    #[ignore = "hardware: inicia todos os coletores (terminal elevado)"]
+    fn intervalo_ajustavel() {
+        let e = Engine::start(1000);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(e.set_interval_ms(250), 200, "passos de 100 ms");
+        assert_eq!(e.set_interval_ms(300), 300);
+        let (_, _, before) = e.latest();
+        std::thread::sleep(Duration::from_secs(3));
+        let (_, _, after) = e.latest();
+        let n = after - before;
+        println!("{n} coletas rápidas em 3 s a 300 ms");
+        assert!((8..=12).contains(&n), "{n}");
     }
 
     #[test]

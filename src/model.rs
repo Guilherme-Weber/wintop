@@ -256,6 +256,17 @@ pub struct Fps {
     pub game: Metric<Game>,
 }
 
+/// Consumo do próprio wintop.
+#[derive(Clone, Debug)]
+pub struct OwnUsage {
+    /// % do sistema inteiro (todos os processadores lógicos).
+    pub cpu: Metric<f64>,
+    /// Working set privado (a coluna "Memory" do Task Manager), bytes.
+    pub private_ws: Metric<u64>,
+    /// Memória confirmada (privada), bytes.
+    pub commit: Metric<u64>,
+}
+
 /// Uma coleta da thread rápida.
 #[derive(Clone, Debug)]
 pub struct Fast {
@@ -265,6 +276,7 @@ pub struct Fast {
     pub disks: Metric<Vec<Disk>>,
     pub nics: Metric<Vec<Nic>>,
     pub gpus: Metric<Vec<Gpu>>,
+    pub own: Metric<OwnUsage>,
     /// Quanto a coleta levou.
     pub took: Duration,
 }

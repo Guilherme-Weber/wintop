@@ -14,7 +14,32 @@ mod pdh;
 mod shm;
 mod win;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use windows::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
+};
+use windows::core::BOOL;
+
+/// Pedido de parada (Ctrl+C, Ctrl+Break ou fechar a janela do console).
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Roda numa thread criada pelo Windows: só marca a parada; o laço principal encerra o motor
+/// (as threads de coleta terminam e os handles são fechados) e sai de `main`.
+unsafe extern "system" fn on_console_event(kind: u32) -> BOOL {
+    if matches!(kind, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
+        STOP.store(true, Ordering::SeqCst);
+        // Ao fechar a janela o Windows encerra o processo quando o handler retorna: espera o
+        // laço principal terminar (ele vê o pedido em até 250 ms).
+        if kind == CTRL_CLOSE_EVENT {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        BOOL(1)
+    } else {
+        BOOL(0)
+    }
+}
 
 const HELP: &str = "\
 usage: wintop [option]
@@ -63,6 +88,14 @@ fn main() {
 
 /// Resumo de uma linha a cada coleta da thread rápida (provisório, até a TUI).
 fn summary_loop() {
+    // Ctrl+C pode chegar desligado, herdado de quem abriu o wintop (processo criado com
+    // CREATE_NEW_PROCESS_GROUP ou que ignorava Ctrl+C): (NULL, FALSE) restaura o padrão.
+    // SAFETY: sem handler; só reativa o processamento normal do Ctrl+C neste processo.
+    let _ = unsafe { SetConsoleCtrlHandler(None, false) };
+    // SAFETY: função estática com a assinatura de PHANDLER_ROUTINE.
+    if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(on_console_event), true) } {
+        eprintln!("warning: SetConsoleCtrlHandler: {e}");
+    }
     let engine = engine::Engine::start(engine::DEFAULT_INTERVAL_MS);
     println!(
         "wintop {}: interval {} ms (Ctrl+C to quit)",
@@ -70,8 +103,8 @@ fn summary_loop() {
         engine.interval_ms()
     );
     let (mut seen, mut printed) = (0, 0);
-    loop {
-        seen = engine.wait_newer(seen, Duration::from_secs(5));
+    while !STOP.load(Ordering::SeqCst) {
+        seen = engine.wait_newer(seen, Duration::from_millis(250));
         let (fast, slow, fast_seq) = engine.latest();
         // Só a coleta rápida gera linha (a lenta também acorda a espera).
         if fast_seq == printed {
@@ -103,8 +136,20 @@ fn summary_loop() {
                 Err(e) => e.to_string(),
             },
         );
+        let own = f.own.as_ref().ok().map_or_else(
+            || "--".to_string(),
+            |o| {
+                format!(
+                    "{}% {}",
+                    o.cpu.as_ref().map_or("--".into(), |v| fmt::num(*v, 3)),
+                    o.private_ws
+                        .as_ref()
+                        .map_or("--".into(), |v| fmt::bytes(*v))
+                )
+            },
+        );
         println!(
-            "CPU {:>6}  RAM {:>9}  GPU {:>4}  PCIe RX {:>10}  collection {:.1} ms  FPS {fps}",
+            "CPU {:>6}  RAM {:>9}  GPU {:>4}  PCIe RX {:>10}  collection {:.1} ms  FPS {fps}  wintop {own}",
             cpu.map_or("--".into(), fmt::pct),
             ram.map_or("--".into(), fmt::bytes),
             gpu.map_or("--".into(), |v| format!("{v}%")),

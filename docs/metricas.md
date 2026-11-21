@@ -136,4 +136,4 @@ aberto antes do wintop)"** até o jogo reiniciar.
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Estado de cada fonte (OK, falha e motivo) | coletores | | | E1 (`wintop --check`) |
-| Consumo do próprio wintop (CPU, RAM) | `GetProcessTimes`, `GetProcessMemoryInfo` | | | E4 |
+| Consumo do próprio wintop (CPU, RAM) | `GetProcessTimes` ÷ tempo total do sistema (`GetSystemTimes`); `GetProcessMemoryInfo` (`PROCESS_MEMORY_COUNTERS_EX2`: working set privado = coluna "Memory" do Task Manager, e memória confirmada) | | | E4 (= contadores do Windows: 0,015% × 0,014% em 120 s; 25,8 MB × 25,8 MB) |
