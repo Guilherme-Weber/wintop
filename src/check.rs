@@ -306,15 +306,18 @@ fn slow_report(r: &mut Report, s: &Slow) {
                             .iter()
                             .filter(|p| p.engines.as_ref().is_ok_and(|e| !e.is_empty()))
                             .count();
-                        let engines = list
-                            .iter()
-                            .find_map(|p| p.engines.as_ref().err())
-                            .map_or_else(String::new, |e| format!("; engines: {e}"));
-                        format!(
-                            "{} processes, {busy} with engine samples{engines}",
-                            list.len()
-                        )
+                        format!("{} processes, {busy} with engine samples", list.len())
                     });
+                    // As engines são uma fonte própria (PDH): falha delas conta como falha.
+                    if let Ok(list) = p {
+                        let engines: crate::model::Metric<()> = list
+                            .iter()
+                            .find_map(|x| x.engines.as_ref().err())
+                            .map_or(Ok(()), |e| Err(e.clone()));
+                        r.line(&format!("GPU {} engines", g.index), &engines, |()| {
+                            "per-process engine counters".into()
+                        });
+                    }
                 }
             }
         }

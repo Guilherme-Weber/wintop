@@ -380,20 +380,28 @@ impl GpuSlowCollector {
         self.engines.close();
     }
 
-    /// `detail`: aba GPU visível (lista de processos por GPU, depois de `collect_engines`).
-    pub fn read(&mut self, detail: bool) -> Metric<Vec<GpuSlow>> {
+    /// `detail`: aba GPU visível (lista de processos por GPU, com as engines coletadas aqui).
+    /// `names`: PID → nome (da lista de processos, quando já coletada; senão o Toolhelp).
+    pub fn read(&mut self, detail: bool, names: &HashMap<u32, String>) -> Metric<Vec<GpuSlow>> {
         let nvml = self
             .nvml
             .as_ref()
             .as_ref()
             .map_err(|e| Missing::Fail(e.clone()))?;
         let count = nv(nvml.device_count())?;
-        let engine_rows = detail.then(|| self.engines.rows());
-        let names = if detail {
-            super::vram::process_names()
-        } else {
-            HashMap::new()
-        };
+        if count == 0 {
+            return fail("no NVIDIA GPU in NVML");
+        }
+        // Uma coleta PDH por ciclo, para todas as GPUs (a VRAM e o detalhe leem dela).
+        let collected = self.vram.collect();
+        let engine_rows: Option<Metric<Vec<(String, f64)>>> = detail.then(|| {
+            match self.engines.collect() {
+                Ok(true) => self.engines.rows().or_else(fail),
+                // 1ª coleta depois de abrir: a taxa ainda não existe (não é "0%").
+                Ok(false) => neutral("waiting for a second sample"),
+                Err(e) => fail(e),
+            }
+        });
         let mut out = Vec::new();
         for index in 0..count {
             out.push(match nvml.device_by_index(index) {
@@ -411,15 +419,17 @@ impl GpuSlowCollector {
                         .get(index as usize)
                         .cloned()
                         .unwrap_or_else(|| fail("GPU without a DXGI adapter"));
-                    let vram = match (&luid, nv(d.memory_info())) {
-                        (Ok(l), Ok(m)) => self.vram.read(l, m.total),
-                        (Err(e), _) => Err(e.clone()),
-                        (_, Err(e)) => Err(e),
+                    let vram = match (&luid, nv(d.memory_info()), &collected) {
+                        (Ok(l), Ok(m), Ok(())) => self.vram.read(l, m.total, names),
+                        (Err(e), _, _) => Err(e.clone()),
+                        (_, Err(e), _) => Err(e),
+                        (_, _, Err(e)) => fail(e.clone()),
                     };
                     let procs = engine_rows.as_ref().map(|rows| {
                         let l = luid.clone()?;
+                        collected.clone().or_else(fail)?;
                         let mem = self.vram.per_process_detail(&l).or_else(fail)?;
-                        Ok(gpu_procs(&mem, rows, &l, &names))
+                        Ok(gpu_procs(&mem, rows, &l, names))
                     });
                     GpuSlow {
                         index,
@@ -440,7 +450,7 @@ impl GpuSlowCollector {
 /// Junta a VRAM por processo e as engines: um processo entra se tem VRAM ou engine em uso.
 fn gpu_procs(
     mem: &HashMap<u32, ProcMem>,
-    engine_rows: &Result<Vec<(String, f64)>, String>,
+    engine_rows: &Metric<Vec<(String, f64)>>,
     luid: &str,
     names: &HashMap<u32, String>,
 ) -> Vec<GpuProc> {
@@ -467,7 +477,7 @@ fn gpu_procs(
                 committed,
                 engines: match &engines {
                     Ok(e) => Ok(e.get(&pid).cloned().unwrap_or_default()),
-                    Err(err) => fail(err.to_string()),
+                    Err(err) => Err((*err).clone()),
                 },
             }
         })

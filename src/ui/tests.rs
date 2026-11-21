@@ -564,7 +564,8 @@ fn aba_processos() {
 #[test]
 fn aba_gpu() {
     let mut st = tab_state(view::Tab::Gpu);
-    st.runtimes.insert(1784, Ok(vec!["D3D11", "D3D12"]));
+    st.runtimes
+        .insert(1784, ("dwm.exe".into(), Ok(vec!["D3D11", "D3D12"])));
     insta::assert_snapshot!(render(&mut st, 160, 20));
 }
 
@@ -662,8 +663,75 @@ fn protegidos_incluem_jogo_e_apps_com_hook() {
     let mut f = game();
     f.hooked = vec![1784, 4242];
     st.push_fps(f);
-    let p = st.protected_pids();
+    let p = st.protected_pids().expect("RTSS rodando");
     assert!(p.contains(&1784) && p.contains(&4242), "{p:?}");
+}
+
+#[test]
+fn sem_lista_do_rtss_nenhum_processo_e_aberto() {
+    let mut st = tab_state(view::Tab::Gpu);
+    // RTSS fechado: não há como saber qual processo é jogo.
+    st.push_fps(Fps {
+        rtss: fail("RTSS not running"),
+        pipe: Ok((8, 0)),
+        game: fail("RTSS not running"),
+        hooked: vec![],
+    });
+    assert_eq!(st.protected_pids(), None);
+    let _ = render(&mut st, 160, 20);
+    st.request_runtimes();
+    let (_, r) = st.runtimes.values().next().expect("resultado");
+    assert!(
+        matches!(r, Err(Missing::Neutral(s)) if s.contains("waiting for RTSS")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn enter_usa_a_selecao_pendente() {
+    let mut st = tab_state(view::Tab::Gpu);
+    let _ = render(&mut st, 160, 20);
+    // ↓ e Enter no mesmo lote de teclas (sem desenho no meio): vale o 2º da lista.
+    st.gpu_cursor.down(1);
+    st.request_runtimes();
+    // 2º por uso de GPU = firefox (12% no decoder); ele não tem o hook no fixture.
+    assert!(st.runtimes.contains_key(&9120), "{:?}", st.runtimes.keys());
+}
+
+#[test]
+fn causa_longa_nos_sensores_quebra_sem_cortar() {
+    let mut st = filled();
+    let mut f = fast(3);
+    f.cpu_sensors = fail(
+        "PawnIO: module AMDFamily17.bin could not be loaded from the modules folder next to wintop.exe (error 0x80070002)",
+    );
+    st.push_fast(f);
+    st.set_tab(view::Tab::Sensors);
+    let out = render(&mut st, 100, 40);
+    let flat: String = out
+        .lines()
+        .map(|l| l.trim_matches('"').trim_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(flat.contains("(error 0x80070002)"), "{out}");
+    assert!(!out.contains('…'), "{out}");
+}
+
+#[test]
+fn rodape_nao_corta_atalho_no_meio() {
+    for (tab, w) in [
+        (view::Tab::Processes, 140),
+        (view::Tab::Overview, 120),
+        (view::Tab::Gpu, 100),
+    ] {
+        let mut st = tab_state(tab);
+        let out = render(&mut st, w, 30);
+        let footer = out.lines().last().expect("rodapé");
+        assert!(!footer.contains("interwintop"), "{footer}");
+        // Entre a ajuda e o estado há pelo menos 2 espaços.
+        let i = footer.find("wintop ").expect("estado");
+        assert!(footer[..i].ends_with("  "), "{footer}");
+    }
 }
 
 #[test]

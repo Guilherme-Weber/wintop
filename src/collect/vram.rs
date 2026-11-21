@@ -207,11 +207,22 @@ impl VramCollector {
         Ok(out)
     }
 
-    /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML).
-    pub(super) fn read(&mut self, luid: &str, total: u64) -> Metric<VramBreakdown> {
-        if let Ok(q) = &self.query {
-            q.collect().or_else(fail)?;
+    /// Coleta a consulta (uma vez por ciclo, antes das leituras de cada GPU).
+    pub(super) fn collect(&self) -> Result<(), String> {
+        match &self.query {
+            Ok(q) => q.collect(),
+            Err(e) => Err(e.clone()),
         }
+    }
+
+    /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML);
+    /// `names`: PID → nome. Chamar depois de `collect`.
+    pub(super) fn read(
+        &mut self,
+        luid: &str,
+        total: u64,
+        names: &HashMap<u32, String>,
+    ) -> Metric<VramBreakdown> {
         let per_process = self.per_process(&self.local, luid).or_else(fail)?;
         let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;
         let mine: Vec<u64> = adapter
@@ -224,7 +235,7 @@ impl VramCollector {
         }
         let adapter_used = mine.iter().sum();
         let list: Vec<(u32, u64)> = per_process.into_iter().collect();
-        Ok(breakdown(&list, adapter_used, total, &process_names()))
+        Ok(breakdown(&list, adapter_used, total, names))
     }
 }
 

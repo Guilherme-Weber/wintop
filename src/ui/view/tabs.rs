@@ -71,16 +71,23 @@ impl Cursor {
     }
 
     /// PID selecionado no último desenho.
+    #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
 
+    /// Linhas visíveis no último desenho.
+    pub(in crate::ui) fn page(&self) -> usize {
+        self.page
+    }
+
     /// Aplica o movimento sobre `pids` (na ordem exibida) com `rows` linhas visíveis; devolve
     /// (selecionado, primeira linha visível).
-    fn resolve(&mut self, pids: &[u32], rows: usize) -> (Option<usize>, usize) {
+    pub(in crate::ui) fn resolve(&mut self, pids: &[u32], rows: usize) -> (Option<usize>, usize) {
         self.page = rows;
         if pids.is_empty() {
             self.pending = 0;
+            self.pid = None;
             return (None, 0);
         }
         let last = pids.len() - 1;
@@ -195,11 +202,21 @@ const FLEX_MAX: u16 = 44;
 /// Texto que cabe em `w` colunas do terminal (corta no fim com `…`) e alinhado.
 fn cell(s: &str, w: u16, right: bool) -> String {
     let w = usize::from(w);
+    let total = Span::raw(s).width();
+    // Caminho comum: cabe inteiro, só alinha.
+    if total <= w {
+        let pad = " ".repeat(w - total);
+        return if right {
+            format!("{pad}{s}")
+        } else {
+            format!("{s}{pad}")
+        };
+    }
     let mut out = String::new();
     let mut used = 0;
-    let total = Span::raw(s).width();
+    let mut tmp = [0u8; 4];
     for ch in s.chars() {
-        let cw = Span::raw(ch.to_string()).width();
+        let cw = Span::raw(&*ch.encode_utf8(&mut tmp)).width();
         // Reserva 1 coluna para o `…` quando o texto não cabe inteiro.
         let limit = if total > w { w.saturating_sub(1) } else { w };
         if used + cw > limit {
@@ -337,7 +354,7 @@ const PROC_COLS: [Col; 9] = [
     col("CPU%", 6, true, 0),
     col("Memory", 10, true, 0),
     col("Commit", 10, true, 4),
-    col("Threads", 7, true, 3),
+    col("Threads", 8, true, 3),
     col("Handles", 8, true, 5),
     col("Read", 11, true, 1),
     col("Write", 11, true, 2),
@@ -359,11 +376,12 @@ pub(super) fn sorted_procs<'a>(
     v.sort_by(|a, b| {
         let o = match sort {
             ProcSort::Pid => a.pid.cmp(&b.pid),
+            // Sem alocar no comparador (ASCII basta para nomes de executáveis).
             ProcSort::Name => a
                 .name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then(a.pid.cmp(&b.pid)),
+                .bytes()
+                .map(|c| c.to_ascii_lowercase())
+                .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase())),
             ProcSort::Cpu => a.cpu.total_cmp(&b.cpu),
             ProcSort::Mem => a.mem.cmp(&b.mem),
             ProcSort::Commit => a.commit.cmp(&b.commit),
@@ -530,7 +548,8 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let block = boxed(&title, &format!("{} processes", list.len()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height < 6 || inner.width < 4 {
+    // VRAM, adapter, folga, cabeçalho, 1 linha, divisória e 2 de detalhe.
+    if inner.height < 8 || inner.width < 4 {
         return;
     }
     // Linha 0: VRAM por categoria; linha 1: engines do adaptador (NVML).
@@ -656,7 +675,12 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             Err(e) => l1.push(missing(e)),
         }
         l2.push(label("runtimes "));
-        match st.runtimes.get(&p.pid) {
+        match st
+            .runtimes
+            .get(&p.pid)
+            .filter(|(n, _)| n == &p.name)
+            .map(|(_, r)| r)
+        {
             Some(Ok(r)) if r.is_empty() => l2.push(label("none of the known GPU runtimes")),
             Some(Ok(r)) => l2.push(text(r.join(", "))),
             Some(Err(e)) => l2.push(missing(e)),
@@ -907,13 +931,25 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Com largura para isso, um grupo por coluna (CPU, GPU, discos lado a lado).
     let groups = rows.windows(2).filter(|w| w[0].group != w[1].group).count() + 1;
     let roomy = usize::from((inner.width + 3) / (SENSOR_FULL_W + 3));
-    let layout = sensor_layout(&rows, h, groups <= roomy);
+    let split = groups <= roomy;
     let gap = 3u16;
     let min_w = 18 + 1 + 12;
     let fits = usize::from((inner.width + gap) / (min_w + gap)).max(1);
+    // Causas longas ocupam linhas a mais, que dependem da largura da coluna, que depende do
+    // número de colunas: uma estimativa (uma coluna só) e depois a conta com a largura real.
+    let geometry = |ncols: usize| {
+        let cw = (inner.width.saturating_sub(gap * (ncols as u16 - 1))) / ncols as u16;
+        (cw, fit(&SENSOR_COLS, cw))
+    };
+    let first = {
+        let (cw, w) = geometry(1);
+        sensor_layout(&rows, h, split, |i| cause_lines(&rows[i], cw, &w).len())
+    };
+    let (cw, widths) = geometry(first.len().clamp(1, fits));
+    let layout = sensor_layout(&rows, h, split, |i| {
+        cause_lines(&rows[i], cw, &widths).len()
+    });
     let ncols = layout.len().clamp(1, fits);
-    let cw = (inner.width.saturating_sub(gap * (ncols as u16 - 1))) / ncols as u16;
-    let widths = fit(&SENSOR_COLS, cw);
     for (col_i, items) in layout.iter().enumerate().take(ncols) {
         let x = inner.x + col_i as u16 * (cw + gap);
         put(
@@ -943,6 +979,12 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     );
                     continue;
                 }
+                SensorItem::Cause(i, k) => {
+                    if let Some(l) = cause_lines(&rows[*i], cw, &widths).into_iter().nth(*k) {
+                        put(frame, Paragraph::new(l), at, inner);
+                    }
+                    continue;
+                }
                 SensorItem::Row(i) => &rows[*i],
             };
             sensor_line(frame, at, inner, r, &widths, st);
@@ -957,11 +999,42 @@ pub(super) enum SensorItem {
     /// Título do grupo do sensor `i`; `true` = continuação de outra coluna.
     Title(usize, bool),
     Row(usize),
+    /// Linha `k` da causa (longa) da falha do sensor `i`, embaixo dele.
+    Cause(usize, usize),
+}
+
+/// Espaço das colunas de valor, mínimo e máximo (com as folgas).
+fn value_room(widths: &[Option<u16>]) -> usize {
+    widths[1..]
+        .iter()
+        .flatten()
+        .map(|w| usize::from(*w) + 1)
+        .sum::<usize>()
+        .saturating_sub(1)
+}
+
+/// Sensor sem valor cuja causa não cabe nas colunas de valor: a causa inteira vai para as
+/// linhas de baixo (quebrada por palavra, nunca cortada).
+fn cause_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>]) -> Vec<Line<'static>> {
+    let (SensorValue::Num(Err(m), ..) | SensorValue::Text(Err(m))) = &r.value else {
+        return Vec::new();
+    };
+    let span = missing(m);
+    if span.width() <= value_room(widths) {
+        return Vec::new();
+    }
+    super::wrap(vec![span], cw, 2, 2)
 }
 
 /// Distribui os sensores em colunas de `h` linhas (puro, para teste).
 /// `split`: cada grupo começa numa coluna nova.
-pub(super) fn sensor_layout(rows: &[SensorRow], h: usize, split: bool) -> Vec<Vec<SensorItem>> {
+/// `extra(i)`: linhas de causa embaixo do sensor `i`.
+pub(super) fn sensor_layout(
+    rows: &[SensorRow],
+    h: usize,
+    split: bool,
+    extra: impl Fn(usize) -> usize,
+) -> Vec<Vec<SensorItem>> {
     let h = h.max(2);
     let mut cols: Vec<Vec<SensorItem>> = vec![Vec::new()];
     let mut last_group: Option<&str> = None;
@@ -986,6 +1059,14 @@ pub(super) fn sensor_layout(rows: &[SensorRow], h: usize, split: bool) -> Vec<Ve
         cols.last_mut()
             .expect("uma coluna")
             .push(SensorItem::Row(i));
+        for k in 0..extra(i) {
+            if cols.last().is_some_and(|c| c.len() >= h) {
+                cols.push(vec![SensorItem::Title(i, true)]);
+            }
+            cols.last_mut()
+                .expect("uma coluna")
+                .push(SensorItem::Cause(i, k));
+        }
     }
     cols
 }
@@ -1011,17 +1092,19 @@ fn sensor_line(
         }
         SensorValue::Text(m) => (metric(m, Clone::clone), String::new(), String::new()),
     };
-    // Valor com falha (texto longo) ocupa as colunas de valor, mínimo e máximo.
-    let wide_value = Span::width(&value) > 12;
-    let cells = if wide_value {
-        let w: u16 = widths[1..].iter().flatten().map(|w| w + 1).sum::<u16>();
+    // Valor com falha (texto longo) ocupa as colunas de valor, mínimo e máximo; se nem assim
+    // couber, a linha fica só com o nome e a causa vai para as linhas de baixo.
+    let room = value_room(widths);
+    let cells = if value.width() > room {
+        Line::from(Span::styled(printable(&r.name), Style::new().fg(TEXT)))
+    } else if value.width() > usize::from(widths[1].unwrap_or(0)) {
         let mut l = vec![Span::styled(
             cell(&printable(&r.name), widths[0].unwrap_or(0), false),
             Style::new().fg(TEXT),
         )];
         l.push(Span::raw(" "));
         l.push(Span::styled(
-            cell(&value.content, w.saturating_sub(1), true),
+            cell(&value.content, room as u16, true),
             value.style,
         ));
         Line::from(l)

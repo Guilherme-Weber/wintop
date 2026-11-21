@@ -147,7 +147,8 @@ pub(super) struct ProcCollector {
 impl ProcCollector {
     pub(super) fn new() -> Self {
         Self {
-            buf: vec![0; 512 << 10 >> 3],
+            // Alocado na 1ª leitura (aba aberta) e liberado no `reset` (aba fechada).
+            buf: Vec::new(),
             prev: HashMap::new(),
             prev_sys: None,
         }
@@ -160,11 +161,15 @@ impl ProcCollector {
 
     /// Esquece as leituras (aba fechada: a próxima abertura começa do zero).
     pub(super) fn reset(&mut self) {
-        self.prev.clear();
+        self.prev = HashMap::new();
         self.prev_sys = None;
+        self.buf = Vec::new();
     }
 
     fn query(&mut self) -> Result<Vec<Raw>, String> {
+        if self.buf.is_empty() {
+            self.buf = vec![0; (512 << 10) / 8];
+        }
         loop {
             let bytes = self.buf.len() * 8;
             let mut need = 0u32;

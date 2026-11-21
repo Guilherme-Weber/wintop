@@ -68,7 +68,7 @@ impl EngineCollector {
 
     /// Coleta (abrindo a consulta se preciso). Devolve se já há taxa (2ª coleta em diante).
     pub(super) fn collect(&mut self) -> Result<bool, String> {
-        let (q, _) = self.open.get_or_insert_with(|| {
+        let (q, slot) = self.open.get_or_insert_with(|| {
             let q = Query::open();
             let slot = match &q {
                 Ok(q) => q.add(r"\GPU Engine(*)\Utilization Percentage"),
@@ -76,6 +76,8 @@ impl EngineCollector {
             };
             (q, slot)
         });
+        // Contador recusado: a causa real (ex.: objeto PDH ausente), não "sem dados".
+        slot.as_ref().map_err(Clone::clone)?;
         q.as_ref().map_err(Clone::clone)?.collect()?;
         self.samples = self.samples.saturating_add(1);
         Ok(self.samples >= 2)

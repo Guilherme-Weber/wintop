@@ -197,29 +197,12 @@ impl SlowCollectors {
             };
         }
         let procs = want_procs.then(|| guarded("process", || self.procs.read()));
-        let engines = if view.gpu {
-            match &mut self.gpu {
-                Ok(g) => catch_unwind(AssertUnwindSafe(|| g.collect_engines()))
-                    .unwrap_or_else(|_| Err("GPU engine collector panicked".into())),
-                Err(e) => Err(e.clone()),
-            }
-        } else {
-            Ok(false)
+        // Nomes dos processos: da lista recém-lida (aba aberta) ou de um snapshot do Toolhelp.
+        let names: std::collections::HashMap<u32, String> = match &procs {
+            Some(Ok(list)) => list.iter().map(|p| (p.pid, p.name.clone())).collect(),
+            _ => vram::process_names(),
         };
-        let gpus = run("GPU PCIe", &mut self.gpu, |g| {
-            let mut list = g.read(view.gpu)?;
-            // Falha da consulta das engines: os processos ficam com a causa.
-            if let Err(e) = &engines {
-                for s in &mut list {
-                    if let Some(Ok(p)) = &mut s.procs {
-                        for x in p.iter_mut() {
-                            x.engines = fail(e.clone());
-                        }
-                    }
-                }
-            }
-            Ok(list)
-        });
+        let gpus = run("GPU PCIe", &mut self.gpu, |g| g.read(view.gpu, &names));
         let disk_temps = run("disk temperature", &mut self.disk_temp, |c| c.read(stop));
         Slow {
             gpus,

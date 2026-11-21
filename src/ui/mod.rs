@@ -174,14 +174,9 @@ fn list_key(st: &mut view::State, code: KeyCode) -> bool {
             st.proc_reverse = !st.proc_reverse;
         }
         KeyCode::Char('/') if st.tab == view::Tab::Processes => st.filtering = true,
-        KeyCode::Enter if st.tab == view::Tab::Gpu => {
-            // Sob demanda: abre o processo selecionado (nunca o jogo nem apps com o hook do
-            // RTSS, recusados antes de abrir).
-            if let Some(pid) = st.gpu_cursor.pid() {
-                let r = crate::collect::modules::runtimes(pid, &st.protected_pids());
-                st.runtimes.insert(pid, r);
-            }
-        }
+        // Sob demanda: abre o processo selecionado (nunca o jogo nem apps com o hook do RTSS,
+        // recusados antes de abrir).
+        KeyCode::Enter if st.tab == view::Tab::Gpu => st.request_runtimes(),
         _ => return false,
     }
     true

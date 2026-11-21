@@ -295,12 +295,18 @@ impl Engine {
     /// para a coleta dela no ciclo seguinte.
     pub fn set_view(&self, v: View) {
         let bits = u8::from(v.procs) | (u8::from(v.gpu) << 1);
-        let old = {
+        // O chute é gravado com o lock: a thread lenta lê o chute com o lock e só o solta ao
+        // começar a esperar, então o aviso não se perde entre a leitura e a espera.
+        let kicked = {
             let _st = self.shared.lock();
-            self.shared.view.swap(bits, Ordering::Relaxed)
+            let old = self.shared.view.swap(bits, Ordering::Relaxed);
+            let kicked = bits & !old != 0;
+            if kicked {
+                self.shared.kick.store(true, Ordering::Relaxed);
+            }
+            kicked
         };
-        if bits & !old != 0 {
-            self.shared.kick.store(true, Ordering::Relaxed);
+        if kicked {
             self.shared.wake.notify_all();
         }
     }

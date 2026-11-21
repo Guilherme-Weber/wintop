@@ -175,7 +175,8 @@ pub struct State {
     /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
     pub gpu_cursor: Cursor,
-    pub runtimes: HashMap<u32, Metric<Vec<&'static str>>>,
+    /// Por PID, com o nome do processo lido (PID reaproveitado por outro não herda o resultado).
+    pub runtimes: HashMap<u32, (String, Metric<Vec<&'static str>>)>,
 }
 
 impl State {
@@ -227,21 +228,49 @@ impl State {
                 }
                 Err(e) => self.gpu_procs = Some(Err(e.clone())),
             }
+            // Runtimes de processos que saíram da lista não valem mais.
+            if let Some(Ok(list)) = &self.gpu_procs {
+                self.runtimes
+                    .retain(|pid, (name, _)| list.iter().any(|p| p.pid == *pid && &p.name == name));
+            }
         }
         self.slow = Some(s);
         self.update_sensors();
     }
 
     /// PIDs que a leitura de módulos nunca abre: o jogo e os apps com o hook do RTSS.
-    pub fn protected_pids(&self) -> Vec<u32> {
-        let mut v = Vec::new();
-        if let Some(f) = &self.fps {
-            v.extend(&f.hooked);
-            if let Ok(g) = &f.game {
-                v.push(g.pid);
-            }
+    /// `None`: o RTSS ainda não deu a lista (início, RTSS fechado ou reconectando): sem ela não
+    /// dá para saber qual processo é jogo, então nenhum é aberto.
+    pub fn protected_pids(&self) -> Option<Vec<u32>> {
+        let f = self.fps.as_ref()?;
+        f.rtss.as_ref().ok()?;
+        let mut v = f.hooked.clone();
+        if let Ok(g) = &f.game {
+            v.push(g.pid);
         }
-        v
+        Some(v)
+    }
+
+    /// Enter na aba GPU: lê os runtimes do processo selecionado (aplicando antes as teclas de
+    /// seleção ainda pendentes, sobre a lista exibida).
+    pub fn request_runtimes(&mut self) {
+        let Some(Ok(list)) = &self.gpu_procs else {
+            return;
+        };
+        let rows = tabs::sorted_gpu(list);
+        let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
+        let page = self.gpu_cursor.page();
+        let (Some(i), _) = self.gpu_cursor.resolve(&pids, page) else {
+            return;
+        };
+        let (pid, name) = (rows[i].pid, rows[i].name.clone());
+        let r = match self.protected_pids() {
+            Some(p) => crate::collect::modules::runtimes(pid, &p),
+            None => crate::model::neutral(
+                "skipped: waiting for RTSS to list the hooked apps (anticheat safety)",
+            ),
+        };
+        self.runtimes.insert(pid, (name, r));
     }
 
     pub fn reset_session(&mut self) {
@@ -575,8 +604,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             Style::new().fg(TITLE).add_modifier(Modifier::BOLD),
         )
     };
-    // Atalhos da aba primeiro (o que sobra da largura corta o fim da ajuda).
-    let mut left = vec![key(" 1-4"), label(" tabs  ")];
+    // Atalhos em grupos inteiros (tecla + rótulo): um grupo que não cabe sai inteiro.
+    let mut groups: Vec<[Span<'static>; 2]> = vec![[key(" 1-4"), label(" tabs  ")]];
     let pairs: &[(&str, &str)] = match st.tab {
         Tab::Overview => &[("r", " reset min/max  "), ("d", " fold pool  ")],
         Tab::Processes if st.filtering => &[
@@ -594,15 +623,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         Tab::Sensors => &[("r", " reset min/max  ")],
     };
     for (k, l) in pairs {
-        left.extend([key(k), label(l)]);
+        groups.push([key(k), label(l)]);
     }
-    left.extend([
+    groups.push([
         key("+/-"),
         label(&format!(" interval {} ms  ", st.interval_ms)),
-        key("q"),
-        label(" quit"),
     ]);
-    let left = Line::from(left);
+    groups.push([key("q"), label(" quit")]);
     let mut right = Vec::new();
     if let Some(f) = &st.fast {
         match &f.own {
@@ -634,9 +661,20 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         1 => Span::styled("! 1 source failing ", Style::new().fg(FAIL)),
         n => Span::styled(format!("! {n} sources failing "), Style::new().fg(FAIL)),
     });
-    // O lado direito (estado) tem prioridade; a ajuda usa o que sobra, sem sobrepor.
+    // O lado direito (estado) tem prioridade; a ajuda usa o que sobra, com 2 colunas de folga.
     let right = Line::from(right);
     let rw = (right.width() as u16).min(area.width);
+    let room = usize::from(area.width.saturating_sub(rw).saturating_sub(2));
+    let mut left = Vec::new();
+    let mut used = 0;
+    for g in groups {
+        let w = g[0].width() + g[1].width();
+        if used + w <= room {
+            used += w;
+            left.extend(g);
+        }
+    }
+    let left = Line::from(left);
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(rw)]).areas(area);
     frame.render_widget(Paragraph::new(left), l);
     frame.render_widget(Paragraph::new(right).right_aligned(), r);
@@ -658,6 +696,15 @@ fn failing_sources(st: &State) -> usize {
     if let Some(s) = &st.slow {
         n += usize::from(s.gpus.as_ref().is_err_and(fail));
         n += usize::from(s.disk_temps.as_ref().is_err_and(fail));
+    }
+    // Fontes das abas Processos e GPU (só quando visíveis).
+    n += usize::from(matches!(&st.procs, Some(Err(e)) if fail(e)));
+    match &st.gpu_procs {
+        Some(Err(e)) => n += usize::from(fail(e)),
+        Some(Ok(list)) => {
+            n += usize::from(list.iter().any(|p| p.engines.as_ref().is_err_and(fail)));
+        }
+        None => {}
     }
     if let Some(f) = &st.fps {
         n += usize::from(f.rtss.as_ref().is_err_and(fail));
@@ -1247,7 +1294,12 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
 /// Quebra uma linha em várias de até `width` colunas, em vez de cortar. Os pontos de quebra são
 /// os spans que começam com espaço (separadores e rótulos como "  SM "); o espaço da quebra
 /// some e a continuação começa com `indent` espaços. `first` é o recuo da primeira linha.
-fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<Line<'static>> {
+pub(super) fn wrap(
+    spans: Vec<Span<'static>>,
+    width: u16,
+    first: u16,
+    indent: u16,
+) -> Vec<Line<'static>> {
     let starts_group = |sp: &Span<'_>| sp.content.starts_with(char::is_whitespace);
     let mut groups: std::collections::VecDeque<Vec<Span<'static>>> = Default::default();
     for sp in spans {
