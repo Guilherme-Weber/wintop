@@ -14,6 +14,9 @@ use windows::Win32::NetworkManagement::Ndis::MediaConnectStateConnected;
 use crate::model::{Metric, Nic, fail, neutral};
 use crate::win::from_wide;
 
+/// `NDIS_LINK_SPEED_UNKNOWN`: o driver não informou a velocidade.
+const LINK_SPEED_UNKNOWN: u64 = u64::MAX;
+
 const REDISCOVER: Duration = Duration::from_secs(30);
 
 // Bits de `InterfaceAndOperStatusFlags`.
@@ -148,10 +151,10 @@ impl NetCollector {
                 }
             };
             out.push(Nic {
-                link: if connected {
-                    Ok(k.row.ReceiveLinkSpeed)
-                } else {
-                    neutral("disconnected")
+                link: match (connected, k.row.ReceiveLinkSpeed) {
+                    (false, _) => neutral("disconnected"),
+                    (true, LINK_SPEED_UNKNOWN) => fail("link speed unknown"),
+                    (true, speed) => Ok(speed),
                 },
                 send: taxa(|p| p.2, tx),
                 recv: taxa(|p| p.1, rx),

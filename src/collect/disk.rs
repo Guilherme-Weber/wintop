@@ -381,7 +381,11 @@ impl Inventory {
     }
 
     /// Atividade desde a última leitura. Não acorda o disco: os contadores são do driver.
+    /// Disco perdido não é reaberto: o mesmo número pode ser outro disco (redescoberta).
     fn activity(&mut self) -> Metric<(f64, f64, f64, f64)> {
+        if self.lost {
+            return fail("disk removed");
+        }
         let temp;
         let h = if let Some(h) = &self.handle {
             h
@@ -400,7 +404,6 @@ impl Inventory {
                 return fail(e);
             }
         };
-        self.lost = false;
         let Some(now) = now else {
             return fail("response too short");
         };
@@ -415,7 +418,8 @@ impl Inventory {
 pub struct DiskCollector {
     disks: Vec<Inventory>,
     letters: Vec<(u32, String)>,
-    discovered: Instant,
+    /// Última redescoberta; `None` força uma na próxima coleta (disco perdido).
+    discovered: Option<Instant>,
     system_drive: Option<char>,
     pagefile_drives: Vec<char>,
 }
@@ -430,7 +434,7 @@ impl DiskCollector {
         Self {
             disks: (0..64).filter_map(Inventory::discover).collect(),
             letters: volume_letters(),
-            discovered: Instant::now(),
+            discovered: Some(Instant::now()),
             system_drive: win::windows_drive(),
             pagefile_drives,
         }
@@ -438,7 +442,7 @@ impl DiskCollector {
 
     /// Discos novos entram, discos que sumiram saem; letras relidas.
     fn rediscover(&mut self) {
-        self.discovered = Instant::now();
+        self.discovered = Some(Instant::now());
         // Disco perdido sai; se o número voltar a existir, é redescoberto do zero (handle e
         // metadados novos: pode ser outro disco).
         self.disks.retain(|d| !d.lost);
@@ -454,7 +458,7 @@ impl DiskCollector {
     }
 
     pub fn read(&mut self) -> Metric<Vec<Disk>> {
-        if self.discovered.elapsed() >= REDISCOVER {
+        if self.discovered.is_none_or(|t| t.elapsed() >= REDISCOVER) {
             self.rediscover();
         }
         if self.disks.is_empty() {
@@ -469,6 +473,9 @@ impl DiskCollector {
         for inv in &mut self.disks {
             inv.retry_if_asleep();
             let act = inv.activity();
+            if inv.lost {
+                self.discovered = None;
+            }
             let letters: Vec<String> = self
                 .letters
                 .iter()
