@@ -824,6 +824,9 @@ impl RtssCollector {
         self.exact.clear();
         self.approx.clear();
         self.lows = None;
+        // Sem Shared Memory válida, nenhum índice é "conhecido" (o teto vale para todos).
+        self.known.clear();
+        self.published = None;
     }
 
     /// Uma amostra: estado do RTSS e do jogo.

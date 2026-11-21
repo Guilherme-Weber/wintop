@@ -161,8 +161,9 @@ fn probe_fps_frametime_e_lows() {
     assert!(g.api.starts_with("D3D1"), "{}", g.api);
     assert!((avg - want).abs() < want * 0.02, "FPS {avg} × {want}");
     // Jitter do próprio probe: um Present que bloqueia (fila da GPU cheia) atrasa um frame e o
-    // seguinte "recupera" (medido: 8.1 ms num alvo de 10 ms). O RTSS mede o que aconteceu.
-    assert!((lo - 1000.0 / FPS).abs() < 2.5, "frametime mínimo {lo}");
+    // seguinte "recupera" (medido: 7.4 a 8.9 ms num alvo de 10 ms, varia entre execuções). O
+    // RTSS mede o que aconteceu; as conferências exatas são o FPS médio e os lows.
+    assert!((lo - 1000.0 / FPS).abs() < 3.5, "frametime mínimo {lo}");
     assert!((hi - STUTTER_MS).abs() < 2.5, "frametime máximo {hi}");
     let (l1, l01) = g.lows.expect("lows com mais de 100 frames");
     assert!((l1 - want_low).abs() < want_low * 0.03, "1% low {l1}");

@@ -76,6 +76,20 @@ impl Cursor {
         self.pid
     }
 
+    /// O que `resolve` selecionaria, sem mudar nada (para montar o detalhe antes da tabela).
+    fn peek(&self, pids: &[u32]) -> Option<usize> {
+        let last = pids.len().checked_sub(1)?;
+        let base = self
+            .pid
+            .and_then(|p| pids.iter().position(|&x| x == p))
+            .unwrap_or(self.index.min(last));
+        Some(
+            (base as isize)
+                .saturating_add(self.pending)
+                .clamp(0, last as isize) as usize,
+        )
+    }
+
     /// Linhas visíveis no último desenho.
     pub(in crate::ui) fn page(&self) -> usize {
         self.page
@@ -603,14 +617,13 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // meio. A seleção é resolvida antes, para o detalhe ser do processo que vai aparecer.
     let table_y = inner.y + 3;
     let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
-    let estimate = usize::from(inner.height.saturating_sub(3 + 1 + 3));
-    let (first_sel, _) = st.gpu_cursor.resolve(&pids, estimate);
     let detail = gpu_detail(
         st,
-        first_sel.and_then(|i| rows.get(i).copied()),
+        st.gpu_cursor.peek(&pids).and_then(|i| rows.get(i).copied()),
         inner.width,
     );
-    let detail_h = (detail.len() as u16).clamp(2, inner.height.saturating_sub(5).max(2));
+    // Pelo menos uma linha de processo fica (cabeçalho + 1 + divisória).
+    let detail_h = (detail.len() as u16).clamp(2, inner.height.saturating_sub(6).max(2));
     let table_h = inner.height.saturating_sub(3 + 1 + detail_h);
     let widths = fit(&GPU_COLS, inner.width);
     put(
@@ -1000,23 +1013,33 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ncols = want;
     }
     // Não cabem nem com as colunas mais estreitas: a última linha avisa quantos ficaram fora.
-    let hidden: usize = layout
+    let sensor_of = |it: &SensorItem| match it {
+        SensorItem::Row(i) | SensorItem::Cause(i, _) => Some(*i),
+        _ => None,
+    };
+    let beyond: std::collections::BTreeSet<usize> = layout
         .iter()
         .skip(ncols)
         .flatten()
-        .filter(|it| matches!(it, SensorItem::Row(_)))
-        .count();
-    if hidden > 0
+        .filter_map(sensor_of)
+        .collect();
+    if !beyond.is_empty()
         && let Some(last) = layout.get_mut(ncols - 1)
     {
-        // A linha do aviso sai da última coluna: o que estava nela também conta.
-        let keep = h.saturating_sub(1).min(last.len());
-        let dropped = last[keep..]
-            .iter()
-            .filter(|it| matches!(it, SensorItem::Row(_)))
-            .count();
+        // A linha do aviso sai da última coluna; o corte recua até o fim de um sensor inteiro
+        // (nem sensor pela metade, nem título solto antes do aviso).
+        let mut keep = h.saturating_sub(1).min(last.len());
+        let cut_sensor = |k: usize| last.get(k).and_then(sensor_of);
+        while keep > 0
+            && (cut_sensor(keep).is_some() && cut_sensor(keep) == cut_sensor(keep - 1)
+                || matches!(last[keep - 1], SensorItem::Title(..) | SensorItem::Blank))
+        {
+            keep -= 1;
+        }
+        let mut hidden = beyond;
+        hidden.extend(last[keep..].iter().filter_map(sensor_of));
         last.truncate(keep);
-        last.push(SensorItem::More(hidden + dropped));
+        last.push(SensorItem::More(hidden.len()));
     }
     for (col_i, items) in layout.iter().enumerate().take(ncols) {
         let x = inner.x + col_i as u16 * (cw + gap);

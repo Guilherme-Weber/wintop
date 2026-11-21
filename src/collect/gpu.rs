@@ -433,6 +433,15 @@ impl GpuSlowCollector {
                         let l = luid.clone()?;
                         collected.clone().or_else(fail)?;
                         let mem = self.vram.per_process_detail(&l).or_else(fail)?;
+                        if names.is_none() {
+                            // Sem a lista de processos: o cache cobre os PIDs desta lista.
+                            let engine_pids: Vec<u32> = rows.as_ref().map_or_else(
+                                |_| Vec::new(),
+                                |r| super::gpu_engine::group(r, &l).into_keys().collect(),
+                            );
+                            self.vram
+                                .refresh_names(mem.keys().copied().chain(engine_pids));
+                        }
                         let list = gpu_procs(&mem, rows, &l, names.unwrap_or(&self.vram.names));
                         // Engines em falha e nenhum processo com VRAM: a lista vazia esconderia
                         // a causa.

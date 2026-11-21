@@ -206,6 +206,12 @@ impl State {
             self.procs = None;
             self.gpu_procs = None;
             self.filtering = false;
+            // A última coleta lenta já trouxe a falha das abas (a thread parou): ela aparece
+            // em vez de "waiting" (dado novo, se vier, substitui).
+            if let Some(Some(Err(e))) = self.slow.as_ref().map(|s| &s.procs) {
+                self.procs = Some(Err(e.clone()));
+                self.gpu_procs = Some(Err(e.clone()));
+            }
         }
     }
 
@@ -1897,7 +1903,15 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .iter()
         .partition(|n| matches!(n.link, Err(Missing::Neutral(_))));
     // Placas que não cabem: a última linha avisa quantas ficaram de fora.
-    let fits = |reserved: u16| usize::from(inner.height.saturating_sub(reserved) / 3).max(1);
+    // Uma placa precisa de 2 linhas (cabeçalho + taxa); com menos, nenhuma cabe.
+    let fits = |reserved: u16| {
+        let room = inner.height.saturating_sub(reserved);
+        if room < 2 {
+            0
+        } else {
+            usize::from(room / 3).max(1)
+        }
+    };
     let mut reserved = u16::from(!down.is_empty());
     let more = up.len() > fits(reserved);
     if more && down.is_empty() {
@@ -2343,7 +2357,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         line(frame, info, info_x, y, info_w, inner);
     }
     // Notas (causas inteiras), nas linhas reservadas.
-    let first = inner.y + 1 + shown as u16 + u16::from(shown < order.len());
+    let first = inner.y + 1 + shown as u16 + u16::from(shown < order.len() && rows > 0);
     for (i, l) in notes.into_iter().enumerate() {
         let y = first + i as u16;
         if y >= inner.y + inner.height {

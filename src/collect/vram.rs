@@ -195,6 +195,21 @@ impl VramCollector {
         Ok(out)
     }
 
+    /// Cache de nomes para os PIDs dados: relê o Toolhelp se algum é novo, e guarda só esses
+    /// (um PID que sai do conjunto e volta, possivelmente outro processo, é relido).
+    pub(super) fn refresh_names(&mut self, pids: impl Iterator<Item = u32>) {
+        let pids: Vec<u32> = pids.collect();
+        if pids.iter().any(|p| !self.names.contains_key(p)) {
+            let all = process_names();
+            self.names = pids
+                .iter()
+                .filter_map(|p| all.get(p).map(|n| (*p, n.clone())))
+                .collect();
+        } else {
+            self.names.retain(|p, _| pids.contains(p));
+        }
+    }
+
     /// VRAM local, não local e confirmada por PID (aba GPU), da coleta feita pelo `read`.
     pub(super) fn per_process_detail(&self, luid: &str) -> Result<HashMap<u32, ProcMem>, String> {
         let mut out: HashMap<u32, ProcMem> = HashMap::new();
@@ -228,8 +243,8 @@ impl VramCollector {
         names: Option<&HashMap<u32, String>>,
     ) -> Metric<VramBreakdown> {
         let per_process = self.per_process(&self.local, luid).or_else(fail)?;
-        if names.is_none() && per_process.keys().any(|p| !self.names.contains_key(p)) {
-            self.names = process_names();
+        if names.is_none() {
+            self.refresh_names(per_process.keys().copied());
         }
         let names = names.unwrap_or(&self.names);
         let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;
