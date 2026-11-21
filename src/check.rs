@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::collect::{FastCollectors, RtssCollector, SlowCollectors};
 use crate::fmt::{bits, bytes, num, pct};
 use crate::model::{Fast, Fps, Metric, Missing, Slow};
+use crate::win::printable;
 
 const WARMUP: Duration = Duration::from_millis(300);
 
@@ -36,7 +37,8 @@ impl Report {
                 ("FAIL  ", s.clone())
             }
         };
-        println!("  {tag}  {label:<34} {text}");
+        // Nomes e mensagens vêm de dispositivos e do sistema: sem controles no terminal.
+        println!("  {tag}  {label:<34} {}", printable(&text));
     }
 }
 
@@ -173,7 +175,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 if d.pagefile {
                     tags.push_str(" page-file");
                 }
-                println!("  Disk {} {}", d.number, tags.trim());
+                println!("  Disk {} {}", d.number, printable(tags.trim()));
                 r.line("  Model", &d.model, Clone::clone);
                 r.line("  Bus", &d.bus, ToString::to_string);
                 r.line("  Type", &d.ssd, |s| if *s { "SSD" } else { "HDD" }.into());
@@ -196,7 +198,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for n in list {
-                println!("  {} ({})", n.alias, n.description);
+                println!("  {} ({})", printable(&n.alias), printable(&n.description));
                 r.line("  Link", &n.link, |v| bits(*v as f64));
                 r.line("  Send", &n.send, |v| bits(*v));
                 r.line("  Receive", &n.recv, |v| bits(*v));
@@ -315,7 +317,12 @@ fn fps_report(r: &mut Report, f: &Fps) {
             } else {
                 ""
             };
-            println!("  Game: {} (PID {}, {}){approx}", g.name, g.pid, g.api);
+            println!(
+                "  Game: {} (PID {}, {}){approx}",
+                printable(&g.name),
+                g.pid,
+                g.api
+            );
             r.line("  Resolution", &g.resolution, |(x, y)| format!("{x}x{y}"));
             r.line("  FPS", &g.fps, |v| num(*v, 1));
             r.line(

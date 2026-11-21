@@ -328,8 +328,12 @@ fn rtss_thread(sh: &Shared, stop: HANDLE) {
         } else {
             RTSS_IDLE_PERIOD
         };
-        // Só publica o que mudou (sem jogo, o estado se repete a cada segundo: nada a redesenhar).
-        if last.as_ref() != Some(&snap) {
+        // Com jogo, toda amostra vai para o gráfico (FPS travado por VSync se repete e mesmo
+        // assim é um ponto novo). Sem jogo o estado se repete a cada segundo: só o que mudou.
+        if snap.game.is_ok() {
+            last = None;
+            publish(snap);
+        } else if last.as_ref() != Some(&snap) {
             last = Some(snap.clone());
             publish(snap);
         }

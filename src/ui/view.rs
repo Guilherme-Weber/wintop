@@ -140,11 +140,18 @@ impl State {
 
 /// Texto de uma métrica: o valor, o estado neutro (cinza) ou a falha (vermelho, com a causa).
 fn metric<T>(m: &Metric<T>, f: impl FnOnce(&T) -> String) -> Span<'static> {
+    // Valores e causas podem trazer texto de fora (nomes, mensagens do sistema): sem controles.
     match m {
-        Ok(v) => Span::styled(f(v), Style::new().fg(TEXT)),
-        Err(Missing::Neutral(s)) => Span::styled(s.clone(), Style::new().fg(NEUTRAL)),
-        Err(Missing::Fail(s)) => Span::styled(format!("! {s}"), Style::new().fg(FAIL)),
+        Ok(v) => Span::styled(printable(&f(v)), Style::new().fg(TEXT)),
+        Err(Missing::Neutral(s)) => Span::styled(printable(s), Style::new().fg(NEUTRAL)),
+        Err(Missing::Fail(s)) => Span::styled(format!("! {}", printable(s)), Style::new().fg(FAIL)),
     }
+}
+
+/// Largura do rótulo de uso no canto do gráfico: 6 colunas com valor; a largura do gráfico
+/// com falha (a causa inteira).
+fn label_w<T>(m: &Metric<T>, graph: Rect) -> u16 {
+    if m.is_ok() { 6 } else { graph.width }
 }
 
 fn label(s: &str) -> Span<'static> {
@@ -238,7 +245,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         Paragraph::new(Line::from(vec![metric(&c.usage, |v| {
             format!("{}%", num(*v, 0))
         })])),
-        Rect::new(graph.x, graph.y, 6, 1).intersection(graph),
+        Rect::new(graph.x, graph.y, label_w(&c.usage, graph), 1).intersection(graph),
     );
 
     if let Some(per) = per {
@@ -374,7 +381,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     frame.render_widget(
         Paragraph::new(metric(&g.usage, |v| format!("{v}%"))),
-        Rect::new(graph.x, graph.y, 6, 1).intersection(graph),
+        Rect::new(graph.x, graph.y, label_w(&g.usage, graph), 1).intersection(graph),
     );
     bar_line(frame, bars, 0, "VRAM  ", &g.dedicated);
     bar_line(frame, bars, 1, "shared", &g.shared);
@@ -764,20 +771,23 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             return;
         }
     };
+    let pipe_failed = matches!(fps.pipe, Err(Missing::Fail(_)));
     let title = format!(
         "game  {} ({}){}",
         printable(&g.name),
         g.api,
-        if g.approx {
-            "  approx. (game opened before wintop)"
-        } else {
-            ""
+        match (g.approx, pipe_failed) {
+            (true, false) => "  approx. (game opened before wintop)",
+            (true, true) => "  approx. (frametime pipe failed)",
+            (false, _) => "",
         }
     );
     let block = boxed(&title, BORDER_GAME);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [graph, info] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
+    let info_h = 3 + u16::from(pipe_failed);
+    let [graph, info] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(info_h)]).areas(inner);
     let scaled = st.game_fps.scaled(usize::from(graph.width) * 2);
     frame.render_widget(
         Graph {
@@ -814,6 +824,14 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             metric(&g.bound, ToString::to_string),
         ]),
     ];
+    // Falha do pipe (outro servidor ocupando o nome): linha própria, só quando acontece.
+    let mut lines = lines;
+    if pipe_failed {
+        lines.push(Line::from(vec![
+            label("frametime pipe "),
+            metric(&fps.pipe, |_| String::new()),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), info);
 }
 

@@ -386,6 +386,16 @@ impl Inventory {
 
     /// Disco que estava em repouso e agora respondeu acordado: relê capacidade e layout com o
     /// handle já aberto (sem esperar o `RETRY_ASLEEP`).
+    /// O disco ainda é o mesmo e está presente. Com handle guardado: ele ainda responde (se
+    /// outro disco pegou o número depois de uma remoção, o número abre, mas o handle velho não).
+    /// Sem handle guardado (USB): o número ainda abre.
+    pub(super) fn alive(&self) -> bool {
+        match &self.handle {
+            Some(h) => h.property(PROP_DEVICE).is_ok(),
+            None => Handle::open(self.number, 0).is_some(),
+        }
+    }
+
     pub(super) fn reread_if_was_asleep(&mut self, meta: &Handle) {
         if self.asleep_since.is_some() {
             self.read_details(meta);
@@ -422,8 +432,9 @@ impl Inventory {
         let now = match h.ioctl(IOCTL_DISK_PERFORMANCE, None, PERF_SIZE) {
             Ok(b) => parse_perf(&b),
             Err(e) => {
-                if Handle::open(self.number, 0).is_none() {
+                if !self.alive() {
                     self.lost = true;
+                    self.handle = None;
                 }
                 return fail(e);
             }

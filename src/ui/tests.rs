@@ -335,3 +335,19 @@ fn temperatura_de_outro_disco_nao_aparece() {
     assert!(!out.contains("47 °C"), "{out}");
     assert!(out.contains("39 °C"), "{out}");
 }
+
+#[test]
+fn falha_do_pipe_com_jogo_aparece() {
+    let mut st = State::new(1000);
+    st.push_fast(fast(2));
+    let mut s = game();
+    s.pipe = fail("frametime pipe (another server running?): busy");
+    if let Ok(g) = &mut s.game {
+        g.approx = true;
+    }
+    st.push_fps(s);
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("approx. (frametime pipe failed)"), "{out}");
+    assert!(out.contains("! frametime pipe (another server"), "{out}");
+    assert!(!out.contains("game opened before wintop"), "{out}");
+}
