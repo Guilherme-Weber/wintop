@@ -21,7 +21,7 @@ use crate::win::{own, wide};
 pub struct SharedView {
     _handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
-    pub len: usize,
+    len: usize,
 }
 
 impl SharedView {

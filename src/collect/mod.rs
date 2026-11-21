@@ -8,7 +8,7 @@ mod gpu;
 mod memory;
 mod net;
 mod pawnio;
-mod rtss;
+pub mod rtss;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;

@@ -13,7 +13,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::collect::{FastCollectors, RtssCollector, SlowCollectors};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+use crate::collect::{FastCollectors, RtssCollector, SlowCollectors, rtss};
 use crate::model::{Fast, Fps, Slow};
 
 pub const DEFAULT_INTERVAL_MS: u64 = 1000;
@@ -78,6 +84,7 @@ impl Shared {
 pub struct Engine {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    stop_event: Arc<OwnedHandle>,
 }
 
 impl Engine {
@@ -111,37 +118,21 @@ impl Engine {
                 })
                 .expect("criar a thread de coleta rápida")
         };
+        // Evento manual de parada da thread do RTSS: acorda a espera do pipe na hora.
+        // SAFETY: evento sem nome; o handle passa a ter dono logo abaixo.
+        let stop_event = Arc::new(unsafe {
+            OwnedHandle::from_raw_handle(
+                CreateEventW(None, true, false, None)
+                    .expect("criar o evento de parada")
+                    .0,
+            )
+        });
         let rtss = {
             let sh = Arc::clone(&shared);
+            let stop = Arc::clone(&stop_event);
             std::thread::Builder::new()
                 .name("rtss".into())
-                .spawn(move || {
-                    let mut c = RtssCollector::new(true, true);
-                    loop {
-                        let snap =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.sample()));
-                        // Com jogo, 250 ms (fallback da Shared Memory); sem jogo, 1 s.
-                        let period = match &snap {
-                            Ok(f) if f.game.is_ok() => RTSS_GAME_PERIOD,
-                            _ => RTSS_IDLE_PERIOD,
-                        };
-                        let Ok(snap) = snap else { break };
-                        {
-                            let mut st = sh.lock();
-                            if st.stop {
-                                break;
-                            }
-                            st.fps = Some(snap);
-                            st.generation += 1;
-                        }
-                        sh.wake.notify_all();
-                        // O pipe é atendido durante a espera; a parada é vista a cada período.
-                        c.pump(Instant::now() + period);
-                        if sh.lock().stop {
-                            break;
-                        }
-                    }
-                })
+                .spawn(move || rtss_thread(&sh, HANDLE(stop.as_raw_handle())))
                 .expect("criar a thread do RTSS")
         };
         let slow = {
@@ -170,6 +161,7 @@ impl Engine {
         Self {
             shared,
             threads: vec![fast, slow, rtss],
+            stop_event,
         }
     }
 
@@ -212,8 +204,52 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.shared.lock().stop = true;
         self.shared.wake.notify_all();
+        // SAFETY: evento válido enquanto o motor existe.
+        unsafe {
+            let _ = SetEvent(HANDLE(self.stop_event.as_raw_handle()));
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+    }
+}
+
+/// Thread do RTSS: amostra a cada 250 ms com jogo (1 s sem) e atende o pipe no meio. Um pânico
+/// publica a falha (a interface não fica parada no último valor) e encerra a thread.
+fn rtss_thread(sh: &Shared, stop: HANDLE) {
+    let publish = |snap: Fps| {
+        {
+            let mut st = sh.lock();
+            st.fps = Some(snap);
+            st.generation += 1;
+        }
+        sh.wake.notify_all();
+    };
+    let Ok(mut c) = catch_unwind(|| RtssCollector::new(true, true)) else {
+        publish(rtss::failed("RTSS collector panicked on startup"));
+        return;
+    };
+    loop {
+        let Ok(snap) = catch_unwind(AssertUnwindSafe(|| c.sample())) else {
+            publish(rtss::failed("RTSS collector panicked"));
+            return;
+        };
+        let period = if snap.game.is_ok() {
+            RTSS_GAME_PERIOD
+        } else {
+            RTSS_IDLE_PERIOD
+        };
+        if sh.lock().stop {
+            return;
+        }
+        publish(snap);
+        match catch_unwind(AssertUnwindSafe(|| c.pump(Instant::now() + period, stop))) {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(_) => {
+                publish(rtss::failed("RTSS collector panicked"));
+                return;
+            }
         }
     }
 }
@@ -233,6 +269,20 @@ fn next_tick(prev: Instant, interval: Duration, now: Instant) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parada imediata: o `Drop` acorda as três threads (a do RTSS pelo evento de parada).
+    #[test]
+    #[ignore = "hardware: inicia todos os coletores (terminal elevado)"]
+    fn parada_rapida() {
+        let e = Engine::start(DEFAULT_INTERVAL_MS);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(e.fps().is_some(), "a thread do RTSS publicou");
+        let t = Instant::now();
+        drop(e);
+        let took = t.elapsed();
+        println!("parada em {took:?}");
+        assert!(took < Duration::from_millis(300), "{took:?}");
+    }
 
     #[test]
     fn intervalo_em_passos() {

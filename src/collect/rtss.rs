@@ -38,7 +38,8 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent, WaitForMultipleObjects,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -99,6 +100,8 @@ const LOWS_EVERY: Duration = Duration::from_secs(1);
 const GPU_BOUND: f64 = 0.9;
 /// Depois de iniciar o RTSS, quanto esperar a Shared Memory antes de chamar de falha.
 const RTSS_START_GRACE: Duration = Duration::from_secs(15);
+/// Sem Shared Memory depois de iniciar: nova tentativa a cada minuto.
+const RTSS_START_RETRY: Duration = Duration::from_secs(60);
 const RTSS_KEY: &str = r"SOFTWARE\Unwinder\RTSS";
 
 fn api_name(flags: u32) -> &'static str {
@@ -276,6 +279,13 @@ impl Ring {
         }
     }
 
+    /// Há frames nos últimos `within`.
+    fn recent(&self, now: Instant, within: Duration) -> bool {
+        self.frames
+            .back()
+            .is_some_and(|(t, _)| now.duration_since(*t) <= within)
+    }
+
     /// Frametimes do último segundo.
     fn last_second(&self, now: Instant) -> impl Iterator<Item = u32> + '_ {
         self.frames
@@ -295,8 +305,8 @@ fn feed(rings: &mut HashMap<u32, Ring>, carry: &mut Vec<u8>, data: &[u8], comple
     for rec in carry[..whole].as_chunks::<8>().0 {
         let app = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
         let us = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-        // Índice fora da Shared Memory: registro inválido.
-        if (app as usize) < MAX_APPS {
+        // Índice fora da Shared Memory ou frametime 0 (sem delta): registro ignorado.
+        if (app as usize) < MAX_APPS && us > 0 {
             rings.entry(app).or_default().push(now, us);
         }
     }
@@ -607,6 +617,16 @@ fn create_pipe() -> Result<Vec<Instance>, String> {
 
 // --- Coletor ---
 
+/// `Fps` com a mesma falha em tudo (pânico ou início impossível da thread).
+pub fn failed(cause: &str) -> Fps {
+    let m = Missing::Fail(cause.to_string());
+    Fps {
+        rtss: Err(m.clone()),
+        pipe: Err(m.clone()),
+        game: Err(m),
+    }
+}
+
 /// Lows em cache: (instante, PID, aproximado, valor).
 type LowsCache = Option<(Instant, u32, bool, Metric<(f64, f64)>)>;
 
@@ -646,39 +666,42 @@ impl RtssCollector {
         }
     }
 
-    /// Atende o pipe até `deadline` (conclusões de conexão e leitura).
-    pub fn pump(&mut self, deadline: Instant) {
+    /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
+    /// (evento manual) for sinalizado; devolve `true` nesse caso.
+    pub fn pump(&mut self, deadline: Instant, stop: HANDLE) -> bool {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                return false;
             }
+            let timeout = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
             let Ok(instances) = &mut self.pipe else {
-                std::thread::sleep(left);
-                return;
+                // SAFETY: evento válido (dono: o motor, que espera esta thread terminar).
+                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
             };
             let armed: Vec<usize> = (0..instances.len())
                 .map(|k| (k + self.turn) % instances.len())
                 .filter(|&k| instances[k].pending != Pending::None)
                 .collect();
             self.turn = self.turn.wrapping_add(1);
-            if armed.is_empty() {
-                std::thread::sleep(left);
-                return;
-            }
-            let events: Vec<HANDLE> = armed.iter().map(|&k| h(&instances[k].event)).collect();
-            let timeout = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-            // SAFETY: eventos válidos (no máximo 8).
+            // O evento de parada vem primeiro (índice 0); depois os das instâncias armadas.
+            let mut events = vec![stop];
+            events.extend(armed.iter().map(|&k| h(&instances[k].event)));
+            // SAFETY: eventos válidos (no máximo 9).
             let r = unsafe { WaitForMultipleObjects(&events, false, timeout) };
             let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-            match armed.get(idx) {
+            if idx == 0 {
+                return true;
+            }
+            match armed.get(idx - 1) {
                 Some(&k) => instances[k].on_signal(&mut self.exact),
-                None => return, // timeout ou erro
+                None => return false, // timeout ou erro
             }
         }
     }
 
-    fn open_view(&mut self) -> Option<String> {
+    /// `None` com a Shared Memory aberta; senão o estado do RTSS (iniciando ou falha).
+    fn open_view(&mut self) -> Option<Missing> {
         if self.view.is_none() {
             self.view = SharedView::open(SHM_NAME);
         }
@@ -688,20 +711,36 @@ impl RtssCollector {
             return None;
         }
         if !self.start_rtss {
-            return Some("RTSS not running".into());
+            return Some(Missing::Fail("RTSS not running".into()));
         }
-        match self.started_at {
-            Some(t) if t.elapsed() < RTSS_START_GRACE => return Some("starting RTSS".into()),
-            Some(_) => {}
-            None => {
-                self.started_at = Some(Instant::now());
-                self.start_error = start_rtss().err();
-            }
+        // Nova tentativa de iniciar depois de `RTSS_START_RETRY`.
+        if self
+            .started_at
+            .is_none_or(|t| t.elapsed() >= RTSS_START_RETRY)
+        {
+            self.started_at = Some(Instant::now());
+            self.start_error = start_rtss().err();
         }
-        Some(self.start_error.clone().map_or_else(
-            || "RTSS not running".into(),
-            |e| format!("RTSS not running: {e}"),
-        ))
+        if let Some(e) = &self.start_error {
+            return Some(Missing::Fail(format!("RTSS not running: {e}")));
+        }
+        Some(
+            if self
+                .started_at
+                .is_some_and(|t| t.elapsed() < RTSS_START_GRACE)
+            {
+                Missing::Neutral("starting RTSS".into())
+            } else {
+                Missing::Fail("RTSS not running (started, but no shared memory yet)".into())
+            },
+        )
+    }
+
+    /// Sem Shared Memory válida os índices do pipe não têm dono: descarta tudo.
+    fn forget_frames(&mut self) {
+        self.exact.clear();
+        self.approx.clear();
+        self.lows = None;
     }
 
     /// Uma amostra: estado do RTSS e do jogo.
@@ -711,12 +750,8 @@ impl RtssCollector {
             Err(Some(e)) => fail(e.clone()),
             Err(None) => neutral("not started in --check"),
         };
-        if let Some(why) = self.open_view() {
-            let missing = if why == "starting RTSS" {
-                Missing::Neutral(why)
-            } else {
-                Missing::Fail(why)
-            };
+        if let Some(missing) = self.open_view() {
+            self.forget_frames();
             return Fps {
                 rtss: Err(missing.clone()),
                 pipe,
@@ -729,6 +764,7 @@ impl RtssCollector {
             Some(Err(e)) => {
                 // 0xDEAD ou lixo: desmapeia e reconecta na próxima amostra.
                 self.view = None;
+                self.forget_frames();
                 return Fps {
                     rtss: fail(e.clone()),
                     pipe,
@@ -739,13 +775,14 @@ impl RtssCollector {
         };
         let rtss = Ok(format!("shared memory {}.{}", ver >> 16, ver & 0xFFFF));
         let now = Instant::now();
-        // Índice reaproveitado por outro app: os frames antigos não valem.
+        // Índice reaproveitado por outro app: os frames antigos não valem. Ring sem dono
+        // (frames que chegaram antes desta amostra) fica com o app atual do índice.
         for a in &apps {
             let ring = self.exact.entry(a.index).or_default();
-            if ring.pid != Some(a.pid) {
+            if ring.pid.is_some_and(|p| p != a.pid) {
                 ring.frames.clear();
-                ring.pid = Some(a.pid);
             }
+            ring.pid = Some(a.pid);
         }
         self.exact.retain(|i, _| apps.iter().any(|a| a.index == *i));
         self.approx
@@ -761,10 +798,12 @@ impl RtssCollector {
     }
 
     fn game(&mut self, g: &App, now: Instant) -> Game {
+        // Exato enquanto o pipe trouxe frames na janela de atividade (um travamento de 1-2 s
+        // não vira "approx." nem perde os lows exatos).
         let exact_recent = self
             .exact
             .get(&g.index)
-            .is_some_and(|r| r.last_second(now).next().is_some());
+            .is_some_and(|r| r.recent(now, Duration::from_millis(u64::from(ACTIVE_MS))));
         let approx = !exact_recent;
         if approx && g.frametime_us > 0 {
             self.approx
@@ -785,6 +824,9 @@ impl RtssCollector {
             let cur = f64::from(g.frametime_us) / 1000.0;
             let (lo, hi) = min_max_ms(&second).unwrap_or((cur, cur));
             (positive(g.fps), positive(cur).map(|c| (c, lo, hi)))
+        } else if second.is_empty() {
+            let m = Missing::Neutral("no frames in the last second".into());
+            (Err(m.clone()), Err(m))
         } else {
             let sum: u64 = second.iter().map(|&u| u64::from(u)).sum();
             let n = second.len() as f64;
@@ -872,7 +914,14 @@ fn start_rtss() -> Result<(), String> {
     if !path.is_absolute() || !path.is_file() {
         return Err(format!("invalid RTSS InstallPath {}", path.display()));
     }
+    let dir = path.parent().ok_or("RTSS InstallPath has no folder")?;
+    // Diretório de trabalho = pasta do RTSS (não o do wintop, que pode ser gravável pelo
+    // usuário) e sem herdar a entrada e a saída do wintop.
     std::process::Command::new(&path)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map(drop)
         .map_err(|e| format!("could not start {}: {e}", path.display()))
@@ -946,6 +995,16 @@ mod tests {
     }
 
     #[test]
+    fn frametime_zero_ignorado() {
+        let mut rings = HashMap::new();
+        let mut carry = Vec::new();
+        let mut rec = 3u32.to_le_bytes().to_vec();
+        rec.extend(0u32.to_le_bytes());
+        feed(&mut rings, &mut carry, &rec, true);
+        assert!(!rings.contains_key(&3));
+    }
+
+    #[test]
     fn janela_e_ultimo_segundo() {
         let mut r = Ring::default();
         let t0 = Instant::now();
@@ -956,5 +1015,7 @@ mod tests {
         r.prune(now);
         assert_eq!(r.frames.len(), 2); // o de t0 saiu da janela de 60 s
         assert_eq!(r.last_second(now).collect::<Vec<_>>(), vec![30_000]);
+        assert!(r.recent(now, Duration::from_secs(2)));
+        assert!(!r.recent(now + Duration::from_secs(3), Duration::from_secs(2)));
     }
 }
