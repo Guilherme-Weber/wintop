@@ -21,7 +21,9 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
-use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows::Win32::System::Threading::{
     CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
     SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
@@ -330,7 +332,8 @@ fn install_dir() -> Result<PathBuf, String> {
             HKEY_LOCAL_MACHINE,
             w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO"),
             w!("InstallLocation"),
-            RRF_RT_REG_SZ,
+            // NOEXPAND: um REG_EXPAND_SZ é recusado (ERROR_UNSUPPORTED_TYPE), não expandido.
+            RRF_RT_REG_SZ | RRF_NOEXPAND,
             None,
             Some(buf.as_mut_ptr().cast::<c_void>()),
             Some(&raw mut len),

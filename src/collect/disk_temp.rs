@@ -149,8 +149,6 @@ impl DiskTempCollector {
                 }
                 continue;
             }
-            // Membro que estava em repouso na descoberta: relê o layout quando acordar.
-            d.retry_if_asleep();
             read_one(d, st);
         }
         let pools = self
@@ -210,24 +208,31 @@ fn pool_temp(pools: usize, members: &[&Metric<i16>], unknown_asleep: bool) -> Me
 }
 
 fn read_one(d: &mut Inventory, st: &mut State) {
-    // Sem handle guardado (USB): abre só para esta leitura.
-    let temp;
-    let meta = if let Some(h) = &d.handle {
-        h
+    // O handle guardado sai do inventário durante a leitura (para `d` poder ser alterado) e
+    // volta no fim; sem handle guardado (USB), abre só para esta leitura.
+    let held = d.handle.take();
+    let temp = if held.is_none() {
+        Handle::open(d.number, 0)
     } else {
-        temp = Handle::open(d.number, 0);
-        let Some(h) = &temp else {
-            d.lost = true;
-            st.value = fail("disk not found");
-            return;
-        };
-        h
+        None
     };
+    if let Some(meta) = held.as_ref().or(temp.as_ref()) {
+        read_with(d, st, meta);
+    } else {
+        d.lost = true;
+        st.value = fail("disk not found");
+    }
+    d.handle = held;
+}
+
+fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
     // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura.
     if d.ssd == Ok(false) && meta.awake() == Some(false) {
         st.value = neutral("asleep");
         return;
     }
+    // Acordou depois de ter sido visto em repouso: relê o layout (membro do pool) agora.
+    d.reread_if_was_asleep(meta);
     if st.method != Method::Smart {
         let native = meta.property(PROP_TEMPERATURE);
         match native.as_deref().ok().and_then(native_temp) {

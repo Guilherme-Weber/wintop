@@ -384,7 +384,15 @@ impl Inventory {
             .or_else(fail);
     }
 
-    pub(super) fn retry_if_asleep(&mut self) {
+    /// Disco que estava em repouso e agora respondeu acordado: relê capacidade e layout com o
+    /// handle já aberto (sem esperar o `RETRY_ASLEEP`).
+    pub(super) fn reread_if_was_asleep(&mut self, meta: &Handle) {
+        if self.asleep_since.is_some() {
+            self.read_details(meta);
+        }
+    }
+
+    fn retry_if_asleep(&mut self) {
         if self
             .asleep_since
             .is_some_and(|t| t.elapsed() >= RETRY_ASLEEP)
