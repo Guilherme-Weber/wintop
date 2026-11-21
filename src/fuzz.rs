@@ -309,7 +309,11 @@ pub fn run_text(name: &str, seeds: &[&str], max_len: usize, mut f: impl FnMut(&s
     let s = seed();
     let mut r = Rng::new(s ^ fnv(name));
     for it in 0..iters() {
-        let mut t = seeds[r.below(seeds.len())].to_string();
+        let mut t = if seeds.is_empty() {
+            String::new()
+        } else {
+            seeds[r.below(seeds.len())].to_string()
+        };
         for _ in 0..mutations(&mut r) {
             mutate_text(&mut r, &mut t);
         }
@@ -360,6 +364,12 @@ mod tests {
             mutate(&mut r, &mut v);
             v.truncate(4096);
         }
+    }
+
+    #[test]
+    fn sem_sementes_nao_quebra() {
+        run("vazio", &[], 16, |_, b| assert!(b.len() <= 16));
+        run_text("vazio_texto", &[], 16, |t| assert!(t.len() <= 16));
     }
 
     #[test]

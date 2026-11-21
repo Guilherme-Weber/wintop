@@ -135,6 +135,15 @@ fn age_ms(now: u32, t1: u32) -> Option<u32> {
 
 /// Aplicativos da Shared Memory, PID em primeiro plano e versão.
 fn read_apps(v: &SharedView) -> Result<(Vec<App>, Option<u32>, u32), String> {
+    // SAFETY: sem pré-condições; lido a cada entrada, depois de `t1` (ver `age_ms`).
+    read_apps_at(v, || unsafe { GetTickCount() })
+}
+
+/// Como `read_apps`, com o relógio dado (o fuzz usa um instante fixo: sementes reproduzíveis).
+fn read_apps_at(
+    v: &SharedView,
+    tick: impl Fn() -> u32,
+) -> Result<(Vec<App>, Option<u32>, u32), String> {
     let oob = || "RTSS shared memory read out of bounds".to_string();
     let sig = v.u32_at(0).ok_or_else(oob)?;
     if sig == RTSS_DEAD {
@@ -176,8 +185,7 @@ fn read_apps(v: &SharedView) -> Result<(Vec<App>, Option<u32>, u32), String> {
         let t0 = v.u32_at(e + E_TIME0).ok_or_else(oob)?;
         let t1 = v.u32_at(e + E_TIME1).ok_or_else(oob)?;
         let frames = v.u32_at(e + E_FRAMES).ok_or_else(oob)?;
-        // SAFETY: sem pré-condições; lido depois de `t1` (ver `age_ms`).
-        let now = unsafe { GetTickCount() };
+        let now = tick();
         let span = t1.wrapping_sub(t0);
         let fps = if t0 != 0 && span > 0 && span < 60_000 {
             1000.0 * f64::from(frames) / f64::from(span)
@@ -1187,12 +1195,12 @@ mod tests {
     fn fuzz_shared_memory() {
         // Período de FPS preenchido (agora - 500 ms .. agora, 72 frames): o cálculo do FPS e da
         // idade é exercitado, não só o caso "sem período".
+        // Relógio fixo (o mesmo na leitura): a semente reproduz a falha em qualquer máquina.
+        const NOW: u32 = 10_000;
         let timed = |mut b: Vec<u8>, esize: usize, n: usize| {
-            // SAFETY: sem pré-condições.
-            let now = unsafe { GetTickCount() };
             for i in 0..n {
                 let e = 0x100 + i * esize;
-                for (o, v) in [(E_TIME0, now - 500), (E_TIME1, now), (E_FRAMES, 72)] {
+                for (o, v) in [(E_TIME0, NOW - 500), (E_TIME1, NOW), (E_FRAMES, 72)] {
                     b[e + o..e + o + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
@@ -1232,7 +1240,7 @@ mod tests {
             if b.len() >= 4 && r.chance(2) {
                 b[..4].copy_from_slice(&RTSS_SIGNATURE.to_le_bytes());
             }
-            let Ok((apps, fg, ver)) = read_apps(&SharedView::from_bytes(&b)) else {
+            let Ok((apps, fg, ver)) = read_apps_at(&SharedView::from_bytes(&b), || NOW) else {
                 return;
             };
             assert_eq!(ver >> 16, 2);

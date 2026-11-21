@@ -300,8 +300,7 @@ impl VramCollector {
 mod tests {
     use super::*;
 
-    /// Instâncias e valores quaisquer do PDH: o detalhamento não estoura e fecha a conta
-    /// (segmentos <= total quando o uso cabe no total).
+    /// Instâncias e valores quaisquer do PDH: o detalhamento não estoura e fecha a conta.
     #[test]
     fn fuzz_instancias_e_detalhamento() {
         crate::fuzz::run_text(
@@ -334,8 +333,10 @@ mod tests {
                 .segments
                 .iter()
                 .fold(0u64, |a, (_, v)| a.saturating_add(*v));
-            if d.used <= total && seg < u64::MAX {
-                assert!(seg >= d.used.min(total));
+            // Sem saturação nas somas, a conta fecha: processos + kernel + livre = maior entre
+            // o uso e o total.
+            if seg < u64::MAX {
+                assert_eq!(seg, d.used.max(total));
             }
         });
     }
