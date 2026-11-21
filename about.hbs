@@ -1,0 +1,25 @@
+wintop: avisos de licença de terceiros / third-party license notices
+====================================================================
+
+O wintop.exe inclui as bibliotecas abaixo (ligadas estaticamente). O módulo
+modules/AMDFamily17.bin tem licença própria (LGPL-2.1, ver modules/README.md).
+
+wintop.exe statically links the libraries below. The module modules/AMDFamily17.bin is
+licensed separately (LGPL-2.1, see modules/README.md).
+
+{{#each overview}}
+- {{{name}}}: {{count}}
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}}
+
+Usado por / used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

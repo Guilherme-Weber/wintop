@@ -38,9 +38,12 @@ Primeira versão.
 
 ### Segurança
 
-- Processo elevado endurecido: DLLs só de System32 (inclusive as importações estáticas),
-  caminhos do registro só locais e sem expansão, Shared Memory só leitura e com limites, pipe do
+- Processo elevado endurecido: DLLs só de System32 (inclusive as importações estáticas), exceto
+  a `PawnIOLib.dll`, carregada por caminho absoluto da instalação do PawnIO (HKLM); caminhos do
+  registro só locais e sem expansão, Shared Memory só leitura e com limites, pipe do
   RTSS com DACL própria e tetos de memória, arquivos do usuário sem seguir links nem
   redirecionamentos, instalação recusada se um usuário sem elevação puder alterar a pasta.
-- Nunca lê a memória do jogo em foco (anticheat): acesso negado aparece como "protected".
+- Anticheat: nenhum processo é aberto para leitura automaticamente; os runtimes de GPU só são
+  lidos sob demanda (`Enter`), nunca em processos com o hook do RTSS ou recém-iniciados, e
+  acesso negado aparece como "protected".
 - Parsers de dados externos cobertos por fuzz (milhões de entradas, com checagem de overflow).

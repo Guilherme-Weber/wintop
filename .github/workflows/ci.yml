@@ -4,21 +4,28 @@ name: ci
 # runners do GitHub não têm GPU NVIDIA, RTSS nem PawnIO: os programas de prova (examples/) só
 # são compilados aqui; os testes unitários deles rodam.
 on:
+  # Só branches: numa tag, o release.yml roda estas checagens (sem execução duplicada).
   push:
+    branches: ['**']
   pull_request:
+  # Reaproveitado pelo release.yml (as mesmas checagens antes de empacotar).
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   check:
-    runs-on: windows-latest
+    # Imagem fixa (MSVC e SDK não mudam sem aviso); actions fixadas pelo SHA do commit.
+    runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Sem argumento, o rustup instala a toolchain de rust-toolchain.toml (com clippy e rustfmt).
       - name: Toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatação
         run: cargo fmt --check
       - name: Clippy
@@ -29,7 +36,7 @@ jobs:
       - name: Build de release
         run: cargo build --release --locked
       # Segurança: vulnerabilidades conhecidas nas dependências travadas (RustSec).
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-audit
       - name: Auditoria de dependências

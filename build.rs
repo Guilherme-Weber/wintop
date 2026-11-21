@@ -28,6 +28,10 @@ fn main() {
     // setupapi, ...) só em System32, nunca na pasta do exe (DLL planting antes do `main`, onde o
     // SetDefaultDllDirectories ainda não rodou). 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32.
     println!("cargo:rustc-link-arg-bin=wintop=/DEPENDENTLOADFLAG:0x800");
+    // Executável reproduzível: sem data de compilação nem GUID aleatório (/Brepro), e só o nome
+    // do .pdb, não o caminho da máquina que compilou (pasta do usuário ou do runner).
+    println!("cargo:rustc-link-arg-bin=wintop=/Brepro");
+    println!("cargo:rustc-link-arg-bin=wintop=/PDBALTPATH:%_PDB%");
 
     let mut res = winresource::WindowsResource::new();
     res.set_manifest_file("wintop.exe.manifest");

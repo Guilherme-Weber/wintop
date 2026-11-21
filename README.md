@@ -28,9 +28,19 @@ O wintop fica em `C:\Program Files\wintop`, com um atalho no Menu Iniciar que o 
 janela do UAC (ver [Atalho sem UAC](#atalho-sem-uac)). Também é possível rodar o `wintop.exe`
 direto da pasta extraída, sem instalar; a pasta `modules` precisa ficar ao lado do executável.
 
-Para conferir o download: o hash SHA-256 do zip está no arquivo `.sha256` da release, e a
-procedência (compilado pelo GitHub Actions a partir deste repositório) pode ser verificada com
-`gh attestation verify wintop-<versão>-windows-x64.zip -R Guilherme-Weber/wintop`.
+O executável não tem assinatura Authenticode: o Windows pode mostrar o aviso do SmartScreen
+("Mais informações" > "Executar assim mesmo") e o UAC mostra editor desconhecido. Por isso,
+confira o download antes de executá-lo:
+
+```powershell
+# hash: igual ao do arquivo .sha256 da release
+(Get-FileHash wintop-<versão>-windows-x64.zip -Algorithm SHA256).Hash
+# procedência: compilado pelo GitHub Actions a partir deste repositório (GitHub CLI)
+gh attestation verify wintop-<versão>-windows-x64.zip -R Guilherme-Weber/wintop
+```
+
+O zip é reproduzível a partir do código: `.\scripts\package.ps1` no commit da versão gera o
+mesmo pacote (exceto pelas diferenças de versão do compilador MSVC entre máquinas).
 
 ## Uso
 
