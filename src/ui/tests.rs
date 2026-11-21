@@ -402,3 +402,56 @@ fn troca_de_pid_do_jogo_nao_zera_o_historico() {
     let tela = render(&mut st, 160, 48);
     assert!(!tela.contains("min 100"), "{tela}");
 }
+
+#[test]
+fn linhas_de_detalhe_nao_cortam_nada() {
+    // As linhas quebram em vez de cortar (o "free" da VRAM era o que sumia).
+    for (w, h) in [(160, 48), (210, 52), (240, 64)] {
+        let out = render(&mut filled(), w, h);
+        for want in [
+            "free 5.0G",
+            "kernel 4.0M",
+            "VBIOS 98.03.58.00.96",
+            "(NVML)",
+            "video 2220/3090 MHz",
+            "182004 handles",
+            "frame 6.80 ms",
+            "1000 ms tick",
+        ] {
+            assert!(out.contains(want), "{w}x{h} sem {want:?}:\n{out}");
+        }
+    }
+}
+
+#[test]
+fn falha_de_temperatura_mostra_a_causa_inteira() {
+    let mut st = filled();
+    let cause = "SMART: IOCTL 0x2D1100: error 0x1F";
+    if let Some(s) = &mut st.slow
+        && let Ok(list) = &mut s.disk_temps
+    {
+        for t in list.iter_mut().filter(|t| t.number == 0) {
+            t.celsius = Err(Missing::Fail(cause.into()));
+        }
+    }
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("! failed"), "{out}");
+    assert!(out.contains(&format!("! E: temp: {cause}")), "{out}");
+}
+
+#[test]
+fn sem_jogo_fica_idle_com_os_graficos() {
+    let mut st = filled();
+    st.push_fps(Fps {
+        rtss: Ok("shared memory 2.21".into()),
+        pipe: Ok((8, 1)),
+        game: Err(Missing::Neutral("no 3D game in focus".into())),
+    });
+    st.push_fast(fast(200));
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("game · idle"), "{out}");
+    assert!(out.contains("FPS idle"), "{out}");
+    // O histórico continua: mínimo/máximo e o gráfico do último jogo.
+    assert!(out.contains("min 144 · max 144"), "{out}");
+    assert!(out.contains("no 3D game in focus"), "{out}");
+}

@@ -29,6 +29,11 @@ const PREDICT_SIZE: usize = 516;
 const NATIVE_EVERY: Duration = Duration::from_secs(10);
 const SMART_EVERY: Duration = Duration::from_secs(60);
 const REDISCOVER: Duration = Duration::from_secs(60);
+/// Falha do SMART com leitura boa antes: mantém o último valor e tenta de novo mais cedo; só
+/// depois de `SMART_TOLERATED` falhas seguidas a métrica vira falha (SSD SATA em economia de
+/// energia recusa a consulta de vez em quando).
+const SMART_RETRY: Duration = Duration::from_secs(10);
+const SMART_TOLERATED: u8 = 3;
 
 /// Primeira temperatura reportada (índice 0 = composta no NVMe), ignorando "não reportado".
 fn native_temp(b: &[u8]) -> Option<i16> {
@@ -68,6 +73,8 @@ struct State {
     last: Option<Instant>,
     value: Metric<i16>,
     source: &'static str,
+    /// Falhas seguidas do SMART desde a última leitura boa.
+    smart_fails: u8,
 }
 
 impl State {
@@ -77,11 +84,13 @@ impl State {
             last: None,
             value: fail("not read yet"),
             source: "",
+            smart_fails: 0,
         }
     }
 
     fn due(&self, now: Instant) -> bool {
         let every = match self.method {
+            Method::Smart if self.smart_fails > 0 => SMART_RETRY,
             Method::Smart | Method::None => SMART_EVERY,
             Method::Unknown | Method::Native => NATIVE_EVERY,
         };
@@ -281,6 +290,7 @@ fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
     match smart {
         Ok((id, c)) => {
             st.method = Method::Smart;
+            st.smart_fails = 0;
             st.value = Ok(i16::from(c));
             st.source = if id == 194 { "SMART 194" } else { "SMART 190" };
         }
@@ -292,7 +302,14 @@ fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
             if st.method == Method::Unknown {
                 st.method = Method::None;
             }
-            st.value = fail(e);
+            // Falha passageira depois de leituras boas: segura o último valor por enquanto.
+            if st.method == Method::Smart && st.value.is_ok() && !d.lost {
+                st.smart_fails = st.smart_fails.saturating_add(1);
+                if st.smart_fails < SMART_TOLERATED {
+                    return;
+                }
+            }
+            st.value = fail(format!("SMART: {e}"));
         }
     }
 }
@@ -312,6 +329,18 @@ mod tests {
         b[T_INFO_COUNT..T_INFO_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(native_temp(&b), None);
         assert_eq!(native_temp(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn smart_falha_passageira_reduz_o_intervalo() {
+        let mut st = State::new();
+        st.method = Method::Smart;
+        st.value = Ok(40);
+        let t0 = Instant::now();
+        st.last = Some(t0);
+        assert!(!st.due(t0 + SMART_RETRY));
+        st.smart_fails = 1;
+        assert!(st.due(t0 + SMART_RETRY));
     }
 
     #[test]

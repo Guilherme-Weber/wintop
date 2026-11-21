@@ -425,7 +425,8 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
         Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(bottom);
     let [mem, net] = Layout::vertical([Constraint::Length(8), Constraint::Min(4)]).areas(left);
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
-    let disk_rows = disk_order(st).len() as u16;
+    // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
+    let disk_rows = (disk_order(st).len() + temp_failures(st).len()) as u16;
     let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
@@ -607,47 +608,6 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let block = boxed(&name, &format!("total 60s · {per_len} logical"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [graphs, info] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
-    // Total à esquerda (~45%), grade por lógico no resto.
-    let total_w = (graphs.width * 9 / 20)
-        .max(16)
-        .min(graphs.width.saturating_sub(16));
-    let [total, grid] =
-        Layout::horizontal([Constraint::Length(total_w), Constraint::Min(8)]).areas(graphs);
-
-    // Gráfico total, com o valor e os extremos na 1ª linha.
-    let head = vec![
-        metric(&c.usage, |v| format!("{}%", num(*v, 0))).add_modifier(Modifier::BOLD),
-        Span::raw(" "),
-        label("kern "),
-        metric(&c.kernel, |v| format!("{}%", num(*v, 0))),
-    ];
-    line(frame, head, total.x, total.y, total.width, total);
-    let mm = minmax(st.session.cpu, |v| num(v, 0));
-    line(frame, vec![mm], total.x, total.y + 1, total.width, total);
-    let g = Rect::new(
-        total.x,
-        total.y + 2,
-        total.width.saturating_sub(1),
-        total.height.saturating_sub(2),
-    );
-    frame.render_widget(
-        Graph::new(st.cpu.values(), GraphColor::Height).with_under(st.cpu_kernel.values()),
-        g.intersection(total),
-    );
-
-    match &c.per_logical {
-        Ok(per) => draw_core_grid(frame, grid, &mut st.cores, &mut st.cores_kernel, per),
-        Err(e) => line(
-            frame,
-            vec![label("per core "), missing(e)],
-            grid.x,
-            grid.y,
-            grid.width,
-            grid,
-        ),
-    }
-
     // Linhas de sensores e topologia.
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
     let mut l1 = vec![
@@ -712,12 +672,55 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             )
         }),
     ]);
-    put(
-        frame,
-        Paragraph::new(vec![Line::from(l1), Line::from(l2)]),
-        info,
-        info,
+    let info_lines: Vec<Line<'static>> = [l1, l2]
+        .into_iter()
+        .flat_map(|l| wrap(l, inner.width, 0, 2))
+        .collect();
+    let [graphs, info] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(info_lines.len() as u16),
+    ])
+    .areas(inner);
+    put(frame, Paragraph::new(info_lines), info, info);
+    // Total à esquerda (~45%), grade por lógico no resto.
+    let total_w = (graphs.width * 9 / 20)
+        .max(16)
+        .min(graphs.width.saturating_sub(16));
+    let [total, grid] =
+        Layout::horizontal([Constraint::Length(total_w), Constraint::Min(8)]).areas(graphs);
+
+    // Gráfico total, com o valor e os extremos na 1ª linha.
+    let head = vec![
+        metric(&c.usage, |v| format!("{}%", num(*v, 0))).add_modifier(Modifier::BOLD),
+        Span::raw(" "),
+        label("kern "),
+        metric(&c.kernel, |v| format!("{}%", num(*v, 0))),
+    ];
+    line(frame, head, total.x, total.y, total.width, total);
+    let mm = minmax(st.session.cpu, |v| num(v, 0));
+    line(frame, vec![mm], total.x, total.y + 1, total.width, total);
+    let g = Rect::new(
+        total.x,
+        total.y + 2,
+        total.width.saturating_sub(1),
+        total.height.saturating_sub(2),
     );
+    frame.render_widget(
+        Graph::new(st.cpu.values(), GraphColor::Height).with_under(st.cpu_kernel.values()),
+        g.intersection(total),
+    );
+
+    match &c.per_logical {
+        Ok(per) => draw_core_grid(frame, grid, &mut st.cores, &mut st.cores_kernel, per),
+        Err(e) => line(
+            frame,
+            vec![label("per core "), missing(e)],
+            grid.x,
+            grid.y,
+            grid.width,
+            grid,
+        ),
+    }
 }
 
 /// Grade de gráficos por lógico (4×4 com 16 threads), sempre com todos: se a célula ficar
@@ -831,7 +834,10 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let block = boxed(&name, &format!("active: {engine}"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [top, bottom] = Layout::vertical([Constraint::Min(4), Constraint::Length(8)]).areas(inner);
+    let details = gpu_details(st, &g, inner.width);
+    let bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
+    let [top, bottom] =
+        Layout::vertical([Constraint::Min(4), Constraint::Length(bottom_h)]).areas(inner);
     let [graph, panel] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(30)]).areas(top);
 
@@ -936,6 +942,45 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .and_then(|s| s.gpus.as_ref().ok())
         .and_then(|l| l.iter().find(|x| x.index == g.index))
         .cloned();
+    let b = bottom;
+    match slow.as_ref().map(|s| &s.vram) {
+        Some(Ok(v)) => vram_bar(frame, b, v, details.game_pid, &g.dedicated),
+        _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated),
+    }
+    let n = details.legend.len() as u16;
+    for (i, l) in details.legend.into_iter().enumerate() {
+        put(
+            frame,
+            Paragraph::new(l),
+            Rect::new(b.x, b.y + 1 + i as u16, b.width, 1),
+            b,
+        );
+    }
+    bar_line(frame, b, 1 + n, "shared", &g.shared);
+    for (i, l) in details.info.into_iter().enumerate() {
+        put(
+            frame,
+            Paragraph::new(l),
+            Rect::new(b.x, b.y + 2 + n + i as u16, b.width, 1),
+            b,
+        );
+    }
+}
+
+/// Linhas de baixo da caixa da GPU, já quebradas na largura (nada é cortado).
+struct GpuDetails {
+    game_pid: Option<u32>,
+    legend: Vec<Line<'static>>,
+    info: Vec<Line<'static>>,
+}
+
+fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
+    let slow = st
+        .slow
+        .as_ref()
+        .and_then(|s| s.gpus.as_ref().ok())
+        .and_then(|l| l.iter().find(|x| x.index == g.index))
+        .cloned();
     let slow_err = match st.slow.as_ref().map(|s| &s.gpus) {
         Some(Err(e)) => Some(e.clone()),
         _ => None,
@@ -945,31 +990,36 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .as_ref()
         .and_then(|f| f.game.as_ref().ok())
         .map(|g| g.pid);
-    let b = bottom;
-    match slow.as_ref().map(|s| &s.vram) {
-        Some(Ok(v)) => vram_bar(
-            frame,
-            Rect::new(b.x, b.y, b.width, 2).intersection(b),
-            v,
-            game_pid,
-            &g.dedicated,
-        ),
-        _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated),
-    }
-    bar_line(frame, b, 2, "shared", &g.shared);
+    let legend = match slow.as_ref().map(|s| &s.vram) {
+        Some(Ok(v)) => {
+            let spans: Vec<Span<'static>> = vram_parts(v, game_pid)
+                .into_iter()
+                .filter(|(_, v)| *v > 0)
+                .flat_map(|(k, v)| {
+                    [
+                        Span::styled("  ■ ", Style::new().fg(vram_color(k))),
+                        label(&format!("{} ", k.label())),
+                        text(short_bytes(v)),
+                    ]
+                })
+                .collect();
+            wrap(spans, width, VRAM_LABEL_W, VRAM_LABEL_W)
+        }
+        _ => Vec::new(),
+    };
     let clk = |m: &Metric<(u32, u32)>| metric(m, |(c, mx)| format!("{c}/{mx}"));
     let rows: Vec<Vec<Span<'static>>> = vec![
         vec![
             label("phys  "),
-            metric(&g.physical, |[u, f, r, t]| {
-                format!(
-                    "{} used · {} free · {} reserved · {} total (NVML)",
-                    bytes(*u),
-                    bytes(*f),
-                    bytes(*r),
-                    bytes(*t)
-                )
+            metric(&g.physical, |[u, ..]| format!("{} used", bytes(*u))),
+            sep(),
+            metric(&g.physical, |[_, f, ..]| format!("{} free", bytes(*f))),
+            sep(),
+            metric(&g.physical, |[_, _, r, _]| {
+                format!("{} reserved", bytes(*r))
             }),
+            sep(),
+            metric(&g.physical, |[.., t]| format!("{} total (NVML)", bytes(*t))),
         ],
         vec![
             label("clk   gfx "),
@@ -1045,10 +1095,77 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             v
         },
     ];
-    for (i, spans) in rows.into_iter().enumerate() {
-        line(frame, spans, b.x, b.y + 3 + i as u16, b.width, b);
+    let info = rows
+        .into_iter()
+        .flat_map(|r| wrap(r, width, 0, 6))
+        .collect();
+    GpuDetails {
+        game_pid,
+        legend,
+        info,
     }
 }
+
+/// Quebra uma linha em várias de até `width` colunas, em vez de cortar. Os pontos de quebra são
+/// os spans que começam com espaço (separadores e rótulos como "  SM "); o espaço da quebra
+/// some e a continuação começa com `indent` espaços. `first` é o recuo da primeira linha.
+fn wrap(spans: Vec<Span<'static>>, width: u16, first: u16, indent: u16) -> Vec<Line<'static>> {
+    let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+    for sp in spans {
+        if groups.is_empty() || sp.content.starts_with(char::is_whitespace) {
+            groups.push(Vec::new());
+        }
+        if let Some(g) = groups.last_mut() {
+            g.push(sp);
+        }
+    }
+    // Sem o espaço (e o "│") do começo do grupo, para abrir uma linha.
+    let trimmed = |g: &[Span<'static>]| -> Vec<Span<'static>> {
+        let mut out = Vec::with_capacity(g.len());
+        let mut lead = true;
+        for sp in g {
+            if lead {
+                let t = sp.content.trim_start().trim_start_matches('│').trim_start();
+                if t.is_empty() {
+                    continue;
+                }
+                lead = false;
+                out.push(Span::styled(t.to_string(), sp.style));
+            } else {
+                out.push(sp.clone());
+            }
+        }
+        out
+    };
+    let width = usize::from(width);
+    let pad = |n: u16| Span::raw(" ".repeat(usize::from(n)));
+    let mut lines = Vec::new();
+    let mut cur = vec![pad(first)];
+    let mut used = usize::from(first);
+    let mut empty = true;
+    for g in groups {
+        let g = if empty { trimmed(&g) } else { g };
+        let w: usize = g.iter().map(Span::width).sum();
+        if !empty && used + w > width {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            let g = trimmed(&g);
+            used = usize::from(indent) + g.iter().map(Span::width).sum::<usize>();
+            cur.push(pad(indent));
+            cur.extend(g);
+            continue;
+        }
+        used += w;
+        empty = false;
+        cur.extend(g);
+    }
+    if !empty {
+        lines.push(Line::from(cur));
+    }
+    lines
+}
+
+/// Largura do rótulo da barra da VRAM (a legenda alinha embaixo da barra).
+const VRAM_LABEL_W: u16 = 7;
 
 /// Cor de cada categoria da VRAM (próximas às do gputaskman).
 fn vram_color(k: VramKind) -> Color {
@@ -1107,7 +1224,7 @@ fn vram_bar(
         )
     });
     let text_w = (t.width() as u16).min(area.width / 2);
-    let label_w = 7u16.min(area.width);
+    let label_w = VRAM_LABEL_W.min(area.width);
     line(frame, vec![label("VRAM  ")], area.x, area.y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     let colored: Vec<(u64, Color)> = parts
@@ -1128,16 +1245,6 @@ fn vram_bar(
         Rect::new(area.x + label_w + bar_w, area.y, text_w, 1),
         area,
     );
-    if area.height < 2 {
-        return;
-    }
-    let mut legend = vec![Span::raw(" ".repeat(usize::from(label_w)))];
-    for (k, v) in parts.iter().filter(|(_, v)| *v > 0) {
-        legend.push(Span::styled("■ ", Style::new().fg(vram_color(*k))));
-        legend.push(label(&format!("{} ", k.label())));
-        legend.push(text(format!("{}  ", short_bytes(*v))));
-    }
-    line(frame, legend, area.x, area.y + 1, area.width, area);
 }
 
 /// Linha "rótulo ■■■■ usado/total" dentro de `area`, na linha `row`.
@@ -1485,6 +1592,28 @@ fn pool_folded(st: &State, total: usize) -> bool {
     st.fold_pool.unwrap_or(total > 12)
 }
 
+/// Temperaturas de disco com falha, com a causa: (número do disco, causa).
+fn temp_failures(st: &State) -> Vec<(u32, String)> {
+    let (Some(Ok(disks)), Some(Ok(temps))) = (
+        st.fast.as_ref().map(|f| &f.disks),
+        st.slow.as_ref().map(|s| &s.disk_temps),
+    ) else {
+        return Vec::new();
+    };
+    temps
+        .iter()
+        .filter(|t| {
+            disks
+                .iter()
+                .any(|d| d.number == t.number && d.model.as_ref().ok() == t.model.as_ref())
+        })
+        .filter_map(|t| match &t.celsius {
+            Err(Missing::Fail(c)) => Some((t.number, c.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let disks = st.fast.as_ref().map(|f| &f.disks);
     let Some(Ok(all)) = disks else {
@@ -1627,7 +1756,14 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 .iter()
                 .find(|t| t.number == d.number)
                 .filter(same)
-                .map_or_else(|| label(""), |t| metric(&t.celsius, |c| format!("{c} °C"))),
+                .map_or_else(
+                    || label(""),
+                    |t| match &t.celsius {
+                        // A causa não cabe na coluna: vai inteira para a linha embaixo da tabela.
+                        Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(FAIL)),
+                        c => metric(c, |c| format!("{c} °C")),
+                    },
+                ),
             Some(Err(e)) => missing(e),
             None => label(""),
         };
@@ -1645,6 +1781,35 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ];
         let x = inner.x + inner.width.saturating_sub(INFO_W);
         line(frame, info, x, y, INFO_W, inner);
+    }
+    // Causas das falhas de temperatura, inteiras (a coluna só tem espaço para "! failed").
+    let first = inner.y + 1 + order.len() as u16;
+    for (k, (number, cause)) in temp_failures(st).into_iter().enumerate() {
+        let y = first + k as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let name = order.iter().find(|(d, _)| d.number == number).map_or_else(
+            || format!("disk {number}"),
+            |(d, _)| {
+                if d.letters.is_empty() {
+                    format!("d{number}")
+                } else {
+                    d.letters.join(" ")
+                }
+            },
+        );
+        line(
+            frame,
+            vec![
+                Span::styled(format!("! {name} temp: "), Style::new().fg(FAIL)),
+                Span::styled(printable(&cause), Style::new().fg(FAIL)),
+            ],
+            inner.x,
+            y,
+            inner.width,
+            inner,
+        );
     }
 }
 
@@ -1665,44 +1830,61 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         return;
     };
     let pipe_failed = matches!(fps.pipe, Err(Missing::Fail(_)));
-    let g = match &fps.game {
-        Ok(g) => g,
-        Err(e) => {
-            let mut lines = vec![
-                Line::from(missing(e)),
-                Line::from(vec![label("RTSS "), metric(&fps.rtss, Clone::clone)]),
-            ];
-            if pipe_failed {
-                lines.push(Line::from(vec![
-                    label("frametime pipe "),
-                    metric(&fps.pipe, |_| String::new()),
-                ]));
-            }
-            frame.render_widget(Paragraph::new(lines).block(boxed("game", "")), area);
-            return;
+    // Sem jogo em foco: "idle", e os gráficos continuam com o histórico (parado até voltar).
+    let g = fps.game.as_ref().ok();
+    let (title, source) = match g {
+        Some(g) => {
+            let res = g
+                .resolution
+                .as_ref()
+                .map_or(String::new(), |(x, y)| format!(" · {x}x{y}"));
+            let title = format!(
+                "game · {} ({} · PID {}{res})",
+                printable(&g.name),
+                g.api,
+                g.pid
+            );
+            let source = match (g.approx, pipe_failed) {
+                (false, _) => "pipe: exact",
+                (true, false) => "approx. (game opened before wintop)",
+                (true, true) => "approx. (frametime pipe failed)",
+            };
+            (title, source)
         }
-    };
-    let res = g
-        .resolution
-        .as_ref()
-        .map_or(String::new(), |(x, y)| format!(" · {x}x{y}"));
-    let title = format!(
-        "game · {} ({} · PID {}{res})",
-        printable(&g.name),
-        g.api,
-        g.pid
-    );
-    let source = match (g.approx, pipe_failed) {
-        (false, _) => "pipe: exact",
-        (true, false) => "approx. (game opened before wintop)",
-        (true, true) => "approx. (frametime pipe failed)",
+        None => ("game · idle".to_string(), ""),
     };
     let block = boxed(&title, source);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let info_h = 2 + u16::from(pipe_failed);
+    let mut lines = match (g, &fps.game) {
+        (Some(g), _) => game_lines(g, st.interval_ms),
+        (None, Err(e)) => vec![
+            Line::from(vec![label("idle: "), missing(e)]),
+            Line::from(vec![
+                label("RTSS "),
+                metric(&fps.rtss, Clone::clone),
+                bar_sep(),
+                label("graphs keep the last game until r"),
+            ]),
+        ],
+        (None, Ok(_)) => Vec::new(),
+    };
+    // Falha do pipe (outro servidor ocupando o nome): linha própria, só quando acontece.
+    if pipe_failed {
+        lines.push(Line::from(vec![
+            label("frametime pipe "),
+            metric(&fps.pipe, |_| String::new()),
+        ]));
+    }
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| wrap(l.spans, inner.width, 0, 2))
+        .collect();
+    let info_h = lines.len() as u16;
+    let idle = || label("idle");
     let [graphs, info] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(info_h)]).areas(inner);
+    put(frame, Paragraph::new(lines), info, info);
     let [fps_area, ft_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(graphs);
 
@@ -1711,7 +1893,9 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let ceil = fps_ceiling(st.game_fps.max_of(n));
     let head = vec![
         label("FPS "),
-        metric(&g.fps, |v| num(*v, 0)).add_modifier(Modifier::BOLD),
+        g.map_or_else(idle, |g| {
+            metric(&g.fps, |v| num(*v, 0)).add_modifier(Modifier::BOLD)
+        }),
         sep(),
         minmax(st.session.fps, |v| num(v, 0)),
     ];
@@ -1745,7 +1929,10 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let n = usize::from(ft_area.width) * 2;
     let head = vec![
         label("FT "),
-        metric(&g.frametime, |(a, _, _)| format!("{} ms", num(*a, 2))).add_modifier(Modifier::BOLD),
+        g.map_or_else(idle, |g| {
+            metric(&g.frametime, |(a, _, _)| format!("{} ms", num(*a, 2)))
+                .add_modifier(Modifier::BOLD)
+        }),
         sep(),
         minmax(st.session.ft, |v| num(v, 1)),
     ];
@@ -1781,9 +1968,12 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ),
         gr.intersection(ft_area),
     );
+}
 
+/// As duas linhas de detalhe do jogo em foco.
+fn game_lines(g: &crate::model::Game, interval_ms: u64) -> Vec<Line<'static>> {
     let ms = |v: f64| format!("{} ms", num(v, 2));
-    let mut lines = vec![
+    vec![
         Line::from(vec![
             label("1% low "),
             metric(&g.lows, |(a, _)| num(*a, 0)),
@@ -1806,15 +1996,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             bar_sep(),
             label("lows over 60 s"),
             bar_sep(),
-            label(&format!("graphs synced to the {} ms tick", st.interval_ms)),
+            label(&format!("graphs synced to the {interval_ms} ms tick")),
         ]),
-    ];
-    // Falha do pipe (outro servidor ocupando o nome): linha própria, só quando acontece.
-    if pipe_failed {
-        lines.push(Line::from(vec![
-            label("frametime pipe "),
-            metric(&fps.pipe, |_| String::new()),
-        ]));
-    }
-    put(frame, Paragraph::new(lines), info, info);
+    ]
 }
