@@ -76,17 +76,20 @@ Pontos para a implementação:
 | Seleção do jogo | ativo (período < 2 s) + API 3D + lista de ignorados; com o Spotify (OpenGL, 100 FPS) em primeiro plano, ele é ignorado |
 | Pipe, DACL | cliente sem elevação (`runas /trustlevel:0x20000`, integridade média) conecta e escreve com a DACL `GRGW` para o usuário |
 | Pipe, instâncias | 8 instâncias: um cliente ocioso segura uma e outro cliente conecta e entrega os frames por outra |
-| Pipe, jogo real | **nenhuma conexão em 60 s com o Deadlock aberto antes do servidor** |
+| Pipe, jogo aberto antes | nenhuma conexão em 60 s (o hook só conecta no início do jogo) |
 
-O cliente do pipe é o hook injetado no jogo: a string `RTSS_Frametime` existe só em
-`RTSSHooks.dll` e `RTSSHooks64.dll`. Como a DACL e as instâncias foram descartadas como causa, a
-hipótese principal é que o hook só conecta quando o jogo inicia; a alternativa é uma opção do
-RTSS que habilita o envio. **Pendente:** iniciar o spike e só então abrir o jogo; confirmar
-também a unidade de `dwFrametime` e o significado de `dwApp`.
+Teste com o jogo aberto **depois** do servidor (Deadlock, 90 s):
 
-```powershell
-cargo run --example spike_rtss 90    # abrir o jogo DEPOIS de "Pipe com 8 instâncias"
-```
+| Item | Resultado |
+| --- | --- |
+| Conexão | o hook conecta quando o jogo inicia: `deadlock.exe` (PID 2768) conectou logo ao abrir; com o jogo aberto antes do servidor, não conecta |
+| Outros clientes | o overlay da Steam (`gameoverlayui64.exe`) também conectou, sem mandar frames: o servidor precisa de várias instâncias |
+| `dwApp` | **índice da entrada** no array de apps da Shared Memory (6 = 7ª entrada = `deadlock.exe`), não o PID |
+| `dwFrametime` | microssegundos (232 frames/s × 4,32 ms médio ≈ 1,0 s) |
+| Volume | 7435 frames em 90 s (até 232 frames/s), sem perda nem bytes descartados |
+| Lows exatos (90 s, com carregamento) | 1% low 7,4 FPS, 0,1% low 1,3 FPS (máximo de 1486 ms no carregamento) |
+| Fallback (Shared Memory, 199 amostras) | 1% low ~5,0 FPS: dá a ordem de grandeza, não os piores frames |
+| v2.21 | GPU ativa 3094 µs / frame de GPU 3122 µs com frametime de 4,47 ms |
 
 Fallback aprovado pelo usuário: com o jogo aberto antes do wintop, frametime e lows vêm de
 amostras da Shared Memory a cada 250 ms, marcados como "aprox."; o spike já faz essa amostragem
@@ -108,6 +111,6 @@ processos gráficos e compute, VBIOS.
 ## Conclusão
 
 Provados em Rust: PawnIO (Zen 3), temperatura e inventário dos 9 discos com os membros do pool,
-NVML e a Shared Memory do RTSS. Pendentes: o pipe de frametime com um jogo aberto depois do
-servidor, o PawnIO após um reboot e um HDD realmente em repouso. PDH, rede e processos são
+NVML, a Shared Memory do RTSS e o pipe de frametime (jogo aberto depois do servidor).
+Pendentes: o PawnIO após um reboot e um HDD realmente em repouso. PDH, rede e processos são
 provados na Etapa 1.
