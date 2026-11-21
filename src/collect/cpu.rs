@@ -160,7 +160,7 @@ fn kernel_share(prev: (u64, u64, u64), now: (u64, u64, u64)) -> Option<f64> {
     let di = now.0.checked_sub(prev.0)?;
     let dk = now.1.checked_sub(prev.1)?;
     let du = now.2.checked_sub(prev.2)?;
-    let total = dk + du;
+    let total = dk.checked_add(du)?;
     (total > 0).then(|| (dk.saturating_sub(di) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
 }
 
@@ -170,7 +170,13 @@ fn per_logical(items: &[(String, f64)]) -> Option<Vec<f64>> {
         .iter()
         .filter_map(|(name, val)| {
             let (g, n) = name.split_once(',')?;
-            Some(((g.parse().ok()?, n.parse().ok()?), val.clamp(0.0, 100.0)))
+            // NaN passaria pelo `clamp`: vira 0.
+            let val = if val.is_nan() {
+                0.0
+            } else {
+                val.clamp(0.0, 100.0)
+            };
+            Some(((g.parse().ok()?, n.parse().ok()?), val))
         })
         .collect();
     if v.is_empty() {
@@ -367,6 +373,30 @@ mod tests {
         r[4..8].copy_from_slice(&(size as u32).to_le_bytes());
         fill(&mut r);
         r
+    }
+
+    /// Tempos do sistema e instâncias do PDH quaisquer: participação do kernel e uso por lógico
+    /// sempre em 0..=100 (NaN do PDH vira 0; contadores que estouram, "sem amostra").
+    #[test]
+    fn fuzz_kernel_e_uso_por_logico() {
+        let t = |v: [u64; 6]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let seed = t([100, 500, 300, 150, 900, 700]);
+        crate::fuzz::run("kernel", &[seed], 48, |_, b| {
+            let mut v = [0u64; 6];
+            for (i, c) in b.as_chunks::<8>().0.iter().take(6).enumerate() {
+                v[i] = u64::from_le_bytes(*c);
+            }
+            if let Some(k) = kernel_share((v[0], v[1], v[2]), (v[3], v[4], v[5])) {
+                assert!((0.0..=100.0).contains(&k));
+            }
+        });
+        crate::fuzz::run_text("uso_por_logico", &["0,15", "1,63", "_Total"], 64, |name| {
+            for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 42.0] {
+                let items = [(name.to_string(), v), ("0,0".to_string(), v)];
+                let u = per_logical(&items).expect("0,0 é válido");
+                assert!(u.iter().all(|x| (0.0..=100.0).contains(x)));
+            }
+        });
     }
 
     #[test]

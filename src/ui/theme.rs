@@ -289,6 +289,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fuzz_cor_hex() {
+        crate::fuzz::run_text("cor_hex", &["#1a2b3c", "#FFFFFF"], 16, |s| {
+            if parse_hex(s).is_some() {
+                assert!(s.len() == 7 && s.starts_with('#'));
+                assert!(s[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+        });
+    }
+
+    #[test]
     fn cores_avulsas_e_ciclo() {
         assert_eq!(parse_hex("#4b5263"), Some(Color::Rgb(0x4b, 0x52, 0x63)));
         assert_eq!(parse_hex("4b5263"), None);

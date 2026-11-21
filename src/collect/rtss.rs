@@ -1185,25 +1185,70 @@ mod tests {
     /// elevação no lugar do RTSS): qualquer conteúdo vira erro ou apps coerentes.
     #[test]
     fn fuzz_shared_memory() {
-        let seeds = [
-            shm(
-                V2_21,
-                ENTRY_V221,
-                &[(4242, br"C:\g\a.exe", 6), (7, b"b.exe", 7)],
-            ),
-            shm(0x0002_000F, E_FRAME_TIME + 4, &[(10, b"old.exe", 5)]),
-            shm(V2_20, E_RES_Y + 4, &[(11, b"mid.exe", 5), (0, b"", 0)]),
-        ];
-        crate::fuzz::run("shared_memory", &seeds, 64 * 1024, |_, b| {
-            if let Ok((apps, _, ver)) = read_apps(&SharedView::from_bytes(b)) {
-                assert_eq!(ver >> 16, 2);
-                assert!(apps.len() <= MAX_APPS);
-                for a in &apps {
-                    assert!(a.pid != 0 && (a.index as usize) < MAX_APPS);
-                    assert!(a.fps.is_finite() && a.fps >= 0.0);
-                    assert!(!a.name.contains('\\'));
+        // Período de FPS preenchido (agora - 500 ms .. agora, 72 frames): o cálculo do FPS e da
+        // idade é exercitado, não só o caso "sem período".
+        let timed = |mut b: Vec<u8>, esize: usize, n: usize| {
+            // SAFETY: sem pré-condições.
+            let now = unsafe { GetTickCount() };
+            for i in 0..n {
+                let e = 0x100 + i * esize;
+                for (o, v) in [(E_TIME0, now - 500), (E_TIME1, now), (E_FRAMES, 72)] {
+                    b[e + o..e + o + 4].copy_from_slice(&v.to_le_bytes());
                 }
-                let _ = select_game(&apps, apps.first().map(|a| a.pid), &defaults());
+            }
+            b
+        };
+        let seeds = [
+            timed(
+                shm(
+                    V2_21,
+                    ENTRY_V221,
+                    &[(4242, br"C:\g\a.exe", 6), (7, b"b.exe", 7)],
+                ),
+                ENTRY_V221,
+                2,
+            ),
+            timed(
+                shm(0x0002_000F, E_FRAME_TIME + 4, &[(10, b"old.exe", 5)]),
+                E_FRAME_TIME + 4,
+                1,
+            ),
+            timed(
+                shm(V2_20, E_RES_Y + 4, &[(11, b"mid.exe", 5), (0, b"", 0)]),
+                E_RES_Y + 4,
+                2,
+            ),
+            // Entradas pequenas e muitas (a maior parte dos bytes é cabeçalho e campos lidos).
+            timed(
+                shm(V2_21, E_FRAME_TIME + 4, &[(1u32, &b"x.exe"[..], 6u32); 8]),
+                E_FRAME_TIME + 4,
+                8,
+            ),
+        ];
+        let ignored = defaults();
+        crate::fuzz::run("shared_memory", &seeds, 32 * 1024, |r, b| {
+            let mut b = b.to_vec();
+            // Metade das entradas com a assinatura certa: as mutações chegam ao resto.
+            if b.len() >= 4 && r.chance(2) {
+                b[..4].copy_from_slice(&RTSS_SIGNATURE.to_le_bytes());
+            }
+            let Ok((apps, fg, ver)) = read_apps(&SharedView::from_bytes(&b)) else {
+                return;
+            };
+            assert_eq!(ver >> 16, 2);
+            assert!(ver >= V2_16 || fg.is_none());
+            assert!(apps.len() <= MAX_APPS);
+            for a in &apps {
+                assert!(a.pid != 0 && (a.index as usize) < MAX_APPS);
+                assert!(a.fps.is_finite() && a.fps >= 0.0);
+                // O nome vem de um processo qualquer: nunca chega com controles ao terminal.
+                assert!(!a.name.contains('\\') && !a.name.chars().any(char::is_control));
+                assert!(ver >= V2_20 || a.res.is_none());
+                assert!(ver >= V2_21 || a.gpu.is_none());
+            }
+            if let Some(g) = select_game(&apps, fg, &ignored) {
+                assert!(g.api != 0 && g.age_ms.is_some_and(|m| m < ACTIVE_MS));
+                assert!(!is_ignored(&ignored, &g.name));
             }
         });
     }
@@ -1225,8 +1270,16 @@ mod tests {
         let mut rings = HashMap::new();
         let mut carry = Vec::new();
         crate::fuzz::run("pipe", &[seed], 512, |r, b| {
-            feed(&mut rings, &known, &ignored, &mut carry, b, r.chance(2));
+            // Recomeça de vez em quando: as filas desconhecidas voltam a ser criadas (o ramo
+            // do teto não fica sempre cheio) e a conferência abaixo não varre 90 mil frames.
+            if r.chance(64) {
+                rings.clear();
+                carry.clear();
+            }
+            let complete = r.chance(2);
+            feed(&mut rings, &known, &ignored, &mut carry, b, complete);
             assert!(carry.len() < 8);
+            assert!(!complete || carry.is_empty());
             let unknown = rings.keys().filter(|i| !known.contains(i)).count();
             assert!(unknown <= MAX_UNKNOWN_RINGS);
             for (i, ring) in &rings {

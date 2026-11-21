@@ -260,6 +260,31 @@ pub fn filetime(ft: FILETIME) -> u64 {
 mod tests {
     use super::*;
 
+    /// Caminhos quaisquer (do registro, no processo elevado): o que passa no filtro é absoluto,
+    /// com letra de unidade, sem `..`/`.` e sem prefixo de dispositivo ou rede.
+    #[test]
+    fn fuzz_caminhos() {
+        use std::path::{Component, Path};
+        let seeds = [
+            r"C:\Program Files\PawnIO",
+            r"\??\D:\pagefile.sys",
+            r"\\srv\s\x",
+        ];
+        crate::fuzz::run_text("caminhos", &seeds, 300, |s| {
+            if let Some(c) = drive_letter(s) {
+                assert!(c.is_ascii_uppercase());
+            }
+            let p = Path::new(s);
+            if is_local_absolute(p) {
+                assert!(drive_letter(s).is_some() && !s.starts_with(r"\\"));
+                assert!(
+                    p.components()
+                        .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
+                );
+            }
+        });
+    }
+
     #[test]
     fn letra_de_unidade() {
         assert_eq!(drive_letter(r"C:\Windows"), Some('C'));

@@ -121,10 +121,11 @@ pub(super) fn breakdown(
         processes
             .iter()
             .filter(|p| p.kind == k)
-            .map(|p| p.local)
-            .sum()
+            .fold(0u64, |a, p| a.saturating_add(p.local))
     };
-    let by_process: u64 = processes.iter().map(|p| p.local).sum();
+    let by_process = processes
+        .iter()
+        .fold(0u64, |a, p| a.saturating_add(p.local));
     let mut segments: Vec<(VramKind, u64)> = [
         VramKind::App,
         VramKind::Compositor,
@@ -200,7 +201,9 @@ impl VramCollector {
             if let Some((pid, rest)) = parse_instance(name)
                 && rest.to_ascii_lowercase().starts_with(luid)
             {
-                *out.entry(pid).or_default() += *v as u64;
+                // `as` satura (NaN = 0); a soma também, com valores corrompidos do PDH.
+                let e = out.entry(pid).or_default();
+                *e = e.saturating_add(*v as u64);
             }
         }
         Ok(out)
@@ -287,7 +290,7 @@ impl VramCollector {
         if mine.is_empty() {
             return fail("adapter has no PDH instance");
         }
-        let adapter_used = mine.iter().sum();
+        let adapter_used = mine.iter().fold(0u64, |a, v| a.saturating_add(*v));
         let list: Vec<(u32, u64)> = per_process.into_iter().collect();
         Ok(breakdown(&list, adapter_used, total, names))
     }
@@ -296,6 +299,46 @@ impl VramCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Instâncias e valores quaisquer do PDH: o detalhamento não estoura e fecha a conta
+    /// (segmentos <= total quando o uso cabe no total).
+    #[test]
+    fn fuzz_instancias_e_detalhamento() {
+        crate::fuzz::run_text(
+            "vram_instancia",
+            &["pid_1234_luid_0x0_0xd1e1_phys_0"],
+            128,
+            |n| {
+                if let Some((_, luid)) = parse_instance(n) {
+                    assert!(n.ends_with(luid));
+                }
+            },
+        );
+        crate::fuzz::run("vram_detalhamento", &[vec![0u8; 64]], 256, |r, b| {
+            let words: Vec<u64> = b
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect();
+            let per: Vec<(u32, u64)> = words
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as u32 % 4, v))
+                .collect();
+            let (used, total) = (r.edge_u64(), r.edge_u64());
+            let names = HashMap::from([(0, "dwm.exe".to_string()), (1, "game.exe".to_string())]);
+            let d = breakdown(&per, used, total, &names);
+            assert!(d.used >= used);
+            let seg = d
+                .segments
+                .iter()
+                .fold(0u64, |a, (_, v)| a.saturating_add(*v));
+            if d.used <= total && seg < u64::MAX {
+                assert!(seg >= d.used.min(total));
+            }
+        });
+    }
 
     #[test]
     fn instancia_por_processo() {

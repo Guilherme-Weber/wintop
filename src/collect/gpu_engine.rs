@@ -101,14 +101,24 @@ mod tests {
     #[test]
     fn fuzz_instancias_do_pdh() {
         let seed = "pid_1234_luid_0x00000000_0x0000d1e1_phys_0_eng_3_engtype_VideoDecode";
-        crate::fuzz::run_text("gpu_engine", &[seed], 256, |name| {
-            let rows: Vec<(String, f64)> = [f64::NAN, f64::INFINITY, -5.0, 50.0, 1e300]
-                .into_iter()
-                .map(|v| (name.to_string(), v))
-                .collect();
-            for luid in ["luid_0x00000000_0x0000d1e1", ""] {
-                for engines in group(&rows, luid).values() {
-                    assert!(engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)));
+        let other = "pid_1234_luid_0x00000000_0x0000d1e1_phys_0_eng_0_engtype_3D";
+        crate::fuzz::run_text("gpu_engine", &[seed, other], 256, |name| {
+            // Um valor por chamada: um 100 de outro valor não esconde um NaN que passou.
+            let edges = [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                -5.0,
+                50.0,
+                1e300,
+            ];
+            for v in edges {
+                let rows = [(name.to_string(), v), (other.to_string(), v)];
+                for luid in ["luid_0x00000000_0x0000d1e1", ""] {
+                    for engines in group(&rows, luid).values() {
+                        assert!(engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)));
+                        assert!(engines.windows(2).all(|w| w[0].0 < w[1].0));
+                    }
                 }
             }
         });

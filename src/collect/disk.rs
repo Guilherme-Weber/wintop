@@ -693,9 +693,19 @@ mod tests {
     #[test]
     fn fuzz_atividade_entre_amostras() {
         let mut p = vec![0u8; PERF_SIZE];
-        for (o, v) in [(P_BYTES_READ, 1u64 << 30), (P_IDLE_TIME, 9_000_000)] {
+        // Todos os contadores preenchidos (com transferências: a divisão da resposta média é
+        // exercitada).
+        for (o, v) in [
+            (P_BYTES_READ, 1u64 << 30),
+            (P_BYTES_WRITTEN, 1 << 28),
+            (P_READ_TIME, 4_000_000),
+            (P_WRITE_TIME, 2_000_000),
+            (P_IDLE_TIME, 9_000_000),
+        ] {
             p[o..o + 8].copy_from_slice(&v.to_le_bytes());
         }
+        p[P_READ_COUNT..P_READ_COUNT + 4].copy_from_slice(&1200u32.to_le_bytes());
+        p[P_WRITE_COUNT..P_WRITE_COUNT + 4].copy_from_slice(&300u32.to_le_bytes());
         p[P_QUERY_TIME..P_QUERY_TIME + 8].copy_from_slice(&10_000_000u64.to_le_bytes());
         crate::fuzz::run("atividade", &[p.clone()], 2 * PERF_SIZE, |r, b| {
             let Some(a) = parse_perf(b) else { return };

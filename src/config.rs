@@ -373,14 +373,26 @@ mod tests {
             };
             let mut warn = Vec::new();
             let c = from_doc(&doc, &mut warn);
+            use crate::engine::{MAX_INTERVAL_MS, MIN_INTERVAL_MS, STEP_MS};
+            assert!((MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&c.interval_ms));
+            assert_eq!(c.interval_ms % STEP_MS, 0);
             assert!(crate::ui::theme::exists(&c.theme));
             assert!(c.rtss_ignored.len() <= 256);
+            assert!(c.rtss_ignored.iter().all(|n| {
+                !n.is_empty() && n.len() <= 260 && *n == n.trim().to_ascii_lowercase()
+            }));
             assert!(c.colors.len() <= 64);
+            assert!(c.colors.iter().all(|(k, v)| {
+                crate::ui::theme::is_color_name(k) && crate::ui::theme::parse_hex(v).is_some()
+            }));
             assert!(warn.iter().all(|w| !w.chars().any(char::is_control)));
             update_doc(&mut doc, &c);
             let again: DocumentMut = doc.to_string().parse().expect("regravado inválido");
             let back = from_doc(&again, &mut Vec::new());
-            assert_eq!((back.interval_ms, back.theme), (c.interval_ms, c.theme));
+            assert_eq!(
+                (back.interval_ms, back.theme, back.fold_pool.name()),
+                (c.interval_ms, c.theme, c.fold_pool.name())
+            );
         });
     }
 
