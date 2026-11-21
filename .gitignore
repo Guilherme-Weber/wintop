@@ -1,0 +1,17 @@
+# Saída de compilação
+/target/
+/dist/
+
+# Logs e binários
+*.log
+logs/
+*.exe
+*.pdb
+
+# Editores e sistema
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

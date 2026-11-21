@@ -1,0 +1,62 @@
+[package]
+name = "wintop"
+version = "0.1.0"
+description = "Monitor de sistema em terminal para Windows: CPU, GPU, VRAM, discos, rede e FPS"
+license = "MIT"
+repository = "https://github.com/Guilherme-Weber/wintop"
+edition = "2024"
+# A versão com que é compilado e testado (fixada em rust-toolchain.toml).
+rust-version = "1.100"
+
+# Etapa 0: só os spikes (examples/) usam; passam a [dependencies] na Etapa 1.
+[dev-dependencies]
+nvml-wrapper = "0.13"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+winresource = "0.1.34"
+
+# Política de lint (verificada por `cargo clippy --all-targets --locked -- -D warnings`).
+# Mesmo conjunto do mediaopti: além do padrão, lints pedantes selecionados.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+assigning_clones = "warn"
+if_not_else = "warn"
+ignore_without_reason = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+redundant_closure_for_method_calls = "warn"
+single_match_else = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+# Unwind (padrão), não abort: um coletor que entra em pânico é isolado com catch_unwind
+# e marcado como falha, sem derrubar a interface.
+panic = "unwind"
+strip = true
+# Arquivo e linha de cada frame no .pdb separado, sem aumentar o executável.
+debug = "line-tables-only"
+
+# Spikes da Etapa 0 (examples/): o de PawnIO tem testes unitários da decodificação.
+[[example]]
+name = "spike_pawnio"
+test = true

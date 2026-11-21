@@ -1,0 +1,4 @@
+# Linka o runtime de C estaticamente para o wintop.exe rodar num Windows limpo,
+# sem o Visual C++ Redistributable (vcruntime140.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

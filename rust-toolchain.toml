@@ -1,0 +1,5 @@
+# Toolchain fixa: uma versão nova do Rust (com lints novos do clippy) só entra por decisão
+# explícita, depois de rodar clippy e testes. Atualizar junto com rust-version no Cargo.toml.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]

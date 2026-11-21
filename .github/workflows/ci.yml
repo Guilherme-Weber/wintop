@@ -1,0 +1,34 @@
+name: ci
+
+# Lint, testes que não dependem de hardware e auditoria de dependências. Os runners do GitHub
+# não têm GPU NVIDIA, RTSS nem PawnIO: os programas de prova (examples/) só são compilados aqui.
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Instala a toolchain fixada em rust-toolchain.toml (com clippy e rustfmt).
+      - name: Toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatação
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Testes
+        run: cargo test --locked
+      # Segurança: vulnerabilidades conhecidas nas dependências travadas (RustSec).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Auditoria de dependências
+        run: cargo audit
+      - name: Sem caracteres de controle nos arquivos de texto
+        shell: bash
+        run: |
+          bad=$(git ls-files '*.rs' '*.md' '*.ps1' '*.toml' '*.json' '*.yml' '*.manifest' | xargs grep -lP '[\x00-\x08\x0b\x0c\x0e-\x1f]' || true)
+          if [ -n "$bad" ]; then echo "caracteres de controle em: $bad"; exit 1; fi
