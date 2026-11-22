@@ -98,6 +98,9 @@ const RTSS_KEY: &str = r"SOFTWARE\Unwinder\RTSS";
 const ETW_LAG: Duration = Duration::from_millis(250);
 /// Swap chains acompanhadas por jogo (a principal é a com mais frames no último segundo).
 const MAX_CHAINS: usize = 4;
+/// Sem jogo escolhido, o ETW continua no último por até isto (o histórico dele não se perde
+/// num congelamento ou numa troca rápida de foco).
+const ETW_HOLD: Duration = Duration::from_secs(10);
 /// Intervalo maior que isto entre dois Present não vira frametime (jogo minimizado).
 const MAX_FRAME_US: u64 = 60_000_000;
 /// Marcadores de frame real guardados (2 s a 2000 FPS reais).
@@ -433,9 +436,12 @@ impl EtwFrames {
     }
 
     /// Swap chain principal: com frames recentes (até `t`), a de mais frames no último segundo.
+    /// Só conta a que já tem frame em `t` ou antes (os primeiros frames do ETW chegam depois do
+    /// corte: até lá vale a fonte anterior, sem uma amostra "sem frames").
     fn dominant(&self, t: Instant) -> Option<u64> {
         self.chains
             .iter()
+            .filter(|(_, c)| c.ring.frames.front().is_some_and(|f| f.0 <= t))
             .filter(|(_, c)| c.ring.recent(t, EXACT_GRACE))
             .max_by_key(|(_, c)| {
                 (
@@ -450,7 +456,7 @@ impl EtwFrames {
     /// janela. Ativo com multiplicador >= 2 recente; com 1 informado, desligado; sem
     /// multiplicador, apresentados/reais >= `FG_RATIO`. Só com a janela inteira coberta desde
     /// a troca de jogo (no aquecimento a contagem de reais sairia baixa).
-    fn framegen(&self, t: Instant, now: Instant, presented: usize) -> Option<FrameGen> {
+    fn framegen(&self, t: Instant, now: Instant, presented: f64) -> Option<FrameGen> {
         let start = t.checked_sub(Duration::from_secs(1))?;
         if self.since.is_none_or(|s| s > start) {
             return None;
@@ -462,7 +468,7 @@ impl EtwFrames {
             .map(|m| m.1);
         let active = match mult {
             Some(m) => m >= 2,
-            None => real >= 5 && presented as f64 / real as f64 >= FG_RATIO,
+            None => real >= 5 && presented / real as f64 >= FG_RATIO,
         };
         (real > 0 && active).then_some(FrameGen {
             real_fps: real as f64,
@@ -868,6 +874,9 @@ pub struct RtssCollector {
     /// Falha ao ligar os providers para o jogo atual.
     etw_error: Option<String>,
     frames: EtwFrames,
+    /// Último jogo escolhido e quando: o ETW continua nele por `ETW_HOLD` sem jogo escolhido
+    /// (um congelamento tira o jogo da lista de ativos do RTSS por um instante).
+    last_game: Option<(u32, Instant)>,
     lows: LowsCache,
     /// PID e momento da publicação anterior do jogo (para o pior frame desde então).
     published: Option<(u32, Instant)>,
@@ -904,6 +913,7 @@ impl RtssCollector {
             },
             etw_error: None,
             frames: EtwFrames::default(),
+            last_game: None,
             lows: None,
             published: None,
         }
@@ -1011,6 +1021,7 @@ impl RtssCollector {
         self.exact.clear();
         self.approx.clear();
         self.lows = None;
+        self.last_game = None;
         self.retarget(None);
         // Sem Shared Memory válida, nenhum índice é "conhecido" (o teto vale para todos).
         self.known.clear();
@@ -1089,7 +1100,19 @@ impl RtssCollector {
             r.prune(now);
         }
         let chosen = select_game(&apps, fg, &self.ignored_names);
-        self.retarget(chosen.map(|g| g.pid));
+        let target = match chosen {
+            Some(g) => {
+                self.last_game = Some((g.pid, now));
+                Some(g.pid)
+            }
+            None => self
+                .last_game
+                .filter(|(pid, t)| {
+                    now.duration_since(*t) < ETW_HOLD && apps.iter().any(|a| a.pid == *pid)
+                })
+                .map(|(pid, _)| pid),
+        };
+        self.retarget(target);
         self.ingest();
         let game = match chosen {
             None => neutral("no 3D game in focus"),
@@ -1118,10 +1141,16 @@ impl RtssCollector {
 
     /// Liga os providers do ETW para o jogo (ou desliga sem jogo).
     fn retarget(&mut self, pid: Option<u32>) {
-        if let Ok(s) = &mut self.etw {
-            self.etw_error = s.target(pid).err();
-        }
-        self.frames.retarget(pid);
+        // Os frames só valem para o PID com os providers ligados de fato (falha ao ligar = sem
+        // alvo, e o aquecimento recomeça quando ligar).
+        let on = match &mut self.etw {
+            Ok(s) => {
+                self.etw_error = s.target(pid).err();
+                self.etw_error.is_none()
+            }
+            Err(_) => false,
+        };
+        self.frames.retarget(if on { pid } else { None });
     }
 
     fn ingest(&mut self) {
@@ -1214,7 +1243,12 @@ impl RtssCollector {
         let lows = cached_lows(&mut self.lows, g.pid, source, now, ring);
         // Reais e apresentados na mesma janela (a do ETW, que chega atrasada).
         let framegen = if self.frames.pid == Some(g.pid) {
-            let presented = ring.map_or(0, |r| r.last_second(t_etw).count());
+            // No modo aproximado a fila tem uma amostra por leitura, não um frame: o FPS dela.
+            let presented = if approx {
+                fps.as_ref().ok().copied().unwrap_or(0.0)
+            } else {
+                ring.map_or(0, |r| r.last_second(t_etw).count()) as f64
+            };
             self.frames.framegen(t_etw, now, presented)
         } else {
             None
@@ -1733,14 +1767,15 @@ mod tests {
     #[test]
     fn frame_gen_pela_contagem_na_mesma_janela() {
         let t = |now: Instant| now - ETW_LAG;
-        let presented = |f: &EtwFrames, now: Instant| f.chains[&1].ring.last_second(t(now)).count();
+        let presented =
+            |f: &EtwFrames, now: Instant| f.chains[&1].ring.last_second(t(now)).count() as f64;
         // 4x informado: real = 1/4 dos apresentados.
         let (f, now) = etw_frames(200, 4, Some(4), 3);
         let p = presented(&f, now);
         let fg = f.framegen(t(now), now, p).expect("frame gen 4x");
         assert_eq!(fg.multiplier, Some(4));
         assert!((fg.real_fps - 50.0).abs() <= 1.0, "{fg:?}");
-        assert!((199..=201).contains(&p), "{p}");
+        assert!((199.0..=201.0).contains(&p), "{p}");
         // Fila do ETW em ordem de tempo, mesmo com o evento fora de ordem.
         let ring = &f.chains[&1].ring.frames;
         assert!(
@@ -1758,10 +1793,23 @@ mod tests {
         assert!(fg.is_some_and(|g| g.multiplier.is_none() && (g.real_fps - 60.0).abs() <= 1.0));
         let (f, now) = etw_frames(120, 1, None, 3);
         assert_eq!(f.framegen(t(now), now, presented(&f, now)), None);
-        // Aquecimento (menos de 1 s completo desde a troca de jogo): ainda não diz nada.
-        let (mut f, now) = etw_frames(100, 1, None, 3);
+        // Aquecimento (menos de 1 s completo desde a troca de jogo): ainda não diz nada, num
+        // caso que daria frame gen sem a guarda.
+        let (mut f, now) = etw_frames(200, 4, Some(4), 3);
+        let p = presented(&f, now);
+        assert!(f.framegen(t(now), now, p).is_some());
         f.since = Some(now - Duration::from_millis(500));
-        assert_eq!(f.framegen(t(now), now, 25), None);
+        assert_eq!(f.framegen(t(now), now, p), None);
+        // Swap chain cujos frames ainda não alcançaram o corte do ETW não é a principal.
+        let (f, now) = etw_frames(100, 1, None, 3);
+        assert_eq!(f.dominant(t(now)), Some(1));
+        let first = f.chains[&1]
+            .ring
+            .frames
+            .front()
+            .map(|x| x.0)
+            .expect("frames");
+        assert_eq!(f.dominant(first - Duration::from_millis(1)), None);
     }
 
     fn defaults() -> Vec<String> {
