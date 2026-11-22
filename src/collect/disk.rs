@@ -317,6 +317,9 @@ fn volume_letters() -> Vec<(u32, String)> {
     out
 }
 
+/// (ativo %, leitura B/s, escrita B/s, resposta s), IOPS e fila atual.
+type Activity = ((f64, f64, f64, f64), f64, u32);
+
 /// Inventário de um disco (lido na descoberta; capacidade e layout de novo se estava em repouso).
 pub(super) struct Inventory {
     pub(super) number: u32,
@@ -447,8 +450,7 @@ impl Inventory {
 
     /// Atividade desde a última leitura. Não acorda o disco: os contadores são do driver.
     /// Disco perdido não é reaberto: o mesmo número pode ser outro disco (redescoberta).
-    /// (ativo %, leitura B/s, escrita B/s, resposta s), IOPS e fila atual.
-    fn activity(&mut self) -> Metric<((f64, f64, f64, f64), f64, u32)> {
+    fn activity(&mut self) -> Metric<Activity> {
         if self.lost {
             return fail("disk removed");
         }
