@@ -353,6 +353,26 @@ pub struct DiskTemp {
     pub health: Metric<bool>,
 }
 
+/// De onde vêm os frames do jogo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSource {
+    /// ETW: DXGI `Present_Start` do jogo (exato; D3D10/11/12).
+    Etw,
+    /// Pipe de frametime do RTSS (exato; qualquer API, só para jogos abertos depois do wintop).
+    Pipe,
+    /// Amostras da Shared Memory do RTSS (aproximado).
+    Approx,
+}
+
+/// Frame generation (DLSS FG) detectado pelos marcadores Reflex.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameGen {
+    /// Frames reais (simulados pelo jogo) no último segundo.
+    pub real_fps: f64,
+    /// Frames apresentados por frame real (2x, 3x, 4x), quando o jogo informa.
+    pub multiplier: Option<u32>,
+}
+
 /// Jogo acompanhado pelo RTSS.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Game {
@@ -360,9 +380,11 @@ pub struct Game {
     pub name: String,
     pub api: &'static str,
     pub resolution: Metric<(u32, u32)>,
-    /// `true` = valores da Shared Memory (jogo aberto antes do wintop): aproximados.
-    pub approx: bool,
+    pub source: FrameSource,
+    /// FPS apresentado (com frame gen, inclui os frames gerados).
     pub fps: Metric<f64>,
+    /// Frame gen ativo: FPS real e multiplicador. `None`: sem frame gen (ou jogo sem Reflex).
+    pub framegen: Option<FrameGen>,
     /// Frametime no último segundo, em ms: médio, mínimo e máximo.
     pub frametime: Metric<(f64, f64, f64)>,
     /// 1% e 0,1% low em FPS (janela de 60 s).
@@ -376,6 +398,14 @@ pub struct Game {
     pub peak_ms: Option<f64>,
 }
 
+impl Game {
+    /// Valores da Shared Memory (jogo aberto antes do wintop, sem ETW): aproximados.
+    #[cfg(test)]
+    pub fn approx(&self) -> bool {
+        self.source == FrameSource::Approx
+    }
+}
+
 /// Estado do RTSS e do jogo (thread do RTSS, a cada 250 ms).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fps {
@@ -383,6 +413,8 @@ pub struct Fps {
     pub rtss: Metric<String>,
     /// Pipe de frametime: quantas instâncias e clientes conectados.
     pub pipe: Metric<(usize, usize)>,
+    /// Sessão ETW dos frames (DXGI + Reflex).
+    pub etw: Metric<&'static str>,
     pub game: Metric<Game>,
     /// PIDs com o hook do RTSS (apps 3D, possivelmente jogos com anticheat): a leitura de
     /// módulos sob demanda nunca abre estes processos.

@@ -104,7 +104,8 @@ redirecionamentos e caminhos que não sejam locais são recusados.
   com nome, driver, uso, encoder/decoder e VRAM (DXGI e contadores do Windows); com mais de uma
   GPU, a tecla `g` troca a exibida.
 - [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/)
-  para FPS e frametime.
+  para identificar o jogo (API, resolução, tempo de GPU). Os frames vêm do ETW (DXGI), com o
+  pipe do RTSS de reserva; com DLSS Frame Generation, o FPS real aparece ao lado do apresentado.
 - [PawnIO](https://pawnio.eu) para temperatura e potência de processadores AMD
   (`winget install namazso.PawnIO`).
 

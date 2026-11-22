@@ -141,7 +141,7 @@ fn open_namespace() -> Result<HANDLE, Error> {
 }
 
 /// Sessão do Windows do processo atual (pelo token).
-fn session_id() -> Result<u32, Error> {
+pub(crate) fn session_id() -> Result<u32, Error> {
     let mut token = HANDLE::default();
     // SAFETY: o token passa a ter dono logo abaixo.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }

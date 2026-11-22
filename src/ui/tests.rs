@@ -215,13 +215,15 @@ pub(super) fn game() -> Fps {
     Fps {
         rtss: Ok("shared memory 2.21".into()),
         pipe: Ok((8, 1)),
+        etw: Ok("DXGI + Reflex markers"),
         game: Ok(Game {
             pid: 4242,
             name: "deadlock.exe".into(),
             api: "D3D11",
             resolution: Ok((2560, 1440)),
-            approx: false,
+            source: crate::model::FrameSource::Pipe,
             fps: Ok(143.6),
+            framegen: None,
             frametime: Ok((6.96, 5.1, 11.4)),
             lows: Ok((98.0, 61.0)),
             gpu_time: Ok((5.2, 6.8)),
@@ -290,6 +292,7 @@ fn falhas_e_estados_neutros() {
     st.push_fps(Fps {
         rtss: Err(Missing::Fail("RTSS not running".into())),
         pipe: Ok((8, 0)),
+        etw: Ok("DXGI + Reflex markers"),
         game: Err(Missing::Fail("RTSS not running".into())),
         hooked: vec![],
     });
@@ -419,13 +422,42 @@ fn falha_do_pipe_com_jogo_aparece() {
     let mut s = game();
     s.pipe = fail("frametime pipe (another server running?): busy");
     if let Ok(g) = &mut s.game {
-        g.approx = true;
+        g.source = crate::model::FrameSource::Approx;
     }
     st.push_fps(s);
     let out = render(&mut st, 160, 48);
     assert!(out.contains("approx. (frametime pipe failed)"), "{out}");
     assert!(out.contains("! frametime pipe (another server"), "{out}");
     assert!(!out.contains("game opened before wintop"), "{out}");
+}
+
+/// Frame gen pelo ETW: "FPS 190 · real 47 (4x)", fonte "ETW: exact", e os frames reais na
+/// parte de baixo do gráfico de FPS (série alinhada com a do FPS).
+#[test]
+fn frame_gen_mostra_fps_real() {
+    let mut st = State::new(1000);
+    let mut s = game();
+    if let Ok(g) = &mut s.game {
+        g.source = crate::model::FrameSource::Etw;
+        g.fps = Ok(190.0);
+        g.framegen = Some(crate::model::FrameGen {
+            real_fps: 47.0,
+            multiplier: Some(4),
+        });
+    }
+    st.push_fps(s);
+    st.push_fast(fast(1));
+    st.push_fast(fast(2));
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("ETW: exact"), "{out}");
+    assert!(out.contains("FPS 190 · real 47 (4x)"), "{out}");
+    // Falha do ETW (sem frame gen): linha própria com a causa.
+    let mut s = game();
+    s.etw = fail("StartTrace: access denied");
+    st.push_fps(s);
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("ETW frames"), "{out}");
+    assert!(out.contains("access denied"), "{out}");
 }
 
 #[test]
@@ -494,6 +526,7 @@ fn sem_jogo_fica_idle_com_os_graficos() {
     st.push_fps(Fps {
         rtss: Ok("shared memory 2.21".into()),
         pipe: Ok((8, 1)),
+        etw: Ok("DXGI + Reflex markers"),
         game: Err(Missing::Neutral("no 3D game in focus".into())),
         hooked: vec![],
     });
@@ -720,6 +753,7 @@ fn sem_lista_do_rtss_nenhum_processo_e_aberto() {
     st.push_fps(Fps {
         rtss: fail("RTSS not running"),
         pipe: Ok((8, 0)),
+        etw: Ok("DXGI + Reflex markers"),
         game: fail("RTSS not running"),
         hooked: vec![],
     });

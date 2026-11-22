@@ -8,6 +8,9 @@
 //!   início do jogo.
 //! - Jogo aberto antes do wintop: frametime amostrado na Shared Memory a cada 250 ms, marcado
 //!   como aproximado (lows só como ordem de grandeza).
+//! - ETW (`etw.rs`, fonte primária): DXGI `Present_Start` do jogo escolhido aqui (frametime
+//!   exato também para jogos abertos antes do wintop) e marcadores Reflex (frames reais e
+//!   multiplicador do frame gen). Sem frames por ETW (Vulkan, OpenGL, D3D9), vale o pipe.
 //! - Lows (1% e 0,1%) calculados pelo wintop numa janela de 60 s (os do RTSS só existem no
 //!   modo benchmark).
 
@@ -39,7 +42,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-use crate::model::{Fps, Game, Metric, Missing, fail, neutral};
+use crate::collect::etw;
+use crate::model::{Fps, FrameGen, FrameSource, Game, Metric, Missing, fail, neutral};
 use crate::shm::SharedView;
 use crate::win::{self, own, wide};
 
@@ -89,6 +93,19 @@ const RTSS_START_GRACE: Duration = Duration::from_secs(15);
 /// Sem Shared Memory depois de iniciar: nova tentativa a cada minuto.
 const RTSS_START_RETRY: Duration = Duration::from_secs(60);
 const RTSS_KEY: &str = r"SOFTWARE\Unwinder\RTSS";
+/// Atraso da entrega do ETW (flush de 100 ms + consumidor): as contas dos frames por ETW usam
+/// "agora" menos isto, para o último segundo não parecer vazio nem um congelamento.
+const ETW_LAG: Duration = Duration::from_millis(250);
+/// Swap chains acompanhadas por jogo (a principal é a com mais frames no último segundo).
+const MAX_CHAINS: usize = 4;
+/// Intervalo maior que isto entre dois Present não vira frametime (jogo minimizado).
+const MAX_FRAME_US: u64 = 60_000_000;
+/// Marcadores de frame real guardados (2 s a 2000 FPS reais).
+const MAX_REAL: usize = 4096;
+/// Multiplicador visto há no máximo isto vale como frame gen ativo.
+const MULT_FRESH: Duration = Duration::from_secs(2);
+/// Sem multiplicador informado: apresentados/reais a partir disto = frame gen.
+const FG_RATIO: f64 = 1.6;
 
 fn api_name(flags: u32) -> &'static str {
     match flags & 0xFFFF {
@@ -308,6 +325,134 @@ impl Ring {
             .rev()
             .take_while(move |(t, _)| now.duration_since(*t) <= Duration::from_secs(1))
             .map(|(_, us)| *us)
+    }
+}
+
+/// Frames de uma swap chain do jogo pelo ETW.
+#[derive(Default)]
+struct Chain {
+    last_qpc: Option<i64>,
+    ring: Ring,
+    /// Pior frametime desde a última publicação.
+    peak: Option<u32>,
+}
+
+/// Frames do jogo pelo ETW (só do PID com os providers ligados).
+#[derive(Default)]
+struct EtwFrames {
+    pid: Option<u32>,
+    chains: HashMap<u64, Chain>,
+    /// Início de cada frame real (Reflex `SIMULATION_START`).
+    real: VecDeque<Instant>,
+    /// Último multiplicador do frame gen informado.
+    mult: Option<(Instant, u32)>,
+    scratch: Vec<etw::Event>,
+}
+
+impl EtwFrames {
+    fn retarget(&mut self, pid: Option<u32>) {
+        if self.pid != pid {
+            self.pid = pid;
+            self.chains.clear();
+            self.real.clear();
+            self.mult = None;
+        }
+    }
+
+    /// Eventos novos da sessão. `now_qpc` e `freq`: o QPC lido junto com `now`.
+    fn ingest(&mut self, events: &mut Vec<etw::Event>, now_qpc: i64, freq: i64, now: Instant) {
+        let age_us = |q: i64| etw::ticks_us(now_qpc.saturating_sub(q), freq);
+        let Some(pid) = self.pid else {
+            events.clear();
+            return;
+        };
+        for ev in events.drain(..) {
+            if ev.pid != pid {
+                continue;
+            }
+            let at = now
+                .checked_sub(Duration::from_micros(age_us(ev.qpc)))
+                .unwrap_or(now);
+            match ev.kind {
+                etw::Kind::Present { swapchain } => {
+                    if !self.chains.contains_key(&swapchain) && self.chains.len() >= MAX_CHAINS {
+                        let oldest = self
+                            .chains
+                            .iter()
+                            .min_by_key(|(_, c)| c.ring.frames.back().map(|f| f.0))
+                            .map(|(k, _)| *k);
+                        if let Some(k) = oldest {
+                            self.chains.remove(&k);
+                        }
+                    }
+                    let c = self.chains.entry(swapchain).or_default();
+                    match c.last_qpc {
+                        // Fora de ordem (buffers de CPUs diferentes): ignorado.
+                        Some(last) if ev.qpc <= last => {}
+                        Some(last) => {
+                            let us = etw::ticks_us(ev.qpc - last, freq);
+                            if us > 0 && us <= MAX_FRAME_US {
+                                let us = us as u32;
+                                c.ring.push(at, us);
+                                c.peak = Some(c.peak.map_or(us, |p| p.max(us)));
+                            }
+                            c.last_qpc = Some(ev.qpc);
+                        }
+                        None => c.last_qpc = Some(ev.qpc),
+                    }
+                }
+                etw::Kind::SimStart => {
+                    if self.real.len() >= MAX_REAL {
+                        self.real.pop_front();
+                    }
+                    self.real.push_back(at);
+                }
+                etw::Kind::Multiplier(v) => self.mult = Some((at, v)),
+            }
+        }
+        while self
+            .real
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(2))
+        {
+            self.real.pop_front();
+        }
+        for c in self.chains.values_mut() {
+            c.ring.prune(now);
+        }
+    }
+
+    /// Swap chain principal: com frames recentes (até `t`), a de mais frames no último segundo.
+    fn dominant(&self, t: Instant) -> Option<u64> {
+        self.chains
+            .iter()
+            .filter(|(_, c)| c.ring.recent(t, EXACT_GRACE))
+            .max_by_key(|(_, c)| {
+                (
+                    c.ring.last_second(t).count(),
+                    c.ring.frames.back().map(|f| f.0),
+                )
+            })
+            .map(|(k, _)| *k)
+    }
+
+    /// Frame gen ativo: multiplicador ≥ 2 recente, ou apresentados/reais ≥ `FG_RATIO`.
+    fn framegen(&self, t: Instant, now: Instant, total: Option<f64>) -> Option<FrameGen> {
+        let real = self
+            .real
+            .iter()
+            .filter(|a| **a <= t && t.duration_since(**a) <= Duration::from_secs(1))
+            .count() as f64;
+        let mult = self
+            .mult
+            .filter(|(a, _)| now.saturating_duration_since(*a) <= MULT_FRESH)
+            .map(|m| m.1)
+            .filter(|m| *m >= 2);
+        let ratio = real >= 5.0 && total.is_some_and(|f| f / real >= FG_RATIO);
+        (real > 0.0 && (mult.is_some() || ratio)).then_some(FrameGen {
+            real_fps: real,
+            multiplier: mult,
+        })
     }
 }
 
@@ -675,13 +820,14 @@ pub fn failed(cause: &str) -> Fps {
     Fps {
         rtss: Err(m.clone()),
         pipe: Err(m.clone()),
+        etw: Err(m.clone()),
         game: Err(m),
         hooked: Vec::new(),
     }
 }
 
-/// Lows em cache: (instante, PID, aproximado, valor).
-type LowsCache = Option<(Instant, u32, bool, Metric<(f64, f64)>)>;
+/// Lows em cache: (instante, PID, fonte, valor).
+type LowsCache = Option<(Instant, u32, FrameSource, Metric<(f64, f64)>)>;
 
 pub struct RtssCollector {
     view: Option<SharedView>,
@@ -702,6 +848,11 @@ pub struct RtssCollector {
     ignored_names: Vec<String>,
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
+    /// Sessão ETW: `Err(None)` = desligada de propósito (`--check`); `Err(Some(e))` = falhou.
+    etw: Result<etw::Session, Option<String>>,
+    /// Falha ao ligar os providers para o jogo atual.
+    etw_error: Option<String>,
+    frames: EtwFrames,
     lows: LowsCache,
     /// PID e momento da publicação anterior do jogo (para o pior frame desde então).
     published: Option<(u32, Instant)>,
@@ -729,6 +880,15 @@ impl RtssCollector {
                 .map(ToString::to_string)
                 .collect(),
             approx: HashMap::new(),
+            // Junto com o pipe: só no modo normal (o `--check` roda com a TUI aberta e não
+            // pode parar a sessão dela).
+            etw: if pipe {
+                etw::Session::start().map_err(Some)
+            } else {
+                Err(None)
+            },
+            etw_error: None,
+            frames: EtwFrames::default(),
             lows: None,
             published: None,
         }
@@ -836,6 +996,7 @@ impl RtssCollector {
         self.exact.clear();
         self.approx.clear();
         self.lows = None;
+        self.retarget(None);
         // Sem Shared Memory válida, nenhum índice é "conhecido" (o teto vale para todos).
         self.known.clear();
         self.ignored.clear();
@@ -859,6 +1020,7 @@ impl RtssCollector {
             return Fps {
                 rtss: Err(missing.clone()),
                 pipe,
+                etw: self.etw_status(),
                 game: Err(missing),
                 hooked: Vec::new(),
             };
@@ -873,6 +1035,7 @@ impl RtssCollector {
                 return Fps {
                     rtss: fail(e.clone()),
                     pipe,
+                    etw: self.etw_status(),
                     game: fail(e),
                     hooked: Vec::new(),
                 };
@@ -910,16 +1073,59 @@ impl RtssCollector {
         for r in self.exact.values_mut().chain(self.approx.values_mut()) {
             r.prune(now);
         }
-        let game = match select_game(&apps, fg, &self.ignored_names) {
+        let chosen = select_game(&apps, fg, &self.ignored_names);
+        self.retarget(chosen.map(|g| g.pid));
+        self.ingest(now);
+        let game = match chosen {
             None => neutral("no 3D game in focus"),
             Some(g) => Ok(self.game(g, now)),
         };
+        // O pior frame é "desde a publicação anterior": o que sobrou não passa para a próxima.
+        for c in self.frames.chains.values_mut() {
+            c.peak = None;
+        }
         let hooked = apps.iter().map(|a| a.pid).collect();
         Fps {
             rtss,
             pipe,
+            etw: self.etw_status(),
             game,
             hooked,
+        }
+    }
+
+    /// Desliga o ETW (testes da reserva: pipe e Shared Memory).
+    #[cfg(test)]
+    pub(crate) fn disable_etw(&mut self) {
+        self.retarget(None);
+        self.etw = Err(None);
+    }
+
+    /// Liga os providers do ETW para o jogo (ou desliga sem jogo).
+    fn retarget(&mut self, pid: Option<u32>) {
+        if let Ok(s) = &mut self.etw {
+            self.etw_error = s.target(pid).err();
+        }
+        self.frames.retarget(pid);
+    }
+
+    fn ingest(&mut self, now: Instant) {
+        let Ok(s) = &self.etw else {
+            return;
+        };
+        let mut events = std::mem::take(&mut self.frames.scratch);
+        // Descartes (caixa cheia) só acontecem numa inundação: os frames que chegaram valem.
+        let _ = s.drain(&mut events);
+        self.frames
+            .ingest(&mut events, etw::qpc_now(), s.freq(), now);
+        self.frames.scratch = events;
+    }
+
+    fn etw_status(&self) -> Metric<&'static str> {
+        match (&self.etw, &self.etw_error) {
+            (Ok(_), None) => Ok("DXGI + Reflex markers"),
+            (Ok(_), Some(e)) | (Err(Some(e)), _) => fail(e.clone()),
+            (Err(None), _) => neutral("not started in --check"),
         }
     }
 
@@ -930,21 +1136,40 @@ impl RtssCollector {
             .exact
             .get(&g.index)
             .is_some_and(|r| r.recent(now, EXACT_GRACE));
-        let approx = !exact_recent;
+        // Por ETW, "agora" é o último instante que já chegou (a entrega atrasa ~100-200 ms).
+        let t_etw = now.checked_sub(ETW_LAG).unwrap_or(now);
+        let chain = if self.frames.pid == Some(g.pid) {
+            self.frames.dominant(t_etw)
+        } else {
+            None
+        };
+        let source = match (chain, exact_recent) {
+            (Some(_), _) => FrameSource::Etw,
+            (None, true) => FrameSource::Pipe,
+            (None, false) => FrameSource::Approx,
+        };
+        let approx = source == FrameSource::Approx;
         if approx && g.frametime_us > 0 {
             self.approx
                 .entry(g.pid)
                 .or_default()
                 .push(now, g.frametime_us);
         }
-        let ring = if approx {
-            self.approx.get(&g.pid)
-        } else {
-            self.exact.get(&g.index)
+        let etw_peak = chain
+            .and_then(|k| self.frames.chains.get_mut(&k))
+            .and_then(|c| c.peak.take());
+        let (ring, t) = match source {
+            FrameSource::Etw => (
+                chain
+                    .and_then(|k| self.frames.chains.get(&k))
+                    .map(|c| &c.ring),
+                t_etw,
+            ),
+            FrameSource::Pipe => (self.exact.get(&g.index), now),
+            FrameSource::Approx => (self.approx.get(&g.pid), now),
         };
-        let second: Vec<u32> = ring.map_or_else(Vec::new, |r| {
-            r.last_second(now).filter(|&u| u > 0).collect()
-        });
+        let second: Vec<u32> =
+            ring.map_or_else(Vec::new, |r| r.last_second(t).filter(|&u| u > 0).collect());
         let (fps, frametime) = if approx {
             // FPS do período do RTSS; frametime: o instantâneo e os extremos das amostras.
             let cur = f64::from(g.frametime_us) / 1000.0;
@@ -960,9 +1185,9 @@ impl RtssCollector {
             let avg = sum as f64 / n / 1000.0;
             // Congelamento em andamento: o tempo desde o último frame conta no FPS (senão um
             // travamento de 900 ms mostraria o FPS do frame anterior a ele).
-            let gap = ring
-                .and_then(|r| r.frames.back())
-                .map_or(0, |(t, _)| now.duration_since(*t).as_micros() as u64);
+            let gap = ring.and_then(|r| r.frames.back()).map_or(0, |(at, _)| {
+                t.saturating_duration_since(*at).as_micros() as u64
+            });
             let stalled = gap > FREEZE_MIN_US && gap as f64 > 2.0 * avg * 1000.0;
             let span = sum + if stalled { gap } else { 0 };
             (
@@ -970,7 +1195,12 @@ impl RtssCollector {
                 positive(avg).map(|a| (a, lo, hi)),
             )
         };
-        let lows = cached_lows(&mut self.lows, g.pid, approx, now, ring);
+        let lows = cached_lows(&mut self.lows, g.pid, source, now, ring);
+        let framegen = if self.frames.pid == Some(g.pid) {
+            self.frames.framegen(t_etw, now, fps.as_ref().ok().copied())
+        } else {
+            None
+        };
         let gpu_time = match g.gpu {
             Some((active, frame)) if active > 0 && frame > 0 => {
                 Ok((f64::from(active) / 1000.0, f64::from(frame) / 1000.0))
@@ -999,8 +1229,9 @@ impl RtssCollector {
                 Some(_) => fail("resolution not reported by RTSS"),
                 None => neutral("needs RTSS shared memory 2.20+"),
             },
-            approx,
+            source,
             fps,
+            framegen,
             frametime,
             lows,
             gpu_time,
@@ -1013,15 +1244,20 @@ impl RtssCollector {
                     Some((pid, t)) if pid == g.pid => Some(t.max(floor)),
                     _ => Some(floor),
                 };
-                ring.and_then(|r| {
-                    r.frames
-                        .iter()
-                        .rev()
-                        .take_while(|(t, _)| since.is_none_or(|s| *t > s))
-                        .map(|(_, us)| *us)
-                        .max()
-                })
-                .map(|us| f64::from(us) / 1000.0)
+                // Pelo ETW os frames chegam atrasados: o pior é o que entrou desde a anterior.
+                if source == FrameSource::Etw {
+                    etw_peak.map(|us| f64::from(us) / 1000.0)
+                } else {
+                    ring.and_then(|r| {
+                        r.frames
+                            .iter()
+                            .rev()
+                            .take_while(|(at, _)| since.is_none_or(|s| *at > s))
+                            .map(|(_, us)| *us)
+                            .max()
+                    })
+                    .map(|us| f64::from(us) / 1000.0)
+                }
             },
         }
     }
@@ -1030,13 +1266,13 @@ impl RtssCollector {
 fn cached_lows(
     cache: &mut LowsCache,
     pid: u32,
-    approx: bool,
+    source: FrameSource,
     now: Instant,
     ring: Option<&Ring>,
 ) -> Metric<(f64, f64)> {
     if let Some((t, p, a, v)) = &*cache
         && *p == pid
-        && *a == approx
+        && *a == source
         && now.duration_since(*t) < LOWS_EVERY
     {
         return v.clone();
@@ -1044,7 +1280,7 @@ fn cached_lows(
     let v = ring
         .and_then(|r| lows(r.frames.iter().map(|(_, us)| *us)))
         .map_or_else(|| neutral("waiting for samples"), Ok);
-    *cache = Some((now, pid, approx, v.clone()));
+    *cache = Some((now, pid, source, v.clone()));
     v
 }
 

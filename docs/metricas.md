@@ -145,9 +145,24 @@ desenvolvimento: o caminho delas é o mesmo, mas os nomes das engines de vídeo 
 | RAM e CPU % do processo | `SystemProcessInformation` | | | E6 |
 | Runtimes (CUDA, Vulkan, D3D9/10/11/12, OpenGL, OpenCL, ONNX, DirectML, NVENC/NVDEC) | **sob demanda** (Enter no processo selecionado), módulos carregados pelo Toolhelp; nunca no jogo ativo nem em PID com o hook do RTSS | A | "protected" (acesso negado); "skipped: 3D app hooked by RTSS" | E6 |
 
-## FPS (jogo em primeiro plano, via RTSS)
+## FPS (jogo em primeiro plano, via ETW e RTSS)
 
-Fonte exata: pipe `\\.\pipe\RTSS_Frametime`, um registro `{dwApp, dwFrametime}` por frame
+O RTSS escolhe o jogo (app 3D em primeiro plano) e dá API, resolução e tempo de GPU. Os frames
+vêm, em ordem de preferência:
+
+1. **ETW** (sessão em tempo real `wintop-fps-s<sessão>`, lógica do PresentMon): DXGI
+   `Present_Start` do PID do jogo (filtro de PID no provider), frametime = intervalo entre dois
+   Present da mesma swap chain (a principal é a de mais frames no último segundo). Exato também
+   com o jogo aberto antes do wintop; D3D10/11/12. Flush de 100 ms
+   (`EVENT_TRACE_USE_MS_FLUSH_TIMER`): as contas usam "agora - 250 ms". Marcado "ETW: exact".
+   Marcadores Reflex do `PCLStatsTraceLoggingProvider` (`0d216f06-82a6-4d49-bc4f-8f38ae56efab`,
+   `pclstats.h` do Streamline): `SIMULATION_START` (0) por frame real e `NUM_PRESENTS_IN_BATCH`
+   (22, `Value` = multiplicador). Ligar o provider faz o jogo emitir o ping de latência (tecla
+   F13-F15 ou mensagem para a própria janela a cada 100-300 ms), como com o overlay da NVIDIA.
+2. Pipe do RTSS (jogos sem frames por ETW: Vulkan, OpenGL, D3D9), marcado "pipe: exact".
+3. Shared Memory do RTSS, aproximado.
+
+Pipe do RTSS: `\\.\pipe\RTSS_Frametime`, um registro `{dwApp, dwFrametime}` por frame
 (`dwApp` = índice da entrada na Shared Memory; `dwFrametime` em µs). O hook do RTSS só conecta ao
 pipe no início do jogo (confirmado). Com o jogo aberto antes do wintop, os
 valores vêm da Shared Memory (amostras a cada 250 ms) e aparecem marcados como **"aprox. (jogo
@@ -161,6 +176,8 @@ aberto antes do wintop)"** até o jogo reiniciar.
 | FPS | pipe (frames por janela); Shared Memory (`dwFrames / (dwTime1 - dwTime0)`) | | | Spike (pipe e SHM) |
 | Frametime atual, mínimo, máximo | pipe; senão `dwFrameTime` da Shared Memory | | "aprox. (jogo aberto antes do wintop)"; "sem frames no último segundo" (travamento ou tela de carregamento) | Spike (pipe: 7435 frames do Deadlock); E6 (fps_probe, frametime pelo pipe: 10-50 ms programados = 8,5-50,3 ms medidos, diferença do jitter do próprio probe); congelamento de 1,5 s: FPS cai já nas amostras de 250 ms (68 → 46 → 20) e depois "sem frames no último segundo"; probe aberto antes: "aprox.", FPS 92,14 × 92,59 |
 | 1% e 0,1% low | **calculado pelo wintop** por jogo, janela deslizante de 60 s; os campos do RTSS só existem no modo benchmark | | "aprox." (amostras da Shared Memory); "aguardando amostras" (< 100) | E3 (janela de 60 s, recalculada a cada 1 s); E6 (fps_probe: 1% low 19,96 e 0,1% low 19,90 × 20,00 esperado; FPS 92,62 × 92,59) |
+| FPS real e multiplicador (frame gen) | ETW: `SIMULATION_START` do PCL no último segundo; multiplicador = `Value` do marcador 22 visto nos últimos 2 s (≥ 2); sem multiplicador, apresentados/reais ≥ 1,6 | A | sem frame gen (jogo sem Reflex ou FG desligado): não aparece | Spike (ZZZ, MFG 4x: DXGI ~190/s, SIM_START ~47/s, `Value` 4); 1.2 (fps_probe `--fg 4` com o GUID e os campos reais: FPS 92,10 × 92,59, real 22,91 × 23,15, multiplicador 4) |
+| Sessão ETW dos frames | `StartTrace` + `EnableTraceEx2` (DXGI e PCL, filtro de PID) | A | "not started in --check" | 1.2 (fps_probe aberto antes do wintop: "ETW: exact", FPS 92,75 × 92,59; entrega mediana ~160 ms) |
 | Tempo de GPU / limitado por CPU ou GPU | `dwGpuActiveRenderTime`, `dwGpuFrameTime` (v2.21+) | | "indisponível neste jogo" (valor 0) | Spike (Deadlock: 3237/38726 µs) |
 | RTSS rodando | o wintop inicia o RTSS (caminho em `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`) | A | | E3 (só no modo normal; o `--check` não inicia o RTSS nem cria o pipe) |
 

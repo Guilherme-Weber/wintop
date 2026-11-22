@@ -4,6 +4,7 @@
 mod cpu;
 mod disk;
 mod disk_temp;
+pub mod etw;
 mod gpu;
 mod gpu_engine;
 pub use gpu_engine::{is_decode, is_encode};

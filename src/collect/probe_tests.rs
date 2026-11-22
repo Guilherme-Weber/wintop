@@ -40,7 +40,7 @@ fn missing_source(what: &str) -> bool {
 
 /// O executável do probe em `target\<perfil>\examples` (release antes de debug), subindo a
 /// partir do executável de teste (que no layout novo do Cargo fica em `build\wintop\<hash>\out`).
-fn probe_exe() -> Option<PathBuf> {
+pub(crate) fn probe_exe() -> Option<PathBuf> {
     let me = std::env::current_exe().expect("executável de teste");
     let found = me
         .ancestors()
@@ -152,11 +152,11 @@ fn probe_fps_frametime_e_lows() {
         g.api,
         1000.0 / FPS,
         g.lows,
-        g.approx
+        g.approx()
     );
     assert!(
-        !g.approx,
-        "frametime pelo pipe (probe aberto depois do coletor)"
+        !g.approx(),
+        "frametime exato (probe aberto depois do coletor)"
     );
     assert!(g.api.starts_with("D3D1"), "{}", g.api);
     assert!((avg - want).abs() < want * 0.02, "FPS {avg} × {want}");
@@ -234,7 +234,7 @@ fn probe_congelamento_derruba_o_fps() {
         if let Ok(g) = &s.game
             && g.pid == pid
         {
-            approx |= g.approx;
+            approx |= g.approx();
             let t = t0.elapsed().as_secs_f64();
             // Janela do congelamento (7,0 a 8,5 s do probe, com folga para o início dele).
             if (7.4..8.4).contains(&t) {
@@ -247,7 +247,7 @@ fn probe_congelamento_derruba_o_fps() {
         c.pump(Instant::now() + Duration::from_millis(250), stop);
     }
     println!("FPS durante o congelamento: {during:?}; sem frames: {stalled_state}");
-    assert!(!approx, "frametime pelo pipe o tempo todo");
+    assert!(!approx, "frametime exato o tempo todo");
     let normal = 1000.0 / expected_avg_ms();
     // O FPS cai aos poucos (a janela de 1 s vai ficando com mais tempo parado): cada amostra
     // abaixo da anterior e a última abaixo da metade, ou já "sem frames".
@@ -261,12 +261,41 @@ fn probe_congelamento_derruba_o_fps() {
     );
 }
 
-/// Jogo aberto antes do coletor: o hook não conecta ao pipe, e os valores vêm da Shared Memory
-/// marcados como aproximados (FPS do período do RTSS, perto do real).
+/// Amostra o probe `pid` por `secs` segundos: FPS das amostras (descartando o primeiro
+/// segundo, de aquecimento) e o último estado do jogo.
+fn sample_probe(
+    c: &mut RtssCollector,
+    pid: u32,
+    secs: u64,
+    stop: HANDLE,
+) -> (Vec<f64>, Vec<crate::model::Game>) {
+    let t0 = Instant::now();
+    let mut fps = Vec::new();
+    let mut games = Vec::new();
+    while t0.elapsed() < Duration::from_secs(secs) {
+        let s = c.sample();
+        if let Ok(g) = &s.game
+            && g.pid == pid
+        {
+            if let Ok(f) = g.fps
+                && t0.elapsed() > Duration::from_secs(1)
+            {
+                fps.push(f);
+            }
+            games.push(g.clone());
+        }
+        c.pump(Instant::now() + Duration::from_millis(250), stop);
+    }
+    (fps, games)
+}
+
+/// Jogo aberto antes do coletor: o hook não conecta ao pipe, mas o ETW dá os frames exatos.
+/// Sem o ETW, os valores vêm da Shared Memory marcados como aproximados (FPS do período do
+/// RTSS, perto do real).
 #[test]
-#[ignore = "hardware: RTSS aberto + fps_probe compilado (abre uma janela D3D11 por ~12 s)"]
-fn probe_aberto_antes_fica_aproximado() {
-    let Some(probe) = start_probe(12) else {
+#[ignore = "hardware: terminal elevado, RTSS aberto + fps_probe compilado (janela D3D11, ~14 s)"]
+fn probe_aberto_antes_exato_por_etw_e_aproximado_sem() {
+    let Some(probe) = start_probe(14) else {
         return;
     };
     let pid = probe.0.id();
@@ -277,30 +306,88 @@ fn probe_aberto_antes_fica_aproximado() {
     if !rtss_running(&mut c) {
         return;
     }
-    let t0 = Instant::now();
-    let mut fps = Vec::new();
-    let mut last = None;
-    while t0.elapsed() < Duration::from_secs(6) {
-        let s = c.sample();
-        if let Ok(g) = &s.game
-            && g.pid == pid
-        {
-            if let Ok(f) = g.fps {
-                fps.push(f);
-            }
-            last = Some(g.clone());
-        }
-        c.pump(Instant::now() + Duration::from_millis(250), stop);
-    }
-    let g = last.expect("probe escolhido como jogo");
-    let avg = fps.iter().sum::<f64>() / fps.len().max(1) as f64;
     let want = 1000.0 / expected_avg_ms();
+    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let (fps, games) = sample_probe(&mut c, pid, 4, stop);
+    let g = games.last().expect("probe escolhido como jogo");
     println!(
-        "aprox. {}; FPS médio {avg:.2} (esperado {want:.2})",
-        g.approx
+        "com ETW: fonte {:?}; FPS médio {:.2} (esperado {want:.2})",
+        g.source,
+        avg(&fps)
     );
-    assert!(g.approx, "jogo aberto antes do pipe = aproximado");
-    assert!((avg - want).abs() < want * 0.1, "FPS {avg} × {want}");
+    assert_eq!(
+        g.source,
+        crate::model::FrameSource::Etw,
+        "{:?}",
+        c.sample().etw
+    );
+    assert!(
+        (avg(&fps) - want).abs() < want * 0.03,
+        "FPS {fps:?} × {want}"
+    );
+    assert!(
+        g.framegen.is_none(),
+        "sem marcadores do Reflex: sem frame gen"
+    );
+    c.disable_etw();
+    let (fps, games) = sample_probe(&mut c, pid, 4, stop);
+    let g = games.last().expect("probe escolhido como jogo");
+    println!(
+        "sem ETW: aprox. {}; FPS médio {:.2} (esperado {want:.2})",
+        g.approx(),
+        avg(&fps)
+    );
+    assert!(
+        g.approx(),
+        "jogo aberto antes do pipe, sem ETW = aproximado"
+    );
+    assert!(
+        (avg(&fps) - want).abs() < want * 0.1,
+        "FPS {fps:?} × {want}"
+    );
+}
+
+/// Frame gen 4x imitado pelo probe (marcadores do Reflex com o GUID e os campos reais): FPS
+/// apresentado = o do probe; real = 1/4; multiplicador 4.
+#[test]
+#[ignore = "hardware: terminal elevado, RTSS aberto + fps_probe compilado (janela D3D11, ~10 s)"]
+fn probe_frame_gen_4x() {
+    let ev = stop_event();
+    let stop = HANDLE(ev.as_raw_handle());
+    let mut c = RtssCollector::new(false, true);
+    if !rtss_running(&mut c) {
+        return;
+    }
+    let Some(probe) = start_probe_with(10, &["--fg", "4"]) else {
+        return;
+    };
+    let pid = probe.0.id();
+    let (fps, games) = sample_probe(&mut c, pid, 7, stop);
+    let want = 1000.0 / expected_avg_ms();
+    let fg: Vec<_> = games.iter().filter_map(|g| g.framegen).collect();
+    let g = games.last().expect("probe escolhido como jogo");
+    let avg = fps.iter().sum::<f64>() / fps.len().max(1) as f64;
+    let reals: Vec<f64> = fg.iter().map(|f| f.real_fps).collect();
+    let real = reals.iter().skip(2).sum::<f64>() / reals.len().saturating_sub(2).max(1) as f64;
+    println!(
+        "fonte {:?}; FPS {avg:.2} (esperado {want:.2}); real {real:.2} (esperado {:.2}); \
+         amostras com frame gen {}/{}",
+        g.source,
+        want / 4.0,
+        fg.len(),
+        games.len()
+    );
+    assert_eq!(g.source, crate::model::FrameSource::Etw);
+    assert!((avg - want).abs() < want * 0.03, "FPS {avg} × {want}");
+    assert!(
+        fg.len() + 4 >= games.len(),
+        "frame gen não detectado sempre"
+    );
+    assert!(fg.iter().all(|f| f.multiplier == Some(4)), "{fg:?}");
+    assert!(
+        (real - want / 4.0).abs() < want / 4.0 * 0.1,
+        "real {reals:?}"
+    );
 }
 
 /// Dois "jogos" D3D11 ao mesmo tempo (60 e 144 FPS): o FPS é o do que está em primeiro plano

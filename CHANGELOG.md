@@ -18,6 +18,14 @@ Todas as mudanças relevantes do projeto. Formato baseado em
   executável e os módulos saem dele (lidos na memória). Depois da troca, o wintop reabre no
   mesmo console, com o executável novo travado e conferido até o reinício (na cópia portátil,
   a pasta é do usuário). Opção `check_updates` no `config.toml`.
+- FPS por ETW (a lógica do PresentMon, enxuta): DXGI `Present_Start` do jogo com filtro de
+  PID, frametime exato também para jogos abertos antes do wintop ("ETW: exact"). O pipe do RTSS
+  e a Shared Memory ficam de reserva (Vulkan, OpenGL, D3D9 ou ETW indisponível); o RTSS continua
+  escolhendo o jogo e dando API, resolução e tempo de GPU.
+- Frame generation (DLSS FG): pelos marcadores Reflex do `PCLStatsTraceLoggingProvider`, o
+  cabeçalho do gráfico mostra "FPS 190 · real 47 (4x)" e os frames reais aparecem em tom escuro
+  dentro do gráfico de FPS. `--check` informa a sessão ETW e o FPS real.
+- `fps_probe --fg N` imita um jogo com frame gen Nx (marcadores do Reflex) para os testes.
 - Releases com `<zip>.sig` (assinatura ed25519 feita no workflow, conferida antes de anexar).
 
 ## [1.1.1] - 2026-11-22

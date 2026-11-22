@@ -483,13 +483,14 @@ fn fps_report(r: &mut Report, f: &Fps) {
     r.line("Frametime pipe", &f.pipe, |(n, c)| {
         format!("{n} instances, {c} clients")
     });
+    r.line("ETW frames", &f.etw, ToString::to_string);
     match &f.game {
         Err(e) => r.line("Game", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(g) => {
-            let approx = if g.approx {
-                " (approx.: game opened before wintop)"
-            } else {
-                ""
+            let approx = match g.source {
+                crate::model::FrameSource::Approx => " (approx.: game opened before wintop)",
+                crate::model::FrameSource::Pipe => " (RTSS pipe)",
+                crate::model::FrameSource::Etw => " (ETW)",
             };
             r.subject(&format!(
                 "Game: {} (PID {}, {}){approx}",
@@ -497,6 +498,12 @@ fn fps_report(r: &mut Report, f: &Fps) {
             ));
             r.line("  Resolution", &g.resolution, |(x, y)| format!("{x}x{y}"));
             r.line("  FPS", &g.fps, |v| num(*v, 1));
+            if let Some(fg) = &g.framegen {
+                let mult = fg.multiplier.map_or(String::new(), |m| format!(" ({m}x)"));
+                r.line("  Real FPS (frame gen)", &Ok(fg.real_fps), |v| {
+                    format!("{}{mult}", num(*v, 1))
+                });
+            }
             r.line(
                 "  Frametime avg / min / max",
                 &g.frametime,

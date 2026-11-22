@@ -315,8 +315,12 @@ const PT_BR: &[(&str, &str)] = &[
         "disco com o sistema / com arquivo de paginação",
     ),
     (
-        "per-frame times from RTSS; approx = shared-memory sampling",
-        "tempos por frame do RTSS; aprox. = amostragem da memória compartilhada",
+        "per frame: ETW or RTSS pipe (exact); approx = shared-memory sampling",
+        "por frame: ETW ou pipe do RTSS (exatos); aprox. = memória compartilhada",
+    ),
+    (
+        "frames rendered by the game; the rest are generated (frame gen), darker",
+        "frames renderizados pelo jogo; o resto é gerado (frame gen), mais escuro",
     ),
     (
         "frametime; average FPS of the slowest 1% and 0.1% frames",
@@ -366,6 +370,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("lows over 60 s", "lows dos últimos 60 s"),
     ("session min · max (r resets)", "sessão mín · máx (r zera)"),
     ("pipe: exact", "pipe: exato"),
+    ("ETW: exact", "ETW: exato"),
     (
         "approx. (game opened before wintop)",
         "aprox. (jogo aberto antes do wintop)",

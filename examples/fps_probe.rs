@@ -9,9 +9,21 @@
 //! - 1% e 0,1% low = 1000 / S quando os engasgos são >= 1% dos frames (N <= 100).
 //!
 //! Uso: `cargo run --release --example fps_probe -- [--fps 100] [--stutter-every 100]
-//! [--stutter-ms 50] [--vram-mb 256] [--seconds 30] [--freeze-at 8 --freeze-ms 1500]`
+//! [--stutter-ms 50] [--vram-mb 256] [--seconds 30] [--freeze-at 8 --freeze-ms 1500] [--fg 4]`
+//!
+//! `--fg N` imita um jogo com Reflex e frame gen Nx: emite os marcadores do
+//! `PCLStatsTraceLoggingProvider` (mesmo nome, GUID e campos do `pclstats.h` da NVIDIA) com um
+//! `SIMULATION_START` a cada N frames apresentados e o `NUM_PRESENTS_IN_BATCH` (22) = N.
 
 use std::time::{Duration, Instant};
+
+use tracelogging as tlg;
+
+tlg::define_provider!(
+    PCL,
+    "PCLStatsTraceLoggingProvider",
+    id("0d216f06-82a6-4d49-bc4f-8f38ae56efab")
+);
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -48,6 +60,8 @@ struct Args {
     /// Um congelamento único de `freeze_ms` aos `freeze_at` segundos (0 = nenhum).
     freeze_at: f64,
     freeze_ms: f64,
+    /// Frame gen Nx imitado pelos marcadores do Reflex (0 = sem marcadores).
+    fg: u32,
 }
 
 fn num<T: std::str::FromStr>(key: &str, val: &str) -> T {
@@ -64,6 +78,7 @@ fn args() -> Args {
         seconds: 30.0,
         freeze_at: 0.0,
         freeze_ms: 0.0,
+        fg: 0,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     for p in v.chunks(2) {
@@ -76,6 +91,7 @@ fn args() -> Args {
             "--seconds" => a.seconds = num(&p[0], val),
             "--freeze-at" => a.freeze_at = num(&p[0], val),
             "--freeze-ms" => a.freeze_ms = num(&p[0], val),
+            "--fg" => a.fg = num(&p[0], val),
             o => panic!("unknown argument {o}"),
         }
     }
@@ -111,8 +127,30 @@ fn wait_until(timer: windows::Win32::Foundation::HANDLE, deadline: Instant) {
     }
 }
 
+/// Marcadores do Reflex de um frame apresentado: um frame real a cada `fg`.
+fn pcl_markers(frame: u64, fg: u32) {
+    let fg = u64::from(fg);
+    if !frame.is_multiple_of(fg) {
+        return;
+    }
+    let id = frame / fg;
+    let value = fg as i32;
+    tlg::write_event!(PCL, "PCLStatsEvent", u32("Marker", &0), u64("FrameID", &id));
+    tlg::write_event!(
+        PCL,
+        "PCLStatsEventV3",
+        u32("Marker", &22),
+        u64("FrameID", &id),
+        i32("Value", &value),
+    );
+}
+
 fn main() -> windows::core::Result<()> {
     let a = args();
+    if a.fg > 0 {
+        // SAFETY: executável (não DLL): o provider vive até o fim do processo.
+        unsafe { PCL.register() };
+    }
     let t = 1000.0 / a.fps;
     let n = f64::from(a.stutter_every.max(1));
     let avg = ((n - 1.0) * t + a.stutter_ms) / n;
@@ -265,6 +303,9 @@ fn main() -> windows::core::Result<()> {
                 }
             }
             wait_until(timer, next);
+            if a.fg > 0 {
+                pcl_markers(frame, a.fg);
+            }
             let _ = swap.Present(0, DXGI_PRESENT(0));
         }
         println!("{frame} frames em {:.2} s", start.elapsed().as_secs_f64());

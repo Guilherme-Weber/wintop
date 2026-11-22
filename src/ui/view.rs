@@ -20,8 +20,8 @@ use super::widgets::{Graph, GraphColor, Meter, Segmented};
 use crate::fmt::{bits, bytes, num};
 use crate::i18n::tr;
 use crate::model::{
-    Disk, Fast, Fps, Gpu, GpuProc, Memory, Metric, Missing, Nic, Proc, Slow, View, VramBreakdown,
-    VramKind,
+    Disk, Fast, Fps, FrameSource, Gpu, GpuProc, Memory, Metric, Missing, Nic, Proc, Slow, View,
+    VramBreakdown, VramKind,
 };
 use crate::win::printable;
 
@@ -158,6 +158,8 @@ pub struct State {
     send: HashMap<String, Series>,
     recv: HashMap<String, Series>,
     game_fps: Series,
+    /// FPS real com frame gen (NaN sem frame gen), alinhado com `game_fps`.
+    game_real: Series,
     game_ft: Series,
     /// FPS mais recente e o pior frametime (ms) desde o último tick da UI.
     pending_fps: Option<f64>,
@@ -456,6 +458,7 @@ impl State {
     pub fn reset_session(&mut self) {
         self.session = Session::default();
         self.game_fps = Series::default();
+        self.game_real = Series::default();
         self.game_ft = Series::default();
         self.pending_fps = None;
         self.pending_ft = None;
@@ -595,6 +598,9 @@ impl State {
         if game.is_some() || fps.is_some() || ft.is_some() {
             let now = game.and_then(|g| g.fps.as_ref().ok().copied());
             self.game_fps.push(fps.or(now).unwrap_or(0.0));
+            // Frames reais (frame gen): a parte de baixo do gráfico de FPS, mais escura.
+            let real = game.and_then(|g| g.framegen).map(|fg| fg.real_fps);
+            self.game_real.push(real.unwrap_or(f64::NAN));
             self.game_ft.push(ft.unwrap_or(f64::NAN));
         }
         self.fast = Some(f);
@@ -1083,8 +1089,12 @@ const HELP: &[(&str, &str)] = &[
         "frametime; average FPS of the slowest 1% and 0.1% frames",
     ),
     (
-        "pipe: exact",
-        "per-frame times from RTSS; approx = shared-memory sampling",
+        "ETW, pipe",
+        "per frame: ETW or RTSS pipe (exact); approx = shared-memory sampling",
+    ),
+    (
+        "real",
+        "frames rendered by the game; the rest are generated (frame gen), darker",
     ),
     (
         "red text",
@@ -3727,10 +3737,11 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 g.api,
                 g.pid
             );
-            let source = match (g.approx, pipe_failed) {
-                (false, _) => "pipe: exact",
-                (true, false) => "approx. (game opened before wintop)",
-                (true, true) => "approx. (frametime pipe failed)",
+            let source = match (g.source, pipe_failed) {
+                (FrameSource::Etw, _) => "ETW: exact",
+                (FrameSource::Pipe, _) => "pipe: exact",
+                (FrameSource::Approx, false) => "approx. (game opened before wintop)",
+                (FrameSource::Approx, true) => "approx. (frametime pipe failed)",
             };
             (title, source)
         }
@@ -3771,6 +3782,13 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ],
         (None, Ok(_)) => Vec::new(),
     };
+    // Falha do ETW (o FPS cai para o pipe do RTSS): linha própria, só quando acontece.
+    if matches!(fps.etw, Err(Missing::Fail(_))) {
+        lines.push(Line::from(vec![
+            label("ETW frames "),
+            metric(&fps.etw, |_| String::new()),
+        ]));
+    }
     // Falha do pipe (outro servidor ocupando o nome): linha própria, só quando acontece.
     if pipe_failed {
         lines.push(Line::from(vec![
@@ -3804,16 +3822,28 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .refresh_hz
         .map_or_else(|| fps_ceiling(st.game_fps.max_of(n)), f64::from);
     let ceil_label = format!("{} ", num(ceil, 0));
+    let mut fps_head = vec![
+        label("FPS "),
+        // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
+        g.map_or_else(idle, |g| match &g.fps {
+            Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
+            Err(Missing::Neutral(_)) => label("-"),
+            Err(Missing::Fail(_)) => failed_span(),
+        }),
+    ];
+    // Frame gen: "FPS 190 · real 47 (4x)" (o real em tom escuro, como no gráfico).
+    if let Some(fg) = g.and_then(|g| g.framegen) {
+        fps_head.push(label(" · real "));
+        fps_head.push(
+            Span::raw(num(fg.real_fps, 0))
+                .style(Style::new().fg(crate::ui::widgets::darker(th().fps))),
+        );
+        if let Some(m) = fg.multiplier {
+            fps_head.push(label(&format!(" ({m}x)")));
+        }
+    }
     let head = head_fit(
-        vec![
-            label("FPS "),
-            // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
-            g.map_or_else(idle, |g| match &g.fps {
-                Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
-                Err(Missing::Neutral(_)) => label("-"),
-                Err(Missing::Fail(_)) => failed_span(),
-            }),
-        ],
+        fps_head,
         minmax(st.session.fps, |v| num(v, 0)),
         fps_area.width.saturating_sub(ceil_label.len() as u16 + 2),
     );
@@ -3832,6 +3862,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         fps_area,
     );
     let data = st.game_fps.over(n, ceil);
+    let real = st.game_real.over(n, ceil);
     let gr = Rect::new(
         fps_area.x,
         fps_area.y + 1,
@@ -3847,7 +3878,8 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 low: th().fps_low,
                 low_at: FPS_LOW / ceil,
             },
-        ),
+        )
+        .with_under(&real),
         gr.intersection(fps_area),
     );
 
@@ -3968,9 +4000,23 @@ mod game_graph_tests {
             g.fps = crate::model::neutral("no frames in the last second");
             g.peak_ms = None;
         }
-        st.push_fps(fps);
+        st.push_fps(fps.clone());
         st.push_fast(crate::ui::tests::fast(3));
         assert_eq!(st.game_fps.values().last(), Some(&0.0));
         assert_eq!(st.game_ft.values().len(), 4);
+        // FPS real (frame gen) alinhado com o FPS: lacuna sem frame gen, valor com ele.
+        if let Ok(g) = &mut fps.game {
+            g.fps = Ok(190.0);
+            g.framegen = Some(crate::model::FrameGen {
+                real_fps: 47.0,
+                multiplier: Some(4),
+            });
+        }
+        st.push_fps(fps);
+        st.push_fast(crate::ui::tests::fast(4));
+        let real = st.game_real.values().to_vec();
+        assert_eq!(real.len(), st.game_fps.values().len());
+        assert!(real[..4].iter().all(|v| v.is_nan()), "{real:?}");
+        assert_eq!(real[4], 47.0);
     }
 }
