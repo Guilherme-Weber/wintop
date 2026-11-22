@@ -1,0 +1,29 @@
+name: fuzz
+
+# Rodada longa do fuzz dos parsers (src/fuzz.rs) no perfil `fuzz` (otimizado, com checagem de
+# overflow): toda semana e quando disparado à mão. A suíte normal da CI roda 20 mil iterações
+# por alvo; aqui são 2 milhões, com uma semente diferente a cada execução (o número da execução,
+# impresso numa falha para reproduzir).
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Fuzz longo
+        env:
+          WINTOP_FUZZ_ITERS: '2000000'
+          WINTOP_FUZZ_SEED: ${{ github.run_id }}
+        run: cargo test --profile fuzz --locked fuzz_

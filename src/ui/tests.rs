@@ -252,6 +252,14 @@ fn geral_com_jogo() {
 }
 
 #[test]
+fn geral_conhost_120x30() {
+    // Tamanho padrão do console clássico, onde o atalho sem UAC abre o wintop.
+    let mut st = filled();
+    st.clock = "10:33:28".into();
+    insta::assert_snapshot!(render(&mut st, 120, 30));
+}
+
+#[test]
 fn geral_1080p() {
     // Tamanho da janela do usuário: Windows Terminal maximizado num monitor 1080p.
     let mut st = filled();

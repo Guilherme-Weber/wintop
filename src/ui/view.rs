@@ -1364,20 +1364,24 @@ fn draw_core_grid(
     let cw = area.width / cols as u16;
     let ch = area.height / rows as u16;
     if cw < 9 || ch < 2 {
-        // Lista compacta: todos os lógicos, quebrando linha.
+        // Lista compacta: todos os lógicos, quebrando linha só entre um lógico e outro (cada
+        // grupo começa com espaço; uso e clock ficam no mesmo trecho, que nunca é partido).
         let spans: Vec<Span<'static>> = per
             .iter()
             .enumerate()
             .flat_map(|(i, v)| {
+                // Sem preenchimento à esquerda: um espaço no começo abriria outro grupo.
+                let pct = format!("{}%", num(*v, 0));
                 [
-                    label(&format!("C{i} ")),
-                    text(format!("{:>3}%", num(*v, 0))),
-                    label(&ghz(i).map_or_else(|| "  ".into(), |g| format!(" {g}  "))),
+                    label(&format!("  C{i} ")),
+                    text(ghz(i).map_or_else(|| pct.clone(), |g| format!("{pct} {g}"))),
                 ]
             })
             .collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: true }),
+        put(
+            frame,
+            Paragraph::new(wrap(spans, area.width, 0, 0)),
+            area,
             area,
         );
         return;
