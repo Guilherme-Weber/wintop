@@ -6,10 +6,45 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Adicionado
+
+- Várias GPUs: a tecla `g` troca a GPU das abas Geral e GPU; a aba Sensores e o `--check`
+  mostram todas.
+- GPUs sem NVML (AMD, Intel, ou NVIDIA com o NVML em falha): nome, driver, uso, encoder,
+  decoder e VRAM pelo DXGI e pelos contadores do Windows (mesma conta do Gerenciador de
+  Tarefas); os campos só do NVML aparecem numa linha com o motivo.
+- Idioma da interface: `language = "pt-BR"` no `config.toml` (português do Brasil, com vírgula
+  decimal); `en-US` continua o padrão.
+- Aba GPU com ordenação por coluna (`←`/`→`, `i`) e filtro (`/`), como a aba Processos.
+- Pausa da tela (`p` ou Espaço), com aviso visível; a coleta continua.
+- Ajuda na tela (`?`), com as teclas e as siglas.
+- Aba Processos: árvore de processos pais e filhos (`e`) e encerrar o processo selecionado
+  (`Del`), com confirmação.
+- Mouse: clique nas abas, nas linhas e nos cabeçalhos (ordena); rodinha rola as listas (opção
+  `mouse` no config).
+- Aba Geral: ampliar uma caixa para a aba inteira (`z`); aba Sensores com rolagem quando não
+  cabe.
+- Discos: IOPS, fila e alerta de falha prevista do SMART (sem acordar HDD em repouso). Rede:
+  erros de pacote.
+- CPU: clock por núcleo na grade e pico e média na linha de velocidade.
+- `config.toml` ao vivo (mudanças valem em até 2 s, inclusive a lista de apps ignorados do
+  RTSS), limite de alerta do frametime (`frametime_alert_ms`) e unidade da rede (`net_unit`).
+- `--check`: auditoria das permissões das pastas do RTSS, do PawnIO e da cópia instalada, e saída
+  `--json`. `--install` atualiza a cópia instalada mesmo com o wintop aberto.
+- Console clássico maximizado ao abrir (`start_maximized`) e título na janela; ícone do
+  programa.
+- CI: pacote em toda execução, fuzz longo semanal e snapshots em 120x30.
+
 ### Alterado
 
 - Abas Processos e GPU: a seleção fica na linha (os processos mudam embaixo dela) em vez de
   seguir o processo, que fazia a lista pular a cada reordenação por CPU.
+- Instância única num namespace privado de Administradores: um processo sem elevação não
+  consegue mais impedir o wintop de abrir.
+- Aba Geral: CPU e memória num bloco só, rede compacta, gráficos com o gradiente lavanda,
+  violeta e índigo, e várias melhorias de legibilidade (nada cortado em terminais pequenos;
+  barra do topo e rodapé encolhem por prioridade).
+- Leituras de arrays do PDH reaproveitam o buffer entre as coletas (menos alocações).
 
 ## [1.0.0] - 2026-11-21
 
