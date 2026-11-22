@@ -575,6 +575,8 @@ mod tests {
             "CPU {cpu:?} (média {avg:.3}%), WS privado máx. {} MB",
             ws >> 20
         );
+        // Sem nenhuma medida o orçamento passaria com 0: o consumo tem de ter sido lido.
+        assert!(!cpu.is_empty() && ws > 0, "consumo próprio não medido");
         assert!(avg < 0.3, "{avg}");
         assert!(ws < 45 << 20, "{} MB", ws >> 20);
     }

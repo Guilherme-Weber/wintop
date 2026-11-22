@@ -285,12 +285,34 @@ fn bordas_intactas(st: &mut State, w: u16, h: u16) {
     let mut t = Terminal::new(TestBackend::new(w, h)).expect("terminal de teste");
     t.draw(|f| view::draw(f, st)).expect("desenho");
     let buf = t.backend().buffer();
+    let at = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+    let screen = || {
+        (0..h)
+            .map(|y| (0..w).map(|x| at(x, y)).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     for y in 0..h {
         for x in 0..w {
-            let s = buf[(x, y)].symbol();
-            // Cantos só aparecem em cantos: se um texto sobrescrevesse uma borda, sobraria
-            // borda vertical sem o par do outro lado; aqui basta não haver lixo de controle.
+            let s = at(x, y);
             assert!(!s.chars().any(char::is_control), "({x},{y}) {s:?}");
+            // Laterais intactas: abaixo de cada canto de cima, só `│` até o canto de baixo do
+            // mesmo lado (um texto por cima da borda quebraria a coluna).
+            let bottom = match s.as_str() {
+                "╭" => "╰",
+                "╮" => "╯",
+                _ => continue,
+            };
+            let mut yy = y + 1;
+            while yy < h && at(x, yy) == "│" {
+                yy += 1;
+            }
+            assert!(
+                yy < h && at(x, yy) == bottom,
+                "borda quebrada abaixo de ({x},{y}) em {w}x{h}: {:?}\n{}",
+                if yy < h { at(x, yy) } else { "fim".into() },
+                screen()
+            );
         }
     }
 }

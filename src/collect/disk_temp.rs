@@ -228,7 +228,8 @@ fn pool_temp(pools: usize, members: &[&Metric<i16>], unknown_asleep: bool) -> Me
 fn read_one(d: &mut Inventory, st: &mut State) {
     // Handle guardado morto (disco removido, talvez outro no mesmo número): não lê nada por
     // ele nem por um handle novo (seria o outro disco com o modelo antigo).
-    if d.handle.is_some() && !d.alive() {
+    // Sem handle guardado (USB), `alive` confere o modelo: outro disco no mesmo número.
+    if !d.alive() {
         d.lost = true;
         d.handle = None;
         st.value = fail("disk removed");

@@ -394,11 +394,18 @@ impl Inventory {
     /// handle já aberto (sem esperar o `RETRY_ASLEEP`).
     /// O disco ainda é o mesmo e está presente. Com handle guardado: ele ainda responde (se
     /// outro disco pegou o número depois de uma remoção, o número abre, mas o handle velho não).
-    /// Sem handle guardado (USB): o número ainda abre.
+    /// Sem handle guardado (USB): o número ainda abre e é o mesmo modelo (outro disco USB
+    /// ligado no mesmo número entre duas leituras é redescoberto, não lido com o nome antigo).
     pub(super) fn alive(&self) -> bool {
         match &self.handle {
             Some(h) => h.property(PROP_DEVICE).is_ok(),
-            None => Handle::open(self.number, 0).is_some(),
+            None => Handle::open(self.number, 0).is_some_and(|h| {
+                let now = h.property(PROP_DEVICE).ok().and_then(|d| model_name(&d));
+                match (&self.model, now) {
+                    (Ok(m), Some(n)) => *m == n,
+                    _ => true,
+                }
+            }),
         }
     }
 
@@ -628,6 +635,14 @@ impl DiskCollector {
         for inv in &mut self.disks {
             inv.retry_if_asleep();
             let act = inv.activity();
+            // Leu ou gravou: o disco está girando. Capacidade e layout na hora, sem esperar o
+            // RETRY_ASLEEP (e sem acordar um disco parado: só depois de tráfego real).
+            if inv.asleep_since.is_some()
+                && act.as_ref().is_ok_and(|(_, r, w, _)| *r > 0.0 || *w > 0.0)
+                && let Some(meta) = Handle::open(inv.number, 0)
+            {
+                inv.read_details(&meta);
+            }
             if inv.lost {
                 self.discovered = None;
             }

@@ -80,6 +80,28 @@ fn match_adapter(adapters: &[Adapter], pci_device_id: u32, subsys: Option<u32>) 
     }
 }
 
+/// Adaptador DXGI da GPU `index` do NVML (pelo PCI).
+fn adapter_of(n: &Nvml, index: u32, adapters: &Result<Vec<Adapter>, String>) -> Metric<Adapter> {
+    let d = n
+        .device_by_index(index)
+        .map_err(|e| Missing::Fail(format!("NVML: {e}")))?;
+    let p = d
+        .pci_info()
+        .map_err(|e| Missing::Fail(format!("NVML pci_info: {e}")))?;
+    let a = adapters.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
+    match_adapter(a, p.pci_device_id, p.pci_sub_system_id)
+}
+
+/// Um reset do driver (TDR), uma atualização dele ou uma eGPU reconectada trocam o LUID do
+/// adaptador: as instâncias do PDH somem do prefixo guardado. A associação é refeita, no máximo
+/// a cada `REMATCH_EVERY`.
+const REMATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const NO_PDH_INSTANCE: &str = "adapter has no PDH instance";
+
+fn lost_adapter<T>(m: &Metric<T>) -> bool {
+    matches!(m, Err(Missing::Fail(c)) if c == NO_PDH_INSTANCE)
+}
+
 /// Prefixo da instância PDH de um LUID (comparado sem diferenciar maiúsculas).
 fn luid_prefix(high: i32, low: u32) -> String {
     format!("luid_0x{:08x}_0x{low:08x}_phys_", high.cast_unsigned())
@@ -159,6 +181,8 @@ pub struct GpuCollector {
     query: Result<Query, String>,
     dedicated: Slot,
     shared: Slot,
+    /// Última nova associação NVML-DXGI (ver `REMATCH_EVERY`).
+    rematched: Instant,
 }
 
 impl GpuCollector {
@@ -178,15 +202,8 @@ impl GpuCollector {
                 let gpus = (0..count)
                     .filter_map(|i| n.device_by_index(i).ok().map(|d| (i, d)))
                     .map(|(index, d)| {
-                        let pci = d.pci_info();
-                        let adapter = match (&adapters, pci) {
-                            (Err(e), _) => fail(e.clone()),
-                            (_, Err(e)) => fail(format!("NVML pci_info: {e}")),
-                            (Ok(a), Ok(p)) => {
-                                match_adapter(a, p.pci_device_id, p.pci_sub_system_id)
-                                    .map(|a| (luid_prefix(a.luid_high, a.luid_low), a.shared_total))
-                            }
-                        };
+                        let adapter = adapter_of(n, index, &adapters)
+                            .map(|a| (luid_prefix(a.luid_high, a.luid_low), a.shared_total));
                         Static {
                             index,
                             name: nv(d.name()),
@@ -206,6 +223,17 @@ impl GpuCollector {
             query,
             dedicated,
             shared,
+            rematched: Instant::now(),
+        }
+    }
+
+    /// Refaz a associação das GPUs que perderam a instância do PDH (LUID novo).
+    fn rematch(&mut self, n: &Nvml) {
+        self.rematched = Instant::now();
+        let adapters = dxgi_adapters();
+        for s in &mut self.gpus {
+            s.adapter = adapter_of(n, s.index, &adapters)
+                .map(|a| (luid_prefix(a.luid_high, a.luid_low), a.shared_total));
         }
     }
 
@@ -238,7 +266,7 @@ impl GpuCollector {
                     let items = items.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
                     sum_for(items, prefix)
                         .map(|v| v as u64)
-                        .map_or_else(|| fail("adapter has no PDH instance"), Ok)
+                        .map_or_else(|| fail(NO_PDH_INSTANCE), Ok)
                 };
                 let shared_total = s.adapter.as_ref().map_or(0, |a| a.1);
                 let mut g = read_device(nvml, s.index);
@@ -249,7 +277,16 @@ impl GpuCollector {
                 g.shared = vram(&shared).map(|u| (u, shared_total));
                 g
             })
-            .collect();
+            .collect::<Vec<Gpu>>();
+        // LUID trocado (reset do driver): associa de novo para a próxima coleta.
+        if out.iter().any(|g| lost_adapter(&g.dedicated))
+            && self.rematched.elapsed() >= REMATCH_EVERY
+        {
+            let shared_nvml = self.nvml.clone();
+            if let Ok(n) = shared_nvml.as_ref() {
+                self.rematch(n);
+            }
+        }
         Ok(out)
     }
 }
@@ -347,6 +384,16 @@ pub struct GpuSlowCollector {
     engines: EngineCollector,
     /// Última leitura de PCIe por GPU: (instante, TX, RX).
     pcie: HashMap<u32, (Instant, Metric<u64>, Metric<u64>)>,
+    /// Última nova associação NVML-DXGI (ver `REMATCH_EVERY`).
+    rematched: Instant,
+}
+
+/// Prefixo PDH (LUID) de cada GPU do NVML.
+fn slow_luids(n: &Nvml) -> Vec<Metric<String>> {
+    let adapters = dxgi_adapters();
+    (0..n.device_count().unwrap_or(0))
+        .map(|i| adapter_of(n, i, &adapters).map(|a| luid_prefix(a.luid_high, a.luid_low)))
+        .collect()
 }
 
 /// Intervalo mínimo entre leituras de PCIe (o piso da thread lenta).
@@ -354,26 +401,14 @@ const PCIE_EVERY: std::time::Duration = std::time::Duration::from_millis(1900);
 
 impl GpuSlowCollector {
     pub fn new(nvml: SharedNvml) -> Self {
-        let adapters = dxgi_adapters();
         let luids = match nvml.as_ref() {
             Err(e) => vec![fail(e.clone())],
-            Ok(n) => (0..n.device_count().unwrap_or(0))
-                .map(|i| {
-                    let d = n
-                        .device_by_index(i)
-                        .map_err(|e| Missing::Fail(format!("NVML: {e}")))?;
-                    let p = d
-                        .pci_info()
-                        .map_err(|e| Missing::Fail(format!("NVML pci_info: {e}")))?;
-                    let a = adapters.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
-                    match_adapter(a, p.pci_device_id, p.pci_sub_system_id)
-                        .map(|a| luid_prefix(a.luid_high, a.luid_low))
-                })
-                .collect(),
+            Ok(n) => slow_luids(n),
         };
         Self {
             nvml,
             luids,
+            rematched: Instant::now(),
             vram: VramCollector::new(),
             engines: EngineCollector::new(),
             pcie: HashMap::new(),
@@ -486,6 +521,11 @@ impl GpuSlowCollector {
                 }
             });
         }
+        // LUID trocado (reset do driver): associa de novo para a próxima coleta.
+        if out.iter().any(|g| lost_adapter(&g.vram)) && self.rematched.elapsed() >= REMATCH_EVERY {
+            self.rematched = Instant::now();
+            self.luids = slow_luids(nvml);
+        }
         Ok(out)
     }
 }
@@ -559,13 +599,29 @@ mod tests {
             match_adapter(&twins, (0x2C05 << 16) | 0x10DE, Some(1)),
             Err(Missing::Neutral(_))
         ));
-        // Mesmo LUID repetido (fora de ordem) continua sendo um adaptador só.
-        let dup = [
+        // Mesmo LUID repetido (o DXGI lista o adaptador mais de uma vez) é um adaptador só.
+        let dup = [adapter(0x2C05, 1, 7), adapter(0x2C05, 1, 7)];
+        let a = match_adapter(&dup, (0x2C05 << 16) | 0x10DE, None).expect("um adaptador");
+        assert_eq!(a.luid_low, 7);
+        // Dois LUIDs diferentes (com repetição fora de ordem) continuam ambíguos: neutro.
+        let two = [
             adapter(0x2C05, 1, 7),
             adapter(0x2C05, 1, 8),
             adapter(0x2C05, 1, 7),
         ];
-        assert!(match_adapter(&dup, (0x2C05 << 16) | 0x10DE, None).is_err());
+        assert!(matches!(
+            match_adapter(&two, (0x2C05 << 16) | 0x10DE, None),
+            Err(Missing::Neutral(_))
+        ));
+    }
+
+    /// Só a falha "sem instância do PDH" (LUID trocado) refaz a associação.
+    #[test]
+    fn luid_perdido_so_pela_falha_do_pdh() {
+        assert!(lost_adapter::<u64>(&fail(NO_PDH_INSTANCE)));
+        assert!(!lost_adapter::<u64>(&fail("NVML: unknown error")));
+        assert!(!lost_adapter::<u64>(&neutral("several identical GPUs")));
+        assert!(!lost_adapter(&Ok(1u64)));
     }
 
     #[test]

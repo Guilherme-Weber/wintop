@@ -288,7 +288,7 @@ impl VramCollector {
             .map(|(_, v)| *v as u64)
             .collect();
         if mine.is_empty() {
-            return fail("adapter has no PDH instance");
+            return fail(super::gpu::NO_PDH_INSTANCE);
         }
         let adapter_used = mine.iter().fold(0u64, |a, v| a.saturating_add(*v));
         let list: Vec<(u32, u64)> = per_process.into_iter().collect();
