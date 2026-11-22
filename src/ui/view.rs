@@ -753,14 +753,16 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
+    // Em cima, CPU + memória (como GPU + VRAM ao lado); embaixo, rede compacta à esquerda e
+    // discos sobre o jogo à direita.
     let [top, bottom] =
-        Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(body);
+        Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
     let [cpu, gpu] =
         Layout::horizontal([Constraint::Percentage(59), Constraint::Percentage(41)]).areas(top);
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(bottom);
-    let mem_h = mem_text(st, left.width).map_or(8, |t| t.height());
-    let [mem, net] = Layout::vertical([Constraint::Length(mem_h), Constraint::Min(4)]).areas(left);
+    let [net, right] =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).areas(bottom);
+    // Linhas da memória dentro da caixa da CPU (sem as bordas, que são da caixa).
+    let mem_rows = mem_text(st, cpu.width).map_or(2, |t| t.height().saturating_sub(2));
     // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
     // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
     let disk_rows =
@@ -768,9 +770,8 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
-    draw_cpu(frame, cpu, st);
+    draw_cpu(frame, cpu, st, mem_rows);
     draw_gpu(frame, gpu, st);
-    draw_memory(frame, mem, st);
     draw_net(frame, net, st);
     draw_disks(frame, disks, st);
     draw_game(frame, game, st);
@@ -1157,9 +1158,17 @@ fn total_width(w: u16) -> u16 {
     (w * 9 / 20).max(16).min(w.saturating_sub(16))
 }
 
-fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+/// Caixa da CPU com a memória nas últimas `mem_rows` linhas (depois de um divisor).
+fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State, mem_rows: u16) {
     let Some(Ok(c)) = st.fast.as_ref().map(|f| &f.cpu) else {
-        empty_box(frame, area, "cpu", st.fast.as_ref().map(|f| &f.cpu));
+        // CPU sem dado: o estado dela em cima, a memória continua embaixo.
+        let [top, bottom] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(mem_rows + 2)]).areas(area);
+        empty_box(frame, top, "cpu", st.fast.as_ref().map(|f| &f.cpu));
+        let block = boxed("memory", "");
+        let inner = block.inner(bottom);
+        frame.render_widget(block, bottom);
+        draw_memory_body(frame, inner, st);
         return;
     };
     let name = c
@@ -1174,8 +1183,29 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         boxed(&name, &format!("total {secs}s · {per_len} logical")),
         c.name.as_ref().err(),
     );
-    let inner = block.inner(area);
+    let whole = block.inner(area);
     frame.render_widget(block, area);
+    // Memória embaixo, depois de um divisor rotulado (como a VRAM na caixa da GPU).
+    let [inner, divider, mem] = Layout::vertical([
+        Constraint::Min(4),
+        Constraint::Length(1),
+        Constraint::Length(mem_rows),
+    ])
+    .areas(whole);
+    put(
+        frame,
+        Paragraph::new(Line::from(vec![
+            Span::styled("── ", Style::new().fg(th().border)),
+            Span::styled("memory ", Style::new().fg(th().title)),
+            Span::styled(
+                "─".repeat(usize::from(divider.width.saturating_sub(10))),
+                Style::new().fg(th().border),
+            ),
+        ])),
+        divider,
+        whole,
+    );
+    draw_memory_body(frame, mem, st);
     // Linhas de sensores e topologia.
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
     // Clock: média de todos os lógicos e o pico (o lógico mais rápido agora).
@@ -2135,15 +2165,23 @@ fn mem_text(st: &State, width: u16) -> Option<MemText> {
     })
 }
 
-fn draw_memory(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+/// Memória no rodapé da caixa da CPU (como a VRAM na da GPU), em `inner` (sem moldura).
+fn draw_memory_body(frame: &mut Frame<'_>, inner: Rect, st: &State) {
     let mem = st.fast.as_ref().map(|f| &f.memory);
-    let (Some(Ok(m)), Some(t)) = (mem, mem_text(st, area.width)) else {
-        empty_box(frame, area, "mem", mem);
+    let (Some(Ok(m)), Some(t)) = (mem, mem_text(st, inner.width + 2)) else {
+        // Sem a memória: o estado (espera ou a falha com a causa) no lugar dela.
+        let msg = match mem {
+            Some(Err(e)) => vec![label("memory "), missing(e)],
+            _ => vec![label("memory: waiting for the first collection")],
+        };
+        put(
+            frame,
+            Paragraph::new(wrap(msg, inner.width, 0, 2)),
+            inner,
+            inner,
+        );
         return;
     };
-    let block = boxed("mem", "");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let ram = m.used.clone().and_then(|u| Ok((u, m.total.clone()?)));
     ram_bar(frame, inner, m, &ram);
     let mut y = 1u16;
@@ -2238,6 +2276,18 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
 
 // --- Rede ---
 
+/// Taxa de rede na unidade do config (bits por segundo, como o Task Manager, ou bytes).
+fn net_rate(st: &State, bits_per_s: f64) -> String {
+    if st.net_bytes {
+        format!("{}/s", bytes((bits_per_s / 8.0).max(0.0) as u64))
+    } else {
+        bits(bits_per_s)
+    }
+}
+
+/// Rede compacta: por placa, 1 linha de identificação (nome, descrição, link, erros) e 1 de
+/// taxas (↑/↓ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
+/// sobrando. Placas desconectadas numa linha só.
 fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let nics = st.fast.as_ref().map(|f| &f.nics);
     let Some(Ok(list)) = nics else {
@@ -2245,161 +2295,129 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         return;
     };
     let list: Vec<Nic> = list.clone();
-    let block = boxed("net", "mirrored ↑↓");
+    let block = boxed("net", "↑ send  ↓ receive");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Só o estado neutro ("disconnected") vai para a linha de desconectadas; falha aparece.
     let (down, up): (Vec<_>, Vec<_>) = list.iter().partition(|n| {
         matches!(n.link, Err(Missing::Neutral(_))) && !failed(&n.send) && !failed(&n.recv)
     });
-    // Placas que não cabem: a última linha avisa quantas ficaram de fora.
-    // Uma placa precisa de 2 linhas (cabeçalho + taxa); com menos, nenhuma cabe.
-    let fits = |reserved: u16| {
-        let room = inner.height.saturating_sub(reserved);
-        if room < 2 {
-            0
-        } else {
-            usize::from(room / 3).max(1)
+    // Linhas fixas por placa: identificação + taxas (que podem quebrar em duas, estreita).
+    let rate_lines = |n: &Nic| -> Vec<Line<'static>> {
+        let n_samples = usize::from(inner.width) * 2;
+        let peak =
+            |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples));
+        let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
+        let mut spans = Vec::new();
+        for (arrow, m, color, mm) in [
+            ("↑ ", &n.send, th().net_send, st.session.send.get(&n.alias)),
+            (
+                "  ↓ ",
+                &n.recv,
+                th().net_recv,
+                st.session.recv.get(&n.alias),
+            ),
+        ] {
+            spans.push(Span::styled(arrow, Style::new().fg(color)));
+            spans.push(metric(m, |v| net_rate(st, *v)));
+            if let Some((_, hi)) = mm.copied().and_then(MinMax::get) {
+                spans.push(label(&format!(" max {}", net_rate(st, hi))));
+            }
         }
+        spans.push(label(&format!("  scale {}", net_rate(st, scale))));
+        wrap(spans, inner.width, 0, 2)
     };
-    let mut reserved = u16::from(!down.is_empty());
-    let more = up.len() > fits(reserved);
-    if more && down.is_empty() {
-        reserved = 1;
+    let fixed: Vec<(usize, Vec<Line<'static>>)> = up.iter().map(|n| (1, rate_lines(n))).collect();
+    let need = |k: usize| -> u16 {
+        fixed
+            .iter()
+            .take(k)
+            .map(|(h, r)| (*h + r.len()) as u16)
+            .sum()
+    };
+    let reserved = u16::from(!down.is_empty());
+    let room = inner.height.saturating_sub(reserved);
+    let mut shown = up.len();
+    while shown > 0 && need(shown) > room.saturating_sub(u16::from(shown < up.len())) {
+        shown -= 1;
     }
-    let shown = up.len().min(fits(reserved));
-    let bottom = inner.y + inner.height.saturating_sub(reserved);
-    let per = (inner.height.saturating_sub(reserved) / (shown.max(1) as u16)).max(3);
-    const RATE_W: u16 = 34;
+    let more = shown < up.len();
+    let bottom_rows = reserved.max(u16::from(more));
+    let room = inner.height.saturating_sub(bottom_rows);
+    // Sobra repartida entre as placas como gráfico espelhado (só a partir de 2 linhas).
+    let spare = room.saturating_sub(need(shown));
+    let graph_h = if shown > 0 { spare / shown as u16 } else { 0 };
     let mut y = inner.y;
-    for n in up.iter().take(shown) {
-        if y + 2 > bottom {
-            break;
-        }
-        // Cabeçalho: alias (descrição) à esquerda, link à direita (na largura real dele).
-        // Erros de pacote do driver: só aparecem quando há algum (em vermelho), ou a causa
-        // se o contador falhou.
-        let mut link = Vec::new();
+    for (n, (_, rates)) in up.iter().zip(&fixed).take(shown) {
+        // Identificação: nome e descrição à esquerda, erros e link à direita.
+        let mut right = Vec::new();
         match &n.errors {
             Ok((0, 0)) => {}
-            Ok((rx, tx)) => link.push(Span::styled(
+            Ok((rx, tx)) => right.push(Span::styled(
                 format!("errors ↓{rx} ↑{tx}  "),
                 Style::new().fg(th().fail),
             )),
-            Err(e) => link.extend([label("errors "), missing(e), Span::raw("  ")]),
+            Err(e) => right.extend([label("errors "), missing(e), Span::raw("  ")]),
         }
-        link.extend([label("link "), metric(&n.link, |v| bits(*v as f64))]);
-        let link = Line::from(link);
-        let link_w = (link.width() as u16).min(inner.width);
+        right.extend([label("link "), metric(&n.link, |v| bits(*v as f64))]);
+        let right = Line::from(right);
+        let rw = (right.width() as u16).min(inner.width);
         line(
             frame,
             vec![
                 text(printable(&n.alias)).add_modifier(Modifier::BOLD),
-                label(&format!("  ({})", printable(&n.description))),
+                label(&format!("  {}", printable(&n.description))),
             ],
             inner.x,
             y,
-            inner.width.saturating_sub(link_w + 1),
+            inner.width.saturating_sub(rw + 1),
             inner,
         );
         put(
             frame,
-            Paragraph::new(link).right_aligned(),
+            Paragraph::new(right).right_aligned(),
             Rect::new(inner.x, y, inner.width, 1),
             inner,
         );
-        let body = (per - 1).min(bottom.saturating_sub(y + 1));
-        if body == 1 {
-            let rate = |m: &Metric<f64>| metric(m, |v| bits(*v));
-            line(
+        y += 1;
+        for l in rates.clone() {
+            put(
                 frame,
-                vec![
-                    Span::styled(" ↑ ", Style::new().fg(th().net_send)),
-                    rate(&n.send),
-                    Span::styled("   ↓ ", Style::new().fg(th().net_recv)),
-                    rate(&n.recv),
-                ],
-                inner.x,
-                y + 1,
-                inner.width,
+                Paragraph::new(l),
+                Rect::new(inner.x, y, inner.width, 1),
                 inner,
             );
-            y += per;
-            continue;
+            y += 1;
         }
-        let half_up = body.div_ceil(2);
-        let half_down = body - half_up;
-        let gw = inner.width.saturating_sub(RATE_W + 1);
-        let n_samples = usize::from(gw) * 2;
-        // Mesma escala para envio e recebimento: a proporção entre os dois fica visível.
-        let peak =
-            |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples));
-        let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
-        for (k, h, series, m, color, arrow, mm) in [
-            (
-                0u16,
-                half_up,
-                st.send.get_mut(&n.alias),
-                &n.send,
-                th().net_send,
-                "↑",
-                st.session.send.get(&n.alias).copied(),
-            ),
-            (
-                half_up,
-                half_down,
-                st.recv.get_mut(&n.alias),
-                &n.recv,
-                th().net_recv,
-                "↓",
-                st.session.recv.get(&n.alias).copied(),
-            ),
-        ] {
-            if h == 0 {
-                continue;
+        if graph_h >= 2 {
+            let n_samples = usize::from(inner.width) * 2;
+            let peak = |m: &HashMap<String, Series>| {
+                m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples))
+            };
+            let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
+            let up_h = graph_h.div_ceil(2);
+            for (series, color, top, h, inverted) in [
+                (st.send.get_mut(&n.alias), th().net_send, y, up_h, false),
+                (
+                    st.recv.get_mut(&n.alias),
+                    th().net_recv,
+                    y + up_h,
+                    graph_h - up_h,
+                    true,
+                ),
+            ] {
+                if let Some(s) = series {
+                    let data = s.over(n_samples, scale);
+                    let g = Graph::new(&data, GraphColor::Fixed(color));
+                    let g = if inverted { g.inverted() } else { g };
+                    frame.render_widget(
+                        g,
+                        Rect::new(inner.x, top, inner.width, h).intersection(inner),
+                    );
+                }
             }
-            let row = y + 1 + k;
-            // Taxa com falha: a causa usa a linha toda (sem gráfico de zeros).
-            if let Err(e) = m {
-                line(
-                    frame,
-                    vec![
-                        Span::styled(format!(" {arrow} "), Style::new().fg(color)),
-                        missing(e),
-                    ],
-                    inner.x,
-                    row,
-                    inner.width,
-                    inner,
-                );
-                continue;
-            }
-            if let Some(s) = series {
-                let data = s.over(n_samples, scale);
-                let g = Graph::new(&data, GraphColor::Fixed(color));
-                let g = if arrow == "↓" { g.inverted() } else { g };
-                frame.render_widget(g, Rect::new(inner.x, row, gw, h).intersection(inner));
-            }
-            let mut spans = vec![
-                Span::styled(format!(" {arrow} "), Style::new().fg(color)),
-                metric(m, |v| bits(*v)),
-            ];
-            if let Some((_, hi)) = mm.and_then(MinMax::get) {
-                spans.push(label(&format!("  max {}", bits(hi))));
-            }
-            line(frame, spans, inner.x + gw + 1, row, RATE_W, inner);
-            if h > 1 {
-                line(
-                    frame,
-                    vec![label(&format!("   scale {}", bits(scale)))],
-                    inner.x + gw + 1,
-                    row + 1,
-                    RATE_W,
-                    inner,
-                );
-            }
+            y += graph_h;
         }
-        y += per;
     }
     if !down.is_empty() || more {
         let names: Vec<String> = down.iter().map(|n| printable(&n.alias)).collect();
