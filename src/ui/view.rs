@@ -901,9 +901,22 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     // Em cima, pelo menos o que CPU + memória e GPU + VRAM precisam para mostrar todas as
     // linhas de detalhe (o conhost do atalho abre com 30 linhas); os gráficos é que encolhem.
     const TOP_MIN: u16 = 23;
-    let top_h = (body.height * 58 / 100)
-        .max(TOP_MIN)
-        .min(body.height.saturating_sub(9));
+    // Sem jogo nesta sessão (nenhum histórico para manter), a caixa do jogo fica numa faixa de
+    // 5 linhas e a altura que ela não usa vai para os gráficos de cima; com jogo ou com o
+    // histórico do último, ela tem altura.
+    let game_known = st.fps.as_ref().is_some_and(|f| f.game.is_ok()) || !st.game_fps.0.is_empty();
+    let game_min = if game_known { 8 } else { 5 };
+    // Discos: cabeçalho + uma linha por disco visível, mais uma por causa de falha (inteira,
+    // embaixo da tabela). Largura da coluna da direita, como no layout abaixo.
+    let right_w = body.width - body.width * 34 / 100;
+    let disk_rows = (disk_order(st).len() + disk_notes(st, right_w.saturating_sub(2)).len()) as u16;
+    let mut top_h = (body.height * 58 / 100).max(TOP_MIN);
+    if !game_known {
+        // Embaixo, só o que discos e a faixa do jogo pedem (a rede compacta cabe nisso).
+        let bottom_need = (disk_rows + 3 + game_min).max(12);
+        top_h = top_h.max(body.height.saturating_sub(bottom_need));
+    }
+    let top_h = top_h.min(body.height.saturating_sub(9));
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
     let [cpu, gpu] =
@@ -912,14 +925,6 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).areas(bottom);
     // Linhas da memória dentro da caixa da CPU (sem as bordas, que são da caixa).
     let mem_rows = mem_text(st, cpu.width).map_or(2, |t| t.height().saturating_sub(2));
-    // Discos: cabeçalho + uma linha por disco visível; no máximo metade da coluna.
-    // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
-    let disk_rows =
-        (disk_order(st).len() + disk_notes(st, right.width.saturating_sub(2)).len()) as u16;
-    // Sem jogo nesta sessão (nenhum histórico para manter), a caixa do jogo fica numa faixa de
-    // 5 linhas e os discos crescem; com jogo ou com o histórico do último, ela tem altura.
-    let game_known = st.fps.as_ref().is_some_and(|f| f.game.is_ok()) || !st.game_fps.0.is_empty();
-    let game_min = if game_known { 8 } else { 5 };
     let disks_h = (disk_rows + 3)
         .min(right.height.saturating_sub(game_min))
         .max(4);
