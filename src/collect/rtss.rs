@@ -740,6 +740,12 @@ impl RtssCollector {
         self
     }
 
+    /// Como `with_ignored`, com o coletor rodando: a próxima amostra refaz os índices
+    /// conhecidos e ignorados com a lista nova.
+    pub fn set_ignored(&mut self, list: Vec<String>) {
+        self.ignored_names = list;
+    }
+
     /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
     /// (evento manual) for sinalizado; devolve `true` nesse caso.
     pub fn pump(&mut self, deadline: Instant, stop: HANDLE) -> bool {

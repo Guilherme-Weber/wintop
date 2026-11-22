@@ -63,6 +63,11 @@ fn event_loop(
     st.fold_pool = cfg.config.fold_pool.as_option();
     st.theme_name = theme::th().name.to_string();
     st.notice = cfg.warnings.first().cloned();
+    st.frametime_alert_ms = cfg.config.frametime_alert_ms;
+    st.net_bytes = cfg.config.net_bytes;
+    // Config editado com o wintop aberto: a data do arquivo é conferida a cada 2 s.
+    let mut cfg_seen = config_mtime();
+    let mut cfg_checked = std::time::Instant::now();
     let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<RuntimeResult>();
     let mut seen = Seen::default();
     let mut dirty = true;
@@ -73,6 +78,20 @@ fn event_loop(
         while let Ok((pid, name, r)) = jobs_rx.try_recv() {
             st.finish_runtimes(pid, name, r);
             dirty = true;
+        }
+        if cfg_checked.elapsed() >= CONFIG_CHECK {
+            cfg_checked = std::time::Instant::now();
+            let m = config_mtime();
+            if m != cfg_seen {
+                cfg_seen = m;
+                // Lido pelo mesmo caminho seguro (userfile); só leitura, nunca cria.
+                let new = crate::config::load(crate::config::roaming(), false);
+                if new.config != cfg.config || new.warnings != cfg.warnings {
+                    apply_config(&mut st, engine, &new);
+                    dirty = true;
+                }
+                *cfg = new;
+            }
         }
         let u = engine.updates(&mut seen);
         let overview = st.tab == view::Tab::Overview;
@@ -228,6 +247,30 @@ fn lower(code: KeyCode) -> KeyCode {
         KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
         c => c,
     }
+}
+
+const CONFIG_CHECK: Duration = Duration::from_secs(2);
+
+/// Data de modificação do `config.toml` (só para perceber a mudança; a leitura em si passa
+/// pelo `userfile`).
+fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::config::default_path()?)
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Valores do config editado com o wintop aberto, aplicados na hora.
+fn apply_config(st: &mut view::State, engine: &Engine, cfg: &crate::config::Loaded) {
+    let c = &cfg.config;
+    theme::set(theme::build(&c.theme, &c.colors));
+    st.theme_name = theme::th().name.to_string();
+    st.interval_ms = engine.set_interval_ms(c.interval_ms);
+    st.fold_pool = c.fold_pool.as_option();
+    st.frametime_alert_ms = c.frametime_alert_ms;
+    st.net_bytes = c.net_bytes;
+    engine.set_rtss_ignored(c.rtss_ignored.clone());
+    st.notice = cfg.warnings.first().cloned();
 }
 
 fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {

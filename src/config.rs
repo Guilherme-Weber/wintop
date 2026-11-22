@@ -80,7 +80,15 @@ pub struct Config {
     pub rtss_ignored: Vec<String>,
     /// Cores trocadas sobre o tema: (nome da cor, "#rrggbb").
     pub colors: Vec<(String, String)>,
+    /// Frametime (ms) a partir do qual o gráfico e o valor ficam em destaque.
+    pub frametime_alert_ms: f64,
+    /// Unidade da rede: bits por segundo (como o Task Manager) ou bytes.
+    pub net_bytes: bool,
 }
+
+/// Faixa aceita do limite de alerta do frametime (ms).
+pub const FRAMETIME_ALERT_RANGE: std::ops::RangeInclusive<f64> = 4.0..=1000.0;
+pub const DEFAULT_FRAMETIME_ALERT_MS: f64 = 33.3;
 
 impl Default for Config {
     fn default() -> Self {
@@ -93,6 +101,8 @@ impl Default for Config {
                 .map(ToString::to_string)
                 .collect(),
             colors: Vec::new(),
+            frametime_alert_ms: DEFAULT_FRAMETIME_ALERT_MS,
+            net_bytes: false,
         }
     }
 }
@@ -105,7 +115,8 @@ fn template(c: &Config) -> String {
         .map(|n| format!("    \"{n}\",\n"))
         .collect();
     format!(
-        "# wintop configuration (edit while wintop is closed; it saves changes made in the UI).\n\
+        "# wintop configuration. Edits here apply within a few seconds, even with wintop open;\n\
+         # changes made in the UI (keys) are saved here, keeping the comments.\n\
          \n\
          # Refresh interval in milliseconds (100 to 10000, steps of 100). Keys: + and -.\n\
          interval_ms = {}\n\
@@ -115,6 +126,12 @@ fn template(c: &Config) -> String {
          \n\
          # Storage Space members in the disk box: auto, fold, expand. Key: d.\n\
          fold_pool = \"{}\"\n\
+         \n\
+         # Frametime (ms) from which the game box highlights it (33.3 = below 30 FPS).\n\
+         frametime_alert_ms = {}\n\
+         \n\
+         # Network rates in \"bits\" per second (like Task Manager) or \"bytes\".\n\
+         net_unit = \"{}\"\n\
          \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
@@ -126,6 +143,8 @@ fn template(c: &Config) -> String {
         c.interval_ms,
         c.theme,
         c.fold_pool.name(),
+        c.frametime_alert_ms,
+        if c.net_bytes { "bytes" } else { "bits" },
         ignored.concat()
     )
 }
@@ -256,6 +275,20 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
                 FoldPool::Auto
             }
         };
+    }
+    if let Some(v) = doc.get("frametime_alert_ms") {
+        let n = v.as_float().or_else(|| v.as_integer().map(|i| i as f64));
+        match n {
+            Some(ms) if FRAMETIME_ALERT_RANGE.contains(&ms) => c.frametime_alert_ms = ms,
+            _ => warn.push("config: frametime_alert_ms must be a number from 4 to 1000".into()),
+        }
+    }
+    if let Some(v) = doc.get("net_unit") {
+        match v.as_str() {
+            Some("bits") => c.net_bytes = false,
+            Some("bytes") => c.net_bytes = true,
+            _ => warn.push("config: net_unit must be bits or bytes".into()),
+        }
     }
     if doc.get("rtss").is_some_and(|t| t.as_table_like().is_none()) {
         warn.push("config: rtss must be a table ([rtss])".into());
@@ -512,5 +545,34 @@ mod tests {
         // Intervalo fora dos limites é ajustado (não recusado).
         let doc: DocumentMut = "interval_ms = 99999".parse().expect("toml");
         assert_eq!(from_doc(&doc, &mut Vec::new()).interval_ms, 10_000);
+    }
+}
+
+#[cfg(test)]
+mod tests_1_1 {
+    use super::*;
+
+    #[test]
+    fn alerta_do_frametime_e_unidade_da_rede() {
+        let doc: DocumentMut = "frametime_alert_ms = 16.7\nnet_unit = \"bytes\"\n"
+            .parse()
+            .expect("toml");
+        let mut warn = Vec::new();
+        let c = from_doc(&doc, &mut warn);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert!((c.frametime_alert_ms - 16.7).abs() < 1e-9 && c.net_bytes);
+        // Inteiro também vale; fora da faixa ou unidade desconhecida: padrão e aviso.
+        let doc: DocumentMut = "frametime_alert_ms = 2\nnet_unit = \"kbps\"\n"
+            .parse()
+            .expect("toml");
+        let mut warn = Vec::new();
+        let c = from_doc(&doc, &mut warn);
+        assert_eq!(warn.len(), 2, "{warn:?}");
+        assert_eq!(c.frametime_alert_ms, DEFAULT_FRAMETIME_ALERT_MS);
+        assert!(!c.net_bytes);
+        // O arquivo criado na 1ª execução traz as duas opções e é lido de volta igual.
+        let t = template(&Config::default());
+        let back = from_doc(&t.parse().expect("modelo"), &mut Vec::new());
+        assert_eq!(back, Config::default());
     }
 }

@@ -38,9 +38,8 @@ fn is_reading<T>(r: &crate::model::Metric<T>) -> bool {
 }
 /// Escala mínima da rede (100 Kbps): ruído de poucos bytes não parece tráfego.
 const NET_FLOOR: f64 = 100_000.0;
-/// Teto do frametime (como o Afterburner) e o limite de alerta (30 FPS).
+/// Teto do frametime (como o Afterburner); o limite de alerta vem do config.
 const FT_CEIL_MS: f64 = 50.0;
-const FT_ALERT_MS: f64 = 33.3;
 /// Degraus do teto do gráfico de FPS (sobe para o próximo quando o máximo passa).
 const FPS_STEPS: [f64; 8] = [60.0, 120.0, 165.0, 240.0, 360.0, 500.0, 750.0, 1000.0];
 
@@ -177,6 +176,9 @@ pub struct State {
     pub paused: bool,
     /// Janela de ajuda aberta (tecla `?`; qualquer tecla fecha).
     pub help: bool,
+    /// Do config (valem na hora quando o arquivo muda).
+    pub frametime_alert_ms: f64,
+    pub net_bytes: bool,
     /// Tema atual (tecla `t`, gravado no config).
     pub theme_name: String,
     /// Aviso da configuração (arquivo com erro, gravação recusada), no rodapé.
@@ -189,6 +191,7 @@ impl State {
     pub fn new(interval_ms: u64) -> Self {
         Self {
             interval_ms,
+            frametime_alert_ms: crate::config::DEFAULT_FRAMETIME_ALERT_MS,
             ..Default::default()
         }
     }
@@ -3005,7 +3008,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             GraphColor::Threshold {
                 base: th().frametime,
                 alert: th().fail,
-                at: FT_ALERT_MS / FT_CEIL_MS,
+                at: st.frametime_alert_ms / FT_CEIL_MS,
             },
         ),
         gr.intersection(ft_area),

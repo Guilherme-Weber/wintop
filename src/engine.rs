@@ -51,6 +51,8 @@ struct State {
     /// A última publicação do RTSS ainda não foi lida pela interface.
     fps_unread: bool,
     stop: bool,
+    /// Lista nova de ignorados do RTSS (o config mudou), aplicada pela thread do RTSS.
+    rtss_ignored: Option<Vec<String>>,
 }
 
 struct Shared {
@@ -340,6 +342,12 @@ impl Engine {
     }
 
     /// Ajusta o intervalo (teclas `+`/`-`); vale a partir da próxima espera.
+    /// Troca a lista de ignorados do RTSS (config editado com o wintop aberto); vale a partir
+    /// da próxima amostra.
+    pub fn set_rtss_ignored(&self, list: Vec<String>) {
+        self.shared.lock().rtss_ignored = Some(list);
+    }
+
     pub fn set_interval_ms(&self, ms: u64) -> u64 {
         let ms = clamp_interval(ms);
         {
@@ -393,8 +401,15 @@ fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
     };
     let mut last: Option<Fps> = None;
     loop {
-        if sh.lock().stop {
-            return;
+        let pending = {
+            let mut st = sh.lock();
+            if st.stop {
+                return;
+            }
+            st.rtss_ignored.take()
+        };
+        if let Some(list) = pending {
+            c.set_ignored(list);
         }
         let Ok(snap) = catch_unwind(AssertUnwindSafe(|| c.sample())) else {
             publish(rtss::failed("RTSS collector panicked"));
