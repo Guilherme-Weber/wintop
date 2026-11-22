@@ -1876,29 +1876,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .as_ref()
         .and_then(|f| f.game.as_ref().ok())
         .map(|g| g.pid);
-    let legend = match slow.as_ref().map(|s| &s.vram) {
-        Some(Ok(v)) => {
-            let spans: Vec<Span<'static>> = vram_parts(v, game_pid)
-                .into_iter()
-                .filter(|(_, v)| *v > 0)
-                .flat_map(|(k, v)| {
-                    [
-                        Span::styled("  ■ ", Style::new().fg(vram_color(k))),
-                        label(&format!("{} ", k.label())),
-                        text(short_bytes(v)),
-                    ]
-                })
-                .collect();
-            wrap(spans, width, VRAM_LABEL_W, VRAM_LABEL_W)
-        }
-        Some(Err(e)) => wrap(
-            vec![label("by kind "), missing(e)],
-            width,
-            VRAM_LABEL_W,
-            VRAM_LABEL_W,
-        ),
-        None => Vec::new(),
-    };
+    let legend = vram_legend(slow.as_ref().map(|s| &s.vram), game_pid, width);
     // Máximo 0 = o NVML não informa (GPUs móveis): só o atual.
     let clk = |m: &Metric<(u32, u32)>| {
         metric(m, |(c, mx)| {
@@ -2134,6 +2112,37 @@ pub(super) fn wrap(
         lines.push(Line::from(cur));
     }
     lines
+}
+
+/// Legenda da barra da VRAM por categoria (aba Geral e aba GPU), quebrada em `width`.
+pub(super) fn vram_legend(
+    vram: Option<&Metric<crate::model::VramBreakdown>>,
+    game_pid: Option<u32>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    match vram {
+        Some(Ok(v)) => {
+            let spans: Vec<Span<'static>> = vram_parts(v, game_pid)
+                .into_iter()
+                .filter(|(_, v)| *v > 0)
+                .flat_map(|(k, v)| {
+                    [
+                        Span::styled("  ■ ", Style::new().fg(vram_color(k))),
+                        label(&format!("{} ", k.label())),
+                        text(short_bytes(v)),
+                    ]
+                })
+                .collect();
+            wrap(spans, width, VRAM_LABEL_W, VRAM_LABEL_W)
+        }
+        Some(Err(e)) => wrap(
+            vec![label("by kind "), missing(e)],
+            width,
+            VRAM_LABEL_W,
+            VRAM_LABEL_W,
+        ),
+        None => Vec::new(),
+    }
 }
 
 /// Largura do rótulo da barra da VRAM (a legenda alinha embaixo da barra).

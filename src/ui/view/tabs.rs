@@ -190,19 +190,27 @@ fn fit(cols: &[Col], avail: u16) -> Vec<Option<u16>> {
         .find(|(c, o)| c.flex && **o)
         .map_or(0, |(c, _)| spare.min(FLEX_MAX.saturating_sub(c.w)));
     let rest = spare - flex_extra;
-    let others = cols.iter().zip(&on).filter(|(c, o)| !c.flex && **o).count() as u16;
-    let each = rest.checked_div(others).unwrap_or(0);
-    let mut extra = rest.checked_rem(others).unwrap_or(0);
+    // A 1ª coluna (PID) não cresce (encostada na borda); as outras ganham no máximo
+    // `EXTRA_MAX` cada (sem vãos largos entre os números); o que sobrar fica à direita.
+    const EXTRA_MAX: u16 = 4;
+    let others = cols
+        .iter()
+        .zip(&on)
+        .enumerate()
+        .filter(|(i, (c, o))| *i > 0 && !c.flex && **o)
+        .count() as u16;
+    let each = rest.checked_div(others).unwrap_or(0).min(EXTRA_MAX);
     cols.iter()
         .zip(&on)
-        .map(|(c, o)| {
+        .enumerate()
+        .map(|(i, (c, o))| {
             o.then(|| {
                 if c.flex {
-                    c.w + flex_extra + if others == 0 { rest } else { 0 }
+                    c.w + flex_extra
+                } else if i == 0 {
+                    c.w
                 } else {
-                    let e = u16::from(extra > 0);
-                    extra = extra.saturating_sub(1);
-                    c.w + each + e
+                    c.w + each
                 }
             })
         })
@@ -210,7 +218,7 @@ fn fit(cols: &[Col], avail: u16) -> Vec<Option<u16>> {
 }
 
 /// Largura máxima da coluna de nomes.
-const FLEX_MAX: u16 = 44;
+const FLEX_MAX: u16 = 60;
 
 /// Texto que cabe em `w` colunas do terminal (corta no fim com `…`) e alinhado.
 pub(super) fn cell(s: &str, w: u16, right: bool) -> String {
@@ -584,7 +592,8 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
             ],
         );
         if Some(i) == sel {
-            line = line.style(Style::new().bg(th().selected));
+            // Fundo e negrito: a seleção não depende só da cor (NO_COLOR, temas claros).
+            line = line.style(Style::new().bg(th().selected).add_modifier(Modifier::BOLD));
         }
         let y = inner.y + 1 + (i - offset) as u16;
         put(
@@ -808,6 +817,18 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         put(
             frame,
             Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+            inner,
+        );
+    }
+    // Legenda das cores da barra da VRAM (a mesma da aba Geral), logo abaixo da barra.
+    if let Some(l) = super::vram_legend(vram.as_ref(), game, inner.width)
+        .into_iter()
+        .next()
+    {
+        put(
+            frame,
+            Paragraph::new(l),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
             inner,
         );
@@ -887,7 +908,8 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ],
         );
         if Some(i) == sel {
-            line = line.style(Style::new().bg(th().selected));
+            // Fundo e negrito: a seleção não depende só da cor (NO_COLOR, temas claros).
+            line = line.style(Style::new().bg(th().selected).add_modifier(Modifier::BOLD));
         }
         let y = table_y + 1 + (i - offset) as u16;
         put(
@@ -1179,7 +1201,8 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
                 out.push(num_row(disks, &name, value, "°C", 0));
                 out.push(text_row(
                     disks,
-                    &format!("{name} SMART"),
+                    // Recuada sob o disco da linha de cima (sem repetir o nome inteiro).
+                    "  SMART",
                     t.health.clone().map(|p| {
                         if p {
                             "FAILURE PREDICTED".to_string()
@@ -1404,14 +1427,15 @@ fn sensor_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>], st: &State) -> V
         }
         out.extend(super::wrap(vec![value], cw, 2, 2));
     } else if value.width() > usize::from(widths[1].unwrap_or(0)) {
-        // Valor que não cabe na coluna dele ocupa também as de mínimo e máximo.
+        // Valor que não cabe na coluna dele ocupa também as de mínimo e máximo, começando onde
+        // a coluna do valor começa (alinhado à direita, pularia para baixo do "Max").
         out.push(Line::from(vec![
             Span::styled(
                 cell(&shown_name, name_w as u16, false),
                 Style::new().fg(th().text),
             ),
             Span::raw(" "),
-            Span::styled(cell(&value.content, room as u16, true), value.style),
+            Span::styled(cell(&value.content, room as u16, false), value.style),
         ]));
     } else {
         out.push(row(
