@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.2.0] - 2026-11-22
+
 ### Adicionado
 
 - Primeira abertura de uma cópia não instalada: o wintop pergunta se deve instalar (cópia em
