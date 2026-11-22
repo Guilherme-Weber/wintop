@@ -1479,3 +1479,32 @@ fn uma_gpu_sem_seletor() {
     assert!(!out.contains("next gpu"));
     assert!(!out.contains("gpu 1/"));
 }
+
+/// Interface em português do Brasil (`language = "pt-BR"`): textos traduzidos, vírgula decimal,
+/// nomes e números intactos.
+fn pt_br(mut st: State, w: u16, h: u16) -> String {
+    crate::i18n::set(crate::i18n::Lang::PtBr);
+    let out = render(&mut st, w, h);
+    crate::i18n::set(crate::i18n::Lang::EnUs);
+    out
+}
+
+#[test]
+fn geral_pt_br() {
+    insta::assert_snapshot!(pt_br(filled(), 160, 48));
+}
+
+#[test]
+fn abas_pt_br() {
+    let p = pt_br(tab_state(view::Tab::Processes), 140, 16);
+    let g = pt_br(tab_state(view::Tab::Gpu), 160, 20);
+    let s = pt_br(tab_state(view::Tab::Sensors), 160, 30);
+    insta::assert_snapshot!(format!("{p}\n{g}\n{s}"));
+}
+
+#[test]
+fn ajuda_pt_br() {
+    let mut st = filled();
+    st.help = true;
+    insta::assert_snapshot!(pt_br(st, 160, 40));
+}

@@ -11,6 +11,7 @@ mod engine;
 mod fmt;
 #[cfg(test)]
 mod fuzz;
+mod i18n;
 mod install;
 mod instance;
 mod model;

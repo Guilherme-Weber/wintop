@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::theme::th;
 use super::widgets::{Graph, GraphColor, Meter, Segmented};
 use crate::fmt::{bits, bytes, num};
+use crate::i18n::tr;
 use crate::model::{
     Disk, Fast, Fps, Gpu, GpuProc, Memory, Metric, Missing, Nic, Proc, Slow, View, VramBreakdown,
     VramKind,
@@ -583,11 +584,12 @@ impl RuntimeJob {
 /// Valor, estado neutro (cinza) ou falha (vermelho, com a causa); sem controles.
 fn metric<T>(m: &Metric<T>, f: impl FnOnce(&T) -> String) -> Span<'static> {
     match m {
-        Ok(v) => Span::styled(printable(&f(v)), Style::new().fg(th().text)),
-        Err(Missing::Neutral(s)) => Span::styled(printable(s), Style::new().fg(th().neutral)),
-        Err(Missing::Fail(s)) => {
-            Span::styled(format!("! {}", printable(s)), Style::new().fg(th().fail))
-        }
+        Ok(v) => Span::styled(printable(&tr(&f(v))), Style::new().fg(th().text)),
+        Err(Missing::Neutral(s)) => Span::styled(printable(&tr(s)), Style::new().fg(th().neutral)),
+        Err(Missing::Fail(s)) => Span::styled(
+            format!("! {}", printable(&tr(s))),
+            Style::new().fg(th().fail),
+        ),
     }
 }
 
@@ -595,12 +597,19 @@ fn missing(e: &Missing) -> Span<'static> {
     metric::<()>(&Err(e.clone()), |()| String::new())
 }
 
+/// Rótulo, já no idioma da interface (`i18n`).
 fn label(s: &str) -> Span<'static> {
-    Span::styled(s.to_string(), Style::new().fg(th().label))
+    Span::styled(tr(s).into_owned(), Style::new().fg(th().label))
 }
 
+/// Valor, já no idioma da interface (nomes e números passam intactos).
 fn text(s: impl Into<String>) -> Span<'static> {
-    Span::styled(s.into(), Style::new().fg(th().text))
+    let s: String = s.into();
+    let s = match tr(&s) {
+        std::borrow::Cow::Owned(t) => t,
+        std::borrow::Cow::Borrowed(_) => s,
+    };
+    Span::styled(s, Style::new().fg(th().text))
 }
 
 /// Valor zerado em tom de rótulo (o número fica, só sai do primeiro plano).
@@ -636,7 +645,7 @@ fn boxed(title: &str, right: &str) -> Block<'static> {
         .title(Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                printable(title),
+                printable(&tr(title)),
                 Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -644,7 +653,7 @@ fn boxed(title: &str, right: &str) -> Block<'static> {
     if !right.is_empty() {
         b = b.title(
             Line::from(Span::styled(
-                format!(" {right} "),
+                format!(" {} ", tr(right)),
                 Style::new().fg(th().label),
             ))
             .right_aligned(),
@@ -947,13 +956,11 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let key_w = HELP
+    let keys: Vec<String> = HELP.iter().map(|(k, _)| tr(k).into_owned()).collect();
+    let key_w = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
+    let lines: Vec<Line<'static>> = keys
         .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(0);
-    let lines: Vec<Line<'static>> = HELP
-        .iter()
+        .zip(HELP.iter().map(|(_, d)| d))
         .map(|(k, d)| {
             Line::from(vec![
                 Span::styled(
@@ -1057,10 +1064,10 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
     };
     let spans = vec![
-        tab("1", "Overview", Tab::Overview),
-        tab("2", "Processes", Tab::Processes),
+        tab("1", &tr("Overview"), Tab::Overview),
+        tab("2", &tr("Processes"), Tab::Processes),
         tab("3", "GPU", Tab::Gpu),
-        tab("4", "Sensors", Tab::Sensors),
+        tab("4", &tr("Sensors"), Tab::Sensors),
     ];
     let mut x = area.x;
     for (sp, t) in spans
@@ -1097,7 +1104,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         // monocromático. Forma curta quando estreito.
         let long = "[PAUSED · p resumes]";
         right.push(Span::styled(
-            if room >= 40 { long } else { "[PAUSED]" },
+            tr(if room >= 40 { long } else { "[PAUSED]" }).into_owned(),
             Style::new()
                 .fg(th().frametime)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
@@ -1554,7 +1561,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State, mem_rows: u16) {
         frame,
         Paragraph::new(Line::from(vec![
             Span::styled("── ", Style::new().fg(th().border)),
-            Span::styled("memory ", Style::new().fg(th().title)),
+            Span::styled(format!("{} ", tr("memory")), Style::new().fg(th().title)),
             Span::styled(
                 "─".repeat(usize::from(divider.width.saturating_sub(10))),
                 Style::new().fg(th().border),

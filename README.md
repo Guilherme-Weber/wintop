@@ -65,7 +65,9 @@ anticheat). `t` troca o tema. A interface é em inglês.
 O arquivo `%APPDATA%\wintop\config.toml` é criado na primeira execução, com comentários:
 intervalo de atualização, tema (`default`, `nord`, `gruvbox`, `dracula`, `mono`), recolhimento
 dos membros do Storage Space, lista de aplicativos que o RTSS acompanha mas não são jogos e cores
-avulsas (`[colors]`, em `#rrggbb`). As mudanças feitas na interface (`+`/`-`, `t`, `d`) são
+avulsas (`[colors]`, em `#rrggbb`). O idioma da interface é escolhido em `language`: `en-US`
+(padrão) ou `pt-BR` (português do Brasil, com vírgula decimal); erros vindos do sistema e dos
+drivers aparecem como o Windows os informa. As mudanças feitas na interface (`+`/`-`, `t`, `d`) são
 gravadas no próprio arquivo, preservando os comentários. Um arquivo com erro de sintaxe não
 impede a abertura: o wintop usa os padrões, avisa no rodapé e não o regrava.
 

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use super::{State, bar_sep, boxed, empty_box, label, metric, missing, put, text, vram_bar};
 use crate::fmt::{bytes, num};
+use crate::i18n::tr;
 use crate::model::{GpuProc, Metric, Missing, Proc};
 use crate::ui::theme::th;
 use crate::ui::widgets::gradient;
@@ -278,7 +279,7 @@ fn header(cols: &[Col], widths: &[Option<u16>], sorted: Option<(usize, bool)>) -
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let mut t = c.title.to_string();
+            let mut t = tr(c.title).into_owned();
             let mut style = Style::new().fg(th().label).add_modifier(Modifier::BOLD);
             if let Some((s, desc)) = sorted
                 && s == i
@@ -318,7 +319,7 @@ fn dim(s: String) -> (String, Style) {
 /// Porcentagem com a cor pela intensidade (cinza no zero).
 fn pct_cell(v: f64) -> (String, Style) {
     if v < 0.05 {
-        return dim("0.0".into());
+        return dim(num(0.0, 1));
     }
     // Texto só até o meio do gradiente: o topo (índigo escuro no tema padrão) sumiria no fundo
     // e na linha selecionada.
@@ -1270,7 +1271,7 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             frame,
             inner,
             Span::styled(
-                "waiting for the first collection",
+                tr("waiting for the first collection").into_owned(),
                 Style::new().fg(th().neutral),
             ),
         );
@@ -1355,10 +1356,11 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     continue;
                 }
                 SensorItem::Title(i, cont) => {
+                    let group = printable(&tr(&rows[*i].group));
                     let t = if *cont {
-                        format!("{} (cont.)", printable(&rows[*i].group))
+                        format!("{group} (cont.)")
                     } else {
-                        printable(&rows[*i].group)
+                        group
                     };
                     put(
                         frame,
@@ -1437,7 +1439,7 @@ fn sensor_lines(r: &SensorRow, cw: u16, widths: &[Option<u16>], st: &State) -> V
         }
         SensorValue::Text(_) => (value_span(r), String::new(), String::new()),
     };
-    let name = printable(&r.name);
+    let name = printable(&tr(&r.name));
     let name_w = usize::from(widths[0].unwrap_or(0));
     let mut out = Vec::new();
     let name_fits = Span::raw(name.as_str()).width() <= name_w;

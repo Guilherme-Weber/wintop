@@ -4,8 +4,9 @@
 //! valores baterem com ele (ver `docs/divergencias.md`). Bits de rede em unidade decimal.
 
 /// Número com `dec` casas e ponto decimal.
+/// Número com `dec` casas, com o separador decimal do idioma da interface.
 pub fn num(v: f64, dec: usize) -> String {
-    format!("{v:.dec$}")
+    crate::i18n::decimal(format!("{v:.dec$}"))
 }
 
 pub fn pct(v: f64) -> String {

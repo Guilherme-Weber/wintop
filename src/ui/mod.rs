@@ -169,6 +169,7 @@ fn event_loop(
     st.notice = cfg.warnings.first().cloned();
     st.frametime_alert_ms = cfg.config.frametime_alert_ms;
     st.net_bytes = cfg.config.net_bytes;
+    crate::i18n::set(cfg.config.language);
     // Config editado com o wintop aberto: a data do arquivo é conferida a cada 2 s.
     let mut cfg_seen = config_mtime();
     let mut cfg_checked = std::time::Instant::now();
@@ -421,6 +422,7 @@ fn apply_config(st: &mut view::State, engine: &Engine, cfg: &crate::config::Load
     st.fold_pool = c.fold_pool.as_option();
     st.frametime_alert_ms = c.frametime_alert_ms;
     st.net_bytes = c.net_bytes;
+    crate::i18n::set(c.language);
     engine.set_rtss_ignored(c.rtss_ignored.clone());
     set_mouse(c.mouse);
     st.notice = cfg.warnings.first().cloned();

@@ -88,6 +88,8 @@ pub struct Config {
     pub mouse: bool,
     /// Maximizar a janela do console clássico ao abrir (o atalho abre o conhost com 120x30).
     pub start_maximized: bool,
+    /// Idioma da interface (en-US padrão; pt-BR).
+    pub language: crate::i18n::Lang,
 }
 
 /// Faixa aceita do limite de alerta do frametime (ms).
@@ -109,6 +111,7 @@ impl Default for Config {
             net_bytes: false,
             mouse: true,
             start_maximized: true,
+            language: crate::i18n::Lang::EnUs,
         }
     }
 }
@@ -147,6 +150,9 @@ fn template(c: &Config) -> String {
          # 120x30). The Windows Terminal is not touched.\n\
          start_maximized = {}\n\
          \n\
+         # Interface language: \"en-US\" (default) or \"pt-BR\" (Brazilian Portuguese).\n\
+         language = \"{}\"\n\
+         \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
          ignored = [\n{}]\n\
@@ -161,6 +167,7 @@ fn template(c: &Config) -> String {
         if c.net_bytes { "bytes" } else { "bits" },
         c.mouse,
         c.start_maximized,
+        c.language.code(),
         ignored.concat()
     )
 }
@@ -304,6 +311,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             Some("bits") => c.net_bytes = false,
             Some("bytes") => c.net_bytes = true,
             _ => warn.push("config: net_unit must be bits or bytes".into()),
+        }
+    }
+    if let Some(v) = doc.get("language") {
+        match v.as_str().and_then(crate::i18n::Lang::from_code) {
+            Some(l) => c.language = l,
+            None => warn.push("config: language must be en-US or pt-BR".into()),
         }
     }
     if let Some(v) = doc.get("start_maximized") {
@@ -579,6 +592,27 @@ mod tests {
 #[cfg(test)]
 mod tests_1_1 {
     use super::*;
+
+    #[test]
+    fn idioma_da_interface() {
+        use crate::i18n::Lang;
+        let read = |s: &str| {
+            let doc: DocumentMut = s.parse().expect("toml");
+            let mut warn = Vec::new();
+            (from_doc(&doc, &mut warn).language, warn.len())
+        };
+        assert_eq!(read("language = \"pt-BR\"\n"), (Lang::PtBr, 0));
+        assert_eq!(read("language = \"en-US\"\n"), (Lang::EnUs, 0));
+        // Código desconhecido: padrão (inglês) e aviso.
+        assert_eq!(read("language = \"pt\"\n"), (Lang::EnUs, 1));
+        assert_eq!(read("language = 1\n"), (Lang::EnUs, 1));
+        // O arquivo da 1ª execução traz a opção e é lido de volta igual.
+        let c = Config {
+            language: Lang::PtBr,
+            ..Config::default()
+        };
+        assert_eq!(read(&template(&c)), (Lang::PtBr, 0));
+    }
 
     #[test]
     fn alerta_do_frametime_e_unidade_da_rede() {
