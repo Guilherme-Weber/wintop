@@ -6,6 +6,11 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Alterado
+
+- Abas Processos e GPU: a seleção fica na linha (os processos mudam embaixo dela) em vez de
+  seguir o processo, que fazia a lista pular a cada reordenação por CPU.
+
 ## [1.0.0] - 2026-11-21
 
 Primeira versão.

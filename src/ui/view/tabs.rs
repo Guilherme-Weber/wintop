@@ -74,10 +74,9 @@ impl Cursor {
     /// O que `resolve` selecionaria, sem mudar nada (para montar o detalhe antes da tabela).
     fn peek(&self, pids: &[u32]) -> Option<usize> {
         let last = pids.len().checked_sub(1)?;
-        let base = self
-            .pid
-            .and_then(|p| pids.iter().position(|&x| x == p))
-            .unwrap_or(self.index.min(last));
+        // Seleção por posição: a linha fica parada e os processos mudam embaixo dela (seguir o
+        // PID fazia a lista pular a cada reordenação por CPU).
+        let base = self.index.min(last);
         Some(
             (base as isize)
                 .saturating_add(self.pending)
@@ -100,10 +99,7 @@ impl Cursor {
             return (None, 0);
         }
         let last = pids.len() - 1;
-        let base = self
-            .pid
-            .and_then(|p| pids.iter().position(|&x| x == p))
-            .unwrap_or(self.index.min(last));
+        let base = self.index.min(last);
         let idx = (base as isize)
             .saturating_add(self.pending)
             .clamp(0, last as isize) as usize;

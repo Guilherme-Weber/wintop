@@ -651,21 +651,25 @@ fn ordem_e_filtro_dos_processos() {
 }
 
 #[test]
-fn selecao_segue_o_pid_entre_coletas() {
+fn selecao_fica_na_linha_entre_coletas() {
     let mut st = tab_state(view::Tab::Processes);
     let _ = render(&mut st, 140, 16);
     st.proc_cursor.down(1);
     let _ = render(&mut st, 140, 16);
     // 2º por CPU = firefox.
     assert_eq!(st.proc_cursor.pid(), Some(9120));
-    // Nova coleta muda a ordem: a seleção continua no firefox.
+    // Nova coleta muda a ordem: a seleção fica na 2ª linha (a lista não pula atrás do
+    // processo), agora com quem ocupa essa posição.
     let mut list = proc_list();
     list[3].cpu = 90.0;
     let mut s = slow();
-    s.procs = Some(Ok(list));
+    s.procs = Some(Ok(list.clone()));
     st.push_slow(s);
     let _ = render(&mut st, 140, 16);
-    assert_eq!(st.proc_cursor.pid(), Some(9120));
+    let mut by_cpu = list;
+    by_cpu.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+    assert_eq!(st.proc_cursor.pid(), Some(by_cpu[1].pid));
+    assert_ne!(st.proc_cursor.pid(), Some(9120));
     st.proc_cursor.end();
     let _ = render(&mut st, 140, 16);
     assert_eq!(st.proc_cursor.pid(), Some(15000));
