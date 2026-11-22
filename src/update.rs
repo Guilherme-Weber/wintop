@@ -461,7 +461,6 @@ static HELD: std::sync::Mutex<Option<(crate::userfile::UserDir, crate::userfile:
 /// O exe novo é gravado inteiro como `.new` antes de mexer no atual: a pasta nunca fica sem
 /// `wintop.exe` além do instante entre os dois renames.
 fn apply_portable(dir: &Path, pkg: &Package) -> Result<(), String> {
-    let dir = &crate::win::long_path(dir);
     let d = crate::userfile::UserDir::open_exe_dir(dir)?;
     if !pkg.modules.is_empty() {
         let m = d
@@ -526,7 +525,7 @@ pub fn remove_stale_old(mode: &Mode) {
             if old.is_empty() {
                 return;
             }
-            if let Ok(dir) = crate::userfile::UserDir::open_exe_dir(&crate::win::long_path(d)) {
+            if let Ok(dir) = crate::userfile::UserDir::open_exe_dir(d) {
                 for n in old {
                     let _ = dir.remove(&n);
                 }
@@ -918,6 +917,32 @@ mod real {
         let v = latest_version().expect("releases/latest");
         assert!(parse_version(&v).is_some(), "{v}");
         eprintln!("última release: {v}");
+    }
+
+    /// Atualização real da cópia instalada (`<Program Files>\wintop`, terminal elevado,
+    /// `WINTOP_TEST_INSTALLED=1`): baixa a última release, troca o exe e os módulos, e a cópia
+    /// responde na versão nova, com a pasta ainda protegida.
+    #[test]
+    #[ignore = "troca a cópia instalada: terminal elevado e WINTOP_TEST_INSTALLED=1"]
+    fn atualiza_a_copia_instalada() {
+        assert_eq!(
+            std::env::var("WINTOP_TEST_INSTALLED").as_deref(),
+            Ok("1"),
+            "troca a cópia em Program Files: confirme com WINTOP_TEST_INSTALLED=1"
+        );
+        let v = latest_version().expect("releases/latest");
+        let pkg = download(&v).expect("pacote");
+        crate::install::update_installed(&pkg.exe, &pkg.modules).expect("troca");
+        let exe = crate::install::install_dir().unwrap().join("wintop.exe");
+        let out = std::process::Command::new(&exe)
+            .arg("--version")
+            .output()
+            .expect("--version");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("wintop {v}")
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), pkg.exe);
     }
 
     /// `WINTOP_TEST_ZIP` (pacote real) + `<zip>.sig`: assinatura confere com a chave das

@@ -325,6 +325,8 @@ impl UserDir {
     /// de um valor que o usuário redirecione (HKCU), e quem grava nela já troca o próprio exe.
     /// Continua valendo o resto: sem reparse point, caminho final igual, âncora dentro.
     pub fn open_exe_dir(dir: &Path) -> Result<Self, String> {
+        // Exe aberto por um caminho 8.3: a conferência do caminho final compara com o longo.
+        let dir = &crate::win::long_path(dir);
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         let d =
             open(dir, GENERIC_READ.0, share, OPEN_EXISTING, true, true).map_err(String::from)?;
