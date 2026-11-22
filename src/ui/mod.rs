@@ -18,6 +18,20 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use crate::engine::{Engine, STEP_MS, Seen};
 
+/// Como a interface terminou.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Quit,
+    /// Atualização aplicada: reabrir o exe novo.
+    Restart,
+}
+
+/// Consulta de versão nova em andamento (`update::spawn_check`) e o modo da cópia em uso.
+pub struct UpdateCtx {
+    pub rx: std::sync::mpsc::Receiver<String>,
+    pub mode: crate::update::Mode,
+}
+
 /// Roda até `q`, Esc, Ctrl+C ou `stop` (Ctrl+Break / fechar a janela, pelo handler do console).
 /// `start` inicia o motor depois do terminal e do panic hook (um pânico precoce de coletor não
 /// desfaz o terminal); o motor é parado antes de o terminal ser restaurado.
@@ -25,9 +39,10 @@ pub fn run(
     start: impl FnOnce() -> Engine,
     stop: &AtomicBool,
     mut cfg: crate::config::Loaded,
-) -> std::io::Result<()> {
+    updates: Option<&UpdateCtx>,
+) -> std::io::Result<Outcome> {
     if stop.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(Outcome::Quit);
     }
     // Antes da tela alternativa: o tamanho novo da janela já vale no primeiro desenho.
     if cfg.config.start_maximized {
@@ -51,7 +66,7 @@ pub fn run(
     }));
     set_mouse(cfg.config.mouse);
     let engine = start();
-    let result = event_loop(&mut terminal, &engine, stop, &mut cfg);
+    let result = event_loop(&mut terminal, &engine, stop, &mut cfg, updates);
     // Threads paradas (handles fechados, PawnIO e NVML liberados) antes de restaurar.
     drop(engine);
     set_mouse(false);
@@ -162,7 +177,8 @@ fn event_loop(
     engine: &Engine,
     stop: &AtomicBool,
     cfg: &mut crate::config::Loaded,
-) -> std::io::Result<()> {
+    updates: Option<&UpdateCtx>,
+) -> std::io::Result<Outcome> {
     let mut st = view::State::new(engine.interval_ms());
     st.fold_pool = cfg.config.fold_pool.as_option();
     st.theme_name = theme::th().name.to_string();
@@ -178,7 +194,32 @@ fn event_loop(
     let mut seen = Seen::default();
     let mut dirty = true;
     let mut last_second = (u16::MAX, 0, 0);
+    let mut applying: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     while !stop.load(Ordering::SeqCst) {
+        // Versão nova: a resposta da consulta abre a pergunta (uma vez por abertura).
+        if let Some(u) = updates
+            && let Ok(v) = u.rx.try_recv()
+        {
+            st.update = Some(view::UpdateUi::Offer(v));
+            dirty = true;
+        }
+        if let Some(rx) = &applying
+            && let Ok(r) = rx.try_recv()
+        {
+            applying = None;
+            match r {
+                Ok(()) => return Ok(Outcome::Restart),
+                Err(e) => {
+                    st.update = None;
+                    st.toast = Some((
+                        format!("update failed: {e}"),
+                        true,
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+            dirty = true;
+        }
         // Cada redesenho também acorda o terminal (que conta no orçamento de CPU): as fontes
         // fora de fase esperam o próximo tick da coleta rápida quando a tela não depende delas.
         while let Ok((pid, name, r)) = jobs_rx.try_recv() {
@@ -191,7 +232,7 @@ fn event_loop(
             if m != cfg_seen {
                 cfg_seen = m;
                 // Lido pelo mesmo caminho seguro (userfile); só leitura, nunca cria.
-                let new = crate::config::load(crate::config::roaming(), false);
+                let new = crate::config::load_home(false);
                 if new.config != cfg.config || new.warnings != cfg.warnings {
                     apply_config(&mut st, engine, &new);
                     dirty = true;
@@ -255,12 +296,32 @@ fn event_loop(
                             st.filter.pop();
                         }
                         KeyCode::Char('c' | 'C') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
+                            return Ok(Outcome::Quit);
                         }
                         KeyCode::Char(c) if !c.is_control() && st.filter.chars().count() < 64 => {
                             st.filter.push(c);
                         }
                         _ => {}
+                    }
+                    dirty = true;
+                }
+                // Versão nova: `y` baixa, confere e troca (depois reabre); qualquer outra tecla
+                // deixa para a próxima abertura. Aplicando, só Ctrl+C sai.
+                Event::Key(k) if k.kind == KeyEventKind::Press && st.update.is_some() => {
+                    if lower(k.code) == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        return Ok(Outcome::Quit);
+                    }
+                    if let Some(view::UpdateUi::Offer(v)) = &st.update {
+                        if lower(k.code) == KeyCode::Char('y')
+                            && let Some(u) = updates
+                        {
+                            applying = Some(crate::update::spawn_apply(v.clone(), u.mode.clone()));
+                            st.update = Some(view::UpdateUi::Applying(v.clone()));
+                        } else {
+                            st.update = None;
+                        }
                     }
                     dirty = true;
                 }
@@ -270,7 +331,7 @@ fn event_loop(
                     let ctrl_c = lower(k.code) == KeyCode::Char('c')
                         && k.modifiers.contains(KeyModifiers::CONTROL);
                     if ctrl_c {
-                        return Ok(());
+                        return Ok(Outcome::Quit);
                     }
                     if let Some((pid, name, create)) = st.confirm_end.take()
                         && lower(k.code) == KeyCode::Char('y')
@@ -289,7 +350,7 @@ fn event_loop(
                     if lower(k.code) == KeyCode::Char('c')
                         && k.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        return Ok(());
+                        return Ok(Outcome::Quit);
                     }
                     st.help = false;
                     dirty = true;
@@ -328,9 +389,9 @@ fn event_loop(
                         st.filter.clear();
                         dirty = true;
                     }
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(Outcome::Quit),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
+                        return Ok(Outcome::Quit);
                     }
                     KeyCode::Char('+' | '=') => {
                         st.interval_ms = engine.set_interval_ms(engine.interval_ms() + STEP_MS);
@@ -380,7 +441,7 @@ fn event_loop(
                     code => dirty |= list_key(&mut st, code, &jobs_tx),
                 },
                 Event::Resize(..) => dirty = true,
-                Event::Mouse(m) if !st.help && st.confirm_end.is_none() => {
+                Event::Mouse(m) if !st.help && st.confirm_end.is_none() && st.update.is_none() => {
                     let (redraw, tab_changed) = on_mouse(&mut st, m);
                     if tab_changed {
                         engine.set_view(st.view());
@@ -394,7 +455,7 @@ fn event_loop(
             }
         }
     }
-    Ok(())
+    Ok(Outcome::Quit)
 }
 
 /// Teclas das listas (abas Processos e GPU). `true` = redesenhar.

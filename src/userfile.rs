@@ -411,6 +411,27 @@ impl UserDir {
         Ok(true)
     }
 
+    /// Renomeia `name` para `to` (substituindo), pelo handle e sem seguir links. Vale para o exe
+    /// em execução (o Windows deixa renomear, não sobrescrever). `Ok(false)`: não existia.
+    pub fn rename(&self, name: &str, to: &str) -> Result<bool, String> {
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+        let p = self.file(name);
+        let c = match open(
+            &p,
+            DELETE.0,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+            false,
+            true,
+        ) {
+            Ok(c) => c,
+            Err(OpenError::NotFound) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        rename_over(c.raw(), &self.file(to))?;
+        Ok(true)
+    }
+
     pub fn write_bytes(&self, name: &str, data: &[u8]) -> Result<(), String> {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

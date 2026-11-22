@@ -17,16 +17,25 @@ em [docs/spike-etapa0.md](docs/spike-etapa0.md).
 ## Instalação
 
 Baixe o `wintop-<versão>-windows-x64.zip` da página de
-[releases](https://github.com/Guilherme-Weber/wintop/releases), extraia e, num terminal como
-administrador dentro da pasta extraída:
+[releases](https://github.com/Guilherme-Weber/wintop/releases), extraia e abra o `wintop.exe`.
+Na primeira abertura, o wintop pergunta como rodar:
 
-```powershell
-.\wintop.exe --install
-```
+- **Install**: copia para `C:\Program Files\wintop` e cria um atalho no Menu Iniciar que o abre
+  sem a janela do UAC (ver [Atalho sem UAC](#atalho-sem-uac)); em seguida, abre a cópia
+  instalada. Equivale a `.\wintop.exe --install` num terminal como administrador.
+- **Portable**: roda da própria pasta, com o `config.toml` gravado ao lado do executável (a
+  presença desse arquivo marca a cópia como portátil e a pergunta não volta). A pasta `modules`
+  precisa ficar ao lado do executável.
 
-O wintop fica em `C:\Program Files\wintop`, com um atalho no Menu Iniciar que o abre sem a
-janela do UAC (ver [Atalho sem UAC](#atalho-sem-uac)). Também é possível rodar o `wintop.exe`
-direto da pasta extraída, sem instalar; a pasta `modules` precisa ficar ao lado do executável.
+### Atualização automática
+
+A cada abertura, o wintop consulta a última release publicada no GitHub (uma requisição, numa
+thread, sem atrasar a interface; sem rede, nada aparece). Havendo versão nova, a interface
+pergunta se deve atualizar; com `y`, baixa o zip, confere a assinatura ed25519 (`.zip.sig` da
+release) com a chave pública embutida no executável, troca o `wintop.exe` e os módulos da cópia
+em uso (instalada ou portátil) e reabre o programa. Um pacote sem assinatura válida, ou de outra
+versão que não a anunciada, é recusado sem alterar nada. A consulta pode ser desligada com
+`check_updates = false` no `config.toml`.
 
 O executável não tem assinatura Authenticode: o Windows pode mostrar o aviso do SmartScreen
 ("Mais informações" > "Executar assim mesmo") e o UAC mostra editor desconhecido. Por isso,
@@ -62,10 +71,11 @@ anticheat). `t` troca o tema. A interface é em inglês.
 
 ## Configuração
 
-O arquivo `%APPDATA%\wintop\config.toml` é criado na primeira execução, com comentários:
+O arquivo `%APPDATA%\wintop\config.toml` (na cópia portátil, `config.toml` ao lado do
+executável) é criado na primeira execução, com comentários:
 intervalo de atualização, tema (`default`, `nord`, `gruvbox`, `dracula`, `mono`), recolhimento
-dos membros do Storage Space, lista de aplicativos que o RTSS acompanha mas não são jogos e cores
-avulsas (`[colors]`, em `#rrggbb`). O idioma da interface é escolhido em `language`: `en-US`
+dos membros do Storage Space, lista de aplicativos que o RTSS acompanha mas não são jogos, busca
+de atualização (`check_updates`) e cores avulsas (`[colors]`, em `#rrggbb`). O idioma da interface é escolhido em `language`: `en-US`
 (padrão) ou `pt-BR` (português do Brasil, com vírgula decimal); erros vindos do sistema e dos
 drivers aparecem como o Windows os informa. As mudanças feitas na interface (`+`/`-`, `t`, `d`) são
 gravadas no próprio arquivo, preservando os comentários. Um arquivo com erro de sintaxe não

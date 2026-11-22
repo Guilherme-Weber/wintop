@@ -79,6 +79,27 @@ jobs:
         with:
           name: wintop-dist
           path: dist
+      # Assinatura ed25519 do zip para a atualização automática (src/update.rs): a chave privada
+      # só existe no secret; o `.sig` é conferido com a chave pública embutida no wintop
+      # (UPDATE_PUBLIC_KEY, igual a update::PUBLIC_KEY: um teste confere) antes de anexar.
+      - name: Assinatura do zip
+        env:
+          KEY: ${{ secrets.WINTOP_UPDATE_KEY }}
+          UPDATE_PUBLIC_KEY: 07525fffb1d1a5b4a8e7904df5c1e8ff8423f9ea5493fce8339b7143ce74c2b6
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then echo "secret WINTOP_UPDATE_KEY ausente"; exit 1; fi
+          zip=$(ls dist/*.zip)
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key" pub.der' EXIT
+          printf '%s
+' "$KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in "$zip" -out "$zip.sig"
+          # SubjectPublicKeyInfo do Ed25519: prefixo fixo + os 32 bytes da chave.
+          echo "302a300506032b6570032100$UPDATE_PUBLIC_KEY" | xxd -r -p > pub.der
+          openssl pkeyutl -verify -rawin -pubin -keyform DER -inkey pub.der             -in "$zip" -sigfile "$zip.sig"
+          test "$(stat -c %s "$zip.sig")" -eq 64
       - name: Release (rascunho)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,4 +110,4 @@ jobs:
           zip=$(ls dist/*.zip)
           gh release create "$TAG" --repo "$REPO" --draft --verify-tag \
             --title "wintop ${TAG#v}" --notes-file dist/notes.md \
-            "$zip" "$zip.sha256"
+            "$zip" "$zip.sha256" "$zip.sig"

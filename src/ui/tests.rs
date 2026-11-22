@@ -1249,6 +1249,34 @@ fn confirmacao_de_encerrar_processo() {
 }
 
 #[test]
+fn pergunta_de_atualizacao() {
+    let mut st = tab_state(view::Tab::Overview);
+    st.update = Some(view::UpdateUi::Offer("9.0.0".into()));
+    let out = render(&mut st, 160, 48);
+    assert!(
+        out.contains(&format!(
+            "wintop 9.0.0 is available (this is {}). Update now?",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{out}"
+    );
+    assert!(out.contains("y update and restart") && out.contains("n / esc not now"));
+    st.update = Some(view::UpdateUi::Applying("9.0.0".into()));
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("Downloading wintop 9.0.0..."), "{out}");
+    // Em pt-BR, tudo traduzido; e cabe numa tela de 80 colunas sem cortar.
+    crate::i18n::set(crate::i18n::Lang::PtBr);
+    st.update = Some(view::UpdateUi::Offer("9.0.0".into()));
+    let out = render(&mut st, 120, 30);
+    crate::i18n::set(crate::i18n::Lang::EnUs);
+    assert!(
+        out.contains("está disponível (esta é a") && out.contains("Atualizar agora?"),
+        "{out}"
+    );
+    assert!(out.contains("atualizar e reiniciar") && out.contains("agora não"));
+}
+
+#[test]
 fn arvore_de_processos() {
     use super::view::tabs::{ProcSort, tree};
     let p = |pid, parent, create, name: &str, cpu| crate::model::Proc {

@@ -196,6 +196,8 @@ pub struct State {
     /// Encerrar processo pedido (tecla Del na aba Processos): (PID, nome, criação), à espera
     /// da confirmação.
     pub confirm_end: Option<(u32, String, u64)>,
+    /// Pergunta de atualização (versão nova encontrada) ou atualização em andamento.
+    pub update: Option<UpdateUi>,
     /// Mensagem curta de uma ação (fim de processo): texto, se é erro, quando apareceu.
     pub toast: Option<(String, bool, std::time::Instant)>,
     /// Do config (valem na hora quando o arquivo muda).
@@ -876,6 +878,9 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     if st.help {
         draw_help(frame, body);
     }
+    if let Some(u) = &st.update {
+        draw_update(frame, body, u);
+    }
     if let Some((pid, name, _)) = &st.confirm_end {
         draw_confirm_end(frame, body, *pid, name);
     }
@@ -937,6 +942,62 @@ pub struct ListHit {
 
 /// Tempo em que a mensagem de uma ação fica na tela.
 pub const TOAST_FOR: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Estado da atualização na tela.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateUi {
+    /// Versão nova encontrada: pergunta.
+    Offer(String),
+    /// Baixando, conferindo e trocando.
+    Applying(String),
+}
+
+/// Pergunta de atualização (por cima da aba).
+fn draw_update(frame: &mut Frame<'_>, area: Rect, u: &UpdateUi) {
+    let key = |k: &str| {
+        Span::styled(
+            k.to_string(),
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        )
+    };
+    let ver = |v: &str| {
+        Span::styled(
+            format!("wintop {v}"),
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = match u {
+        UpdateUi::Offer(v) => vec![
+            Line::from(vec![
+                label(" "),
+                ver(v),
+                label(" is available (this is "),
+                Span::raw(crate::update::current()),
+                label("). Update now? "),
+            ]),
+            Line::from(vec![
+                key(" y"),
+                label(" update and restart    "),
+                key("n / esc"),
+                label(" not now"),
+            ]),
+        ],
+        UpdateUi::Applying(v) => vec![
+            Line::from(vec![label(" Downloading "), ver(v), label("... ")]),
+            Line::from(label(" Checking the signature, then wintop restarts. ")),
+        ],
+    };
+    let w = (lines.iter().map(|l| l.width() as u16).max().unwrap_or(0) + 3).min(area.width);
+    let h = 4.min(area.height);
+    let r = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(ratatui::widgets::Clear, r);
+    frame.render_widget(Paragraph::new(lines).block(boxed("update", "")), r);
+}
 
 /// Confirmação de encerrar processo (por cima da aba).
 fn draw_confirm_end(frame: &mut Frame<'_>, area: Rect, pid: u32, name: &str) {

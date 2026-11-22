@@ -411,6 +411,11 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Dispara a tarefa: abre a cópia instalada elevada (sem UAC).
+pub fn run_task() -> Result<(), String> {
+    schtasks(&["/run", "/tn", TASK])
+}
+
 /// Versão da cópia instalada (`wintop.exe --version`), se houver uma.
 fn installed_version(exe: &Path) -> Option<String> {
     if !exe.is_file() {
@@ -438,18 +443,72 @@ fn replace_exe(from: &Path, exe: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(p);
     }
     std::fs::copy(from, &new).map_err(|e| format!("copy to {}: {e}", new.display()))?;
+    swap_in(&new, exe)
+}
+
+/// `exe.new` (já gravado) assume o lugar de `exe`; o atual vira `exe.old` (apagado se não estiver
+/// em uso).
+fn swap_in(new: &Path, exe: &Path) -> Result<(), String> {
+    let old = exe.with_extension("exe.old");
     if exe.exists() {
         if let Err(e) = std::fs::rename(exe, &old) {
-            let _ = std::fs::remove_file(&new);
+            let _ = std::fs::remove_file(new);
             return Err(format!("{}: {e}", exe.display()));
         }
-        if running_from(exe) {
+        if running_from(exe) && !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
             println!("wintop is open: the new version starts the next time it opens");
         }
     }
-    std::fs::rename(&new, exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    if let Err(e) = std::fs::rename(new, exe) {
+        // Sem o exe novo no lugar: o antigo volta (melhor esforço).
+        let _ = std::fs::rename(&old, exe);
+        return Err(format!("{}: {e}", exe.display()));
+    }
     let _ = std::fs::remove_file(&old);
     Ok(())
+}
+
+/// Atualização pela TUI: sem mensagens no console (a tela é da interface).
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Atualização automática da cópia instalada (o processo elevado roda dela): o exe e os módulos
+/// novos (já conferidos pela assinatura) são gravados protegidos na própria pasta e trocados no
+/// lugar; a tarefa e o atalho não mudam. A ACL da pasta é conferida antes e depois.
+pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Result<(), String> {
+    QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+    let dir = install_dir()?;
+    check_tree(&dir)?;
+    let exe = dir.join("wintop.exe");
+    let new = exe.with_extension("exe.new");
+    if new.exists() || is_link(&new) {
+        std::fs::remove_file(&new).map_err(|e| format!("{}: {e}", new.display()))?;
+    }
+    create_protected(&new, exe_bytes)?;
+    let mdir = dir.join("modules");
+    if is_link(&mdir) {
+        return Err(format!("{} is a link (refused)", mdir.display()));
+    }
+    std::fs::create_dir_all(&mdir).map_err(|e| format!("{}: {e}", mdir.display()))?;
+    // Módulos antes do exe: um módulo novo com o exe antigo é inofensivo (mesmo formato), o
+    // contrário pode não ser.
+    for (name, data) in modules {
+        if !MODULE_FILES.contains(&name.as_str()) {
+            continue;
+        }
+        let dst = mdir.join(name);
+        let tmp = mdir.join(format!("{name}.new"));
+        if tmp.exists() || is_link(&tmp) {
+            std::fs::remove_file(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        }
+        create_protected(&tmp, data)?;
+        if is_link(&dst) {
+            return Err(format!("{} is a link (refused)", dst.display()));
+        }
+        std::fs::rename(&tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    }
+    swap_in(&new, &exe)?;
+    secure_owner_tree(&dir)?;
+    check_tree(&dir)
 }
 
 /// Há um wintop aberto a partir de `exe` (pelo `.old` ainda travado depois da troca).

@@ -6,6 +6,18 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Adicionado
+
+- Primeira abertura de uma cópia não instalada: o wintop pergunta se deve instalar (cópia em
+  Program Files com o atalho sem UAC, e abre a cópia instalada) ou rodar portátil na pasta, com o
+  `config.toml` ao lado do executável.
+- Atualização automática: a cada abertura, consulta a última release no GitHub (sem API, pelo
+  redirecionamento de `releases/latest`, via WinHTTP) e pergunta se deve atualizar; o zip só é
+  usado com a assinatura ed25519 válida (chave pública embutida) e na versão anunciada, e só o
+  executável e os módulos saem dele (lidos na memória). Depois da troca, o wintop reabre no
+  mesmo console. Opção `check_updates` no `config.toml`.
+- Releases com `<zip>.sig` (assinatura ed25519 feita no workflow, conferida antes de anexar).
+
 ## [1.1.1] - 2026-11-22
 
 ### Alterado

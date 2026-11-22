@@ -90,6 +90,8 @@ pub struct Config {
     pub start_maximized: bool,
     /// Idioma da interface (en-US padrão; pt-BR).
     pub language: crate::i18n::Lang,
+    /// Procurar versão nova no GitHub ao abrir (e oferecer a atualização).
+    pub check_updates: bool,
 }
 
 /// Faixa aceita do limite de alerta do frametime (ms).
@@ -112,6 +114,7 @@ impl Default for Config {
             mouse: true,
             start_maximized: true,
             language: crate::i18n::Lang::EnUs,
+            check_updates: true,
         }
     }
 }
@@ -153,6 +156,10 @@ fn template(c: &Config) -> String {
          # Interface language: \"en-US\" (default) or \"pt-BR\" (Brazilian Portuguese).\n\
          language = \"{}\"\n\
          \n\
+         # Look for a new version on GitHub when wintop opens and offer to install it (the\n\
+         # download is checked against the wintop signing key before anything is replaced).\n\
+         check_updates = {}\n\
+         \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
          ignored = [\n{}]\n\
@@ -168,6 +175,7 @@ fn template(c: &Config) -> String {
         c.mouse,
         c.start_maximized,
         c.language.code(),
+        c.check_updates,
         ignored.concat()
     )
 }
@@ -196,9 +204,35 @@ pub fn roaming() -> Option<PathBuf> {
     crate::win::known_folder(&windows::Win32::UI::Shell::FOLDERID_RoamingAppData).ok()
 }
 
-/// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml`.
+/// Pasta do exe no modo portátil (o config fica nela); definida uma vez, na partida.
+static PORTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Modo portátil: o `config.toml` passa a ser `<dir>\config.toml` (`dir` = pasta do exe).
+pub fn set_portable(dir: PathBuf) {
+    let _ = PORTABLE.set(dir);
+}
+
+/// (base, pasta) do config: `<pasta do exe>` no modo portátil (base = a pasta acima dela),
+/// senão `%APPDATA%\wintop`.
+fn home() -> Option<(PathBuf, String)> {
+    if let Some(d) = PORTABLE.get() {
+        let name = d.file_name()?.to_string_lossy().to_string();
+        return Some((d.parent()?.to_path_buf(), name));
+    }
+    Some((roaming()?, DIR.to_string()))
+}
+
+/// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml` (ou o portátil).
 pub fn default_path() -> Option<PathBuf> {
-    roaming().map(|r| r.join(DIR).join(FILE))
+    home().map(|(b, d)| b.join(d).join(FILE))
+}
+
+/// Lê o config do lugar em uso (portátil ou `%APPDATA%`); `create` como em `load`.
+pub fn load_home(create: bool) -> Loaded {
+    match home() {
+        Some((b, d)) => load_in(Some(b), &d, create),
+        None => load(None, create),
+    }
 }
 
 /// Lê o arquivo em `<base>\wintop\config.toml`; `create`: cria com os padrões se faltar (a
@@ -323,6 +357,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
         match v.as_bool() {
             Some(b) => c.start_maximized = b,
             None => warn.push("config: start_maximized must be true or false".into()),
+        }
+    }
+    if let Some(v) = doc.get("check_updates") {
+        match v.as_bool() {
+            Some(b) => c.check_updates = b,
+            None => warn.push("config: check_updates must be true or false".into()),
         }
     }
     if let Some(v) = doc.get("mouse") {
