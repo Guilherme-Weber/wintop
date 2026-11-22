@@ -342,7 +342,8 @@ pub struct GpuCollector {
     query: Result<Query, String>,
     dedicated: Slot,
     shared: Slot,
-    /// `\GPU Engine(*)`: só com uma GPU sem NVML, e as coletas desde que entrou (taxa).
+    /// `\GPU Engine(*)` do adaptador (uso sem NVML e a engine fora o 3D e o vídeo), e as
+    /// coletas desde que entrou (taxa). ~540 instâncias, ~1 ms por coleta (medido na RTX 5070 Ti).
     engines: Option<Slot>,
     engine_samples: u32,
     /// Última nova associação NVML-DXGI (ver `REMATCH_EVERY`).
@@ -373,13 +374,9 @@ impl GpuCollector {
         c
     }
 
-    /// Abre o contador das engines se alguma GPU precisar dele (sem NVML).
+    /// Abre o contador das engines (uso sem NVML; a engine fora o 3D e o vídeo em todas).
     fn open_engines(&mut self) {
-        let need = self
-            .gpus
-            .iter()
-            .any(|s| matches!(s.source, Source::Dxgi(..)));
-        if need && self.engines.is_none() {
+        if !self.gpus.is_empty() && self.engines.is_none() {
             self.engines = Some(match &self.query {
                 Ok(q) => q.add(r"\GPU Engine(*)\Utilization Percentage"),
                 Err(e) => Err(e.clone()),
@@ -458,6 +455,15 @@ impl GpuCollector {
                         dxgi_gpu(why, &used)
                     }
                 };
+                // Engine fora o 3D e o vídeo, pelo LUID (sem instância do prefixo: falha, nunca
+                // um 0% falso).
+                if matches!(s.source, Source::Nvml(_)) {
+                    g.other_engine = match (&s.adapter, &engines) {
+                        (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+                        _ if lost_adapter(&used_vram) => fail(NO_PDH_INSTANCE),
+                        (Ok((p, _)), Ok(rows)) => other_engine(Ok(adapter_use(rows, p).other)),
+                    };
+                }
                 g.index = pos as u32;
                 g.name.clone_from(&s.name);
                 g.vbios.clone_from(&s.vbios);
@@ -482,6 +488,14 @@ impl GpuCollector {
     }
 }
 
+/// Engine fora o 3D e o vídeo, arredondada (`None` = o adaptador não tem outra).
+fn other_engine(m: Metric<Option<(String, f64)>>) -> Metric<(String, u32)> {
+    m?.map_or_else(
+        || neutral("no other engine reported"),
+        |(t, v)| Ok((t, v.round() as u32)),
+    )
+}
+
 /// GPU sem NVML: uso, encode e decode pelas engines; o resto com o motivo (`no_nvml`).
 fn dxgi_gpu(why: &Missing, used: &Metric<AdapterUse>) -> Gpu {
     let pct = |v: f64| v.round() as u32;
@@ -495,6 +509,7 @@ fn dxgi_gpu(why: &Missing, used: &Metric<AdapterUse>) -> Gpu {
     g.usage = used.as_ref().map(|u| pct(u.usage)).map_err(Clone::clone);
     g.encoder = video(|u| u.encode, "encode");
     g.decoder = video(|u| u.decode, "decode");
+    g.other_engine = other_engine(used.as_ref().map(|u| u.other.clone()).map_err(Clone::clone));
     g
 }
 
@@ -536,6 +551,7 @@ fn read_device(nvml: &Nvml, index: u32) -> Gpu {
             .and_then(|g| Ok((g, nv(d.current_pcie_link_width())?))),
         encoder: nv(d.encoder_utilization()).map(|u| u.utilization),
         decoder: nv(d.decoder_utilization()).map(|u| u.utilization),
+        other_engine: fail(""),
         pstate: nv(d.performance_state()).map(|p| p.as_c()),
         throttle: nv(d.current_throttle_reasons()).map(throttle_names),
     }
@@ -582,6 +598,7 @@ fn missing_gpu(index: u32, m: &Missing) -> Gpu {
         pcie_link: Err(m.clone()),
         encoder: Err(m.clone()),
         decoder: Err(m.clone()),
+        other_engine: Err(m.clone()),
         pstate: Err(m.clone()),
         throttle: Err(m.clone()),
     }

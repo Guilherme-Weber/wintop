@@ -168,6 +168,7 @@ fn event_loop(
     st.theme_name = theme::th().name.to_string();
     st.notice = cfg.warnings.first().cloned();
     st.frametime_alert_ms = cfg.config.frametime_alert_ms;
+    st.refresh_hz = crate::win::primary_refresh_hz();
     st.net_bytes = cfg.config.net_bytes;
     crate::i18n::set(cfg.config.language);
     // Config editado com o wintop aberto: a data do arquivo é conferida a cada 2 s.
@@ -226,6 +227,10 @@ fn event_loop(
         if now != last_second {
             last_second = now;
             st.clock = format!("{:02}:{:02}:{:02}", now.0, now.1, now.2);
+            // Taxa do monitor (teto do FPS) relida a cada 10 s: muda ao trocar o modo de vídeo.
+            if now.2.is_multiple_of(10) {
+                st.refresh_hz = crate::win::primary_refresh_hz();
+            }
             dirty |= st.interval_ms > 1000;
         }
         if dirty {

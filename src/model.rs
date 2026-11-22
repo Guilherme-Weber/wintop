@@ -211,6 +211,9 @@ pub struct Gpu {
     pub pcie_link: Metric<(u32, u32)>,
     pub encoder: Metric<u32>,
     pub decoder: Metric<u32>,
+    /// Engine mais usada fora o 3D e as de vídeo (PDH do adaptador): tipo ("Copy",
+    /// "Compute_0"...) e uso, 0-100.
+    pub other_engine: Metric<(String, u32)>,
     pub pstate: Metric<u32>,
     pub throttle: Metric<Vec<&'static str>>,
 }

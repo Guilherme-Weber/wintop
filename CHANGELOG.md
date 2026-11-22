@@ -6,6 +6,27 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.1.1] - 2026-11-22
+
+### Alterado
+
+- Gradiente do tema padrão: #1E1B4B embaixo, #7E57C2 no meio, #FF8A65 no alto. Atividade
+  pequena nos gráficos de uma linha e as porcentagens das tabelas continuam legíveis no fundo.
+- Cores do jogo no tema padrão: FPS #108981, frametime #8386F1, picos do frametime #FF8A65
+  (cor nova `frametime_spike` em `[colors]`; nos outros temas, a cor de falha).
+- Gráfico de FPS com teto na taxa de atualização do monitor principal (relida a cada 10 s);
+  acima dela a coluna fica #1E1B4B e abaixo de 30 FPS, #FF8A65 (cores `fps_over` e `fps_low`).
+- Caixa da GPU no estilo da caixa da CPU: valor e engine no alto do gráfico com o mínimo e o
+  máximo embaixo; ao lado, uma grade de mini gráficos (com o gradiente) com o 3D, ou a engine
+  mais usada fora o 3D e o vídeo quando o 3D já está no gráfico principal, mais encoder, decoder
+  e atividade da memória; temperatura, potência e clock com o máximo da sessão ao lado do
+  valor e a VRAM numa linha "session VRAM" (como a "session RAM").
+- A consulta `\GPU Engine(*)` da thread rápida vale para todas as GPUs (antes só sem NVML),
+  para a engine fora o 3D e o vídeo (~1 ms por coleta); nova linha no `--check`.
+- A caixa do jogo tem a mesma altura antes e depois do primeiro jogo (o layout não pula).
+- Rede: os gráficos ocupam a altura toda da caixa, e uma linha de base apagada mostra o eixo
+  com a placa parada.
+
 ## [1.1.0] - 2026-11-22
 
 ### Adicionado

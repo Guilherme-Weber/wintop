@@ -113,6 +113,7 @@ HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_suppor
 | Fans (%, RPM), todos os `num_fans` | NVML | | "parado" (0 RPM, modo silencioso) | Spike (2 fans) |
 | PCIe: geração, largura, TX/RX | NVML (TX/RX custam ~23 ms cada: thread lenta) | | | Spike |
 | Encoder / decoder (%) | NVML | | | Spike |
+| Engine mais usada fora o 3D e o vídeo (tipo e %: Copy, Compute, OFA...) | PDH `\GPU Engine(*)\Utilization Percentage` do LUID, mesma conta do uso sem NVML (soma dos processos por engine física, teto 100; maior por tipo). Consulta na thread rápida com qualquer GPU (~540 instâncias, ~1 ms por coleta na RTX 5070 Ti) | | "waiting for a second sample" (1ª coleta); "no other engine reported" | 1.1.1 (2026-11-22: Copy 0,04% parado) |
 | P-state, motivos de throttling | NVML | | | Spike |
 | Hotspot e temperatura da memória | não expostos pela RTX 5070 Ti / NVML | | fora do escopo | — |
 
@@ -125,7 +126,7 @@ troca a GPU exibida nas abas Geral e GPU; a aba Sensores e o `--check` mostram t
 | Métrica (GPU sem NVML) | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Nome, driver | DXGI `GetDesc1` e `CheckInterfaceSupport` (versão WDDM, ex. 32.0.15.8180) | | | E1.1 (RTX forçada sem NVML) |
-| Uso (%) | PDH `\GPU Engine(*)\Utilization Percentage` do LUID: soma dos processos por engine física (teto 100), máximo entre as engines (conta do Task Manager). Consulta aberta na thread rápida só quando existe GPU sem NVML | | "waiting for a second sample" (1ª coleta) | E1.1: 2 pontos de diferença média do NVML com carga, 6 parado (picos de Copy) |
+| Uso (%) | PDH `\GPU Engine(*)\Utilization Percentage` do LUID: soma dos processos por engine física (teto 100), máximo entre as engines (conta do Task Manager). Consulta aberta na thread rápida (com qualquer GPU desde a 1.1.1) | | "waiting for a second sample" (1ª coleta) | E1.1: 2 pontos de diferença média do NVML com carga, 6 parado (picos de Copy) |
 | Encoder / decoder (%) | mesmas engines: `*Encode*` / `*Decode*`; `VideoCodec` (AMD) vale para os dois | | "no video encode/decode engine reported" | E1.1 |
 | VRAM dedicada, compartilhada, por categoria, processos | mesmo PDH das GPUs do NVML; total = DXGI `DedicatedVideoMemory` | | | E1.1 (idêntica ao caminho do NVML) |
 | Campos só do NVML (física, temperatura, clocks, potência, fans, PCIe, P-state, throttling, VBIOS, atividade da memória) | — | | "needs NVML (NVIDIA only)" (AMD, Intel), numa linha só; NVIDIA com o NVML em falha mostra a falha | E1.1 |

@@ -391,6 +391,9 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 );
                 r.line("  Encoder", &g.encoder, |v| format!("{v}%"));
                 r.line("  Decoder", &g.decoder, |v| format!("{v}%"));
+                r.line("  Other engine (busiest)", &g.other_engine, |(t, v)| {
+                    format!("{} {v}%", crate::win::printable(t))
+                });
                 r.line("  P-state", &g.pstate, |v| format!("P{v}"));
                 r.line("  Throttle reasons", &g.throttle, |v| {
                     if v.is_empty() {

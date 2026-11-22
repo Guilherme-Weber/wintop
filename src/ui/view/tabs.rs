@@ -324,9 +324,12 @@ fn pct_cell(v: f64) -> (String, Style) {
     if v < 0.05 {
         return dim(num(0.0, 1));
     }
-    // Texto só até o meio do gradiente: o topo (índigo escuro no tema padrão) sumiria no fundo
-    // e na linha selecionada.
-    (num(v, 1), Style::new().fg(gradient((v / 100.0).min(0.55))))
+    // Texto a partir de 40% do gradiente: a base (índigo escuro no tema padrão) sumiria no
+    // fundo e na linha selecionada.
+    (
+        num(v, 1),
+        Style::new().fg(gradient(0.4 + 0.6 * (v / 100.0).clamp(0.0, 1.0))),
+    )
 }
 
 fn rate(v: f64) -> (String, Style) {
@@ -841,6 +844,13 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         if g.no_nvml.is_none() {
             spans.extend([bar_sep(), label("memory activity "), pctm(&g.mem_activity)]);
         }
+        spans.extend([
+            bar_sep(),
+            label("other engine "),
+            metric(&g.other_engine, |(t, v)| {
+                format!("{} {v}%", super::engine_label(t))
+            }),
+        ]);
         head_lines.extend(super::wrap(spans, inner.width, 0, 9));
     }
     // Sem altura, a tabela fica com pelo menos o cabeçalho e 3 linhas.
@@ -864,8 +874,10 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         inner.width,
     );
     // Pelo menos uma linha de processo fica (cabeçalho + 1 + divisória).
-    let detail_h = (detail.len() as u16).clamp(2, inner.height.saturating_sub(6).max(2));
-    let table_h = inner.height.saturating_sub(3 + 1 + detail_h);
+    // Pelas linhas reais do topo (a linha do adaptador pode quebrar em várias).
+    let head_h = 1 + head_lines.len() as u16;
+    let detail_h = (detail.len() as u16).clamp(2, inner.height.saturating_sub(head_h + 3).max(2));
+    let table_h = inner.height.saturating_sub(head_h + 1 + detail_h);
     let widths = fit(&GPU_COLS, inner.width);
     put(
         frame,

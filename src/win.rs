@@ -283,6 +283,20 @@ pub fn maximize_classic_console() -> bool {
 }
 
 /// `FILETIME` em unidades de 100 ns.
+/// Taxa de atualização (Hz) do monitor principal, pelo modo de vídeo atual. `None` quando o
+/// Windows não informa (0 ou 1 = "padrão do hardware").
+pub fn primary_refresh_hz() -> Option<u32> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: `dm` é um DEVMODEW válido com `dmSize` preenchido; dispositivo nulo = o monitor
+    // da thread atual (o principal).
+    let ok = unsafe { EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut dm) };
+    (ok.as_bool() && dm.dmDisplayFrequency > 1).then_some(dm.dmDisplayFrequency)
+}
+
 pub fn filetime(ft: FILETIME) -> u64 {
     (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
 }

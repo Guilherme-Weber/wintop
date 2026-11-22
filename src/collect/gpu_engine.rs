@@ -27,12 +27,14 @@ fn parse_engine(name: &str) -> Option<(u32, &str, &str, &str)> {
 
 /// Uso do adaptador inteiro (GPU sem NVML), como o Gerenciador de Tarefas: cada engine física
 /// soma o uso de todos os processos (teto 100); o uso da GPU é a engine mais ocupada.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct AdapterUse {
     pub usage: f64,
     /// Engines de vídeo: `None` = o adaptador não tem engine desse tipo.
     pub encode: Option<f64>,
     pub decode: Option<f64>,
+    /// Engine mais usada que não é 3D nem de vídeo (tipo, uso); `None` = não existe.
+    pub other: Option<(String, f64)>,
 }
 
 pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
@@ -63,6 +65,16 @@ pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
         }
         if is_decode(engtype) {
             max(&mut out.decode, v);
+        }
+        if engtype != "3D"
+            && !is_encode(engtype)
+            && !is_decode(engtype)
+            && out
+                .other
+                .as_ref()
+                .is_none_or(|(t, o)| v > *o || (v == *o && engtype < t.as_str()))
+        {
+            out.other = Some((engtype.to_string(), v));
         }
     }
     out
@@ -175,7 +187,10 @@ mod tests {
                 let rows = [(name.to_string(), v), (other.to_string(), v)];
                 for luid in ["luid_0x00000000_0x0000d1e1", ""] {
                     let u = adapter_use(&rows, luid);
-                    for x in [Some(u.usage), u.encode, u.decode].into_iter().flatten() {
+                    for x in [Some(u.usage), u.encode, u.decode, u.other.map(|o| o.1)]
+                        .into_iter()
+                        .flatten()
+                    {
                         assert!((0.0..=100.0).contains(&x));
                     }
                     for engines in group(&rows, luid).values() {
@@ -215,6 +230,18 @@ mod tests {
         let codec = adapter_use(&[row(1, "D1E1", 5, "VideoCodec", 12.0)], l);
         assert_eq!((codec.encode, codec.decode), (Some(12.0), Some(12.0)));
         assert_eq!(adapter_use(&rows, "luid_0x1_"), AdapterUse::default());
+        // Fora o 3D e o vídeo: a Copy (a engine 3D do outro adaptador não entra).
+        assert_eq!(u.other, Some(("Copy".into(), 70.0)));
+        assert_eq!(adapter_use(&rows[..2], l).other, None);
+        // Empate: o tipo de nome menor (resultado estável entre coletas).
+        let tie = adapter_use(
+            &[
+                row(1, "D1E1", 6, "Compute_0", 5.0),
+                row(1, "D1E1", 1, "Copy", 5.0),
+            ],
+            l,
+        );
+        assert_eq!(tie.other, Some(("Compute_0".into(), 5.0)));
     }
 
     #[test]

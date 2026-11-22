@@ -1,6 +1,6 @@
 [package]
 name = "wintop"
-version = "1.1.0"
+version = "1.1.1"
 description = "Monitor de sistema em terminal para Windows: CPU, GPU, VRAM, discos, rede e FPS"
 license = "MIT"
 repository = "https://github.com/Guilherme-Weber/wintop"
@@ -15,6 +15,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Security",

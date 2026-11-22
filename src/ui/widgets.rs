@@ -66,6 +66,14 @@ pub enum GraphColor {
         alert: Color,
         at: f64,
     },
+    /// Cor fixa; `over` nas colunas acima do teto (amostra > 1) e `low` nas que ficam abaixo
+    /// de `low_at` (FPS acima da taxa do monitor / abaixo de 30).
+    Bands {
+        base: Color,
+        over: Color,
+        low: Color,
+        low_at: f64,
+    },
 }
 
 /// Gráfico de área em braille. `samples` em 0..=1, o mais novo por último (fica à direita).
@@ -77,6 +85,9 @@ pub struct Graph<'a> {
     /// Parte de cada amostra pintada num tom mais escuro (tempo de kernel, como o Task Manager
     /// com "Show kernel times"), na mesma escala e alinhamento de `samples`.
     pub under: Option<&'a [f64]>,
+    /// Amostras zeradas acendem o ponto da base nesta cor (eixo da rede espelhada visível com
+    /// a placa parada).
+    pub baseline: Option<Color>,
 }
 
 impl<'a> Graph<'a> {
@@ -86,11 +97,17 @@ impl<'a> Graph<'a> {
             color,
             invert: false,
             under: None,
+            baseline: None,
         }
     }
 
     pub fn with_under(mut self, under: &'a [f64]) -> Self {
         self.under = Some(under);
+        self
+    }
+
+    pub fn with_baseline(mut self, c: Color) -> Self {
+        self.baseline = Some(c);
         self
     }
 
@@ -161,17 +178,39 @@ impl Widget for Graph<'_> {
                         bits |= rb;
                     }
                 }
+                // Base das amostras zeradas (só a 1ª linha de pontos, na cor da base).
+                let mut base_only = false;
+                if row == 0 && self.baseline.is_some() {
+                    let (lb, rb) = if self.invert {
+                        (LEFT[3], RIGHT[3])
+                    } else {
+                        (LEFT[0], RIGHT[0])
+                    };
+                    base_only = bits == 0;
+                    if l == 0 {
+                        bits |= lb;
+                    }
+                    if r == 0 {
+                        bits |= rb;
+                    }
+                }
                 if bits == 0 {
                     continue;
                 }
                 let ch = char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ');
                 let color = match self.color {
-                    GraphColor::Height => gradient(if h > 1 {
-                        row as f64 / (h - 1) as f64
-                    } else {
-                        0.0
-                    }),
-                    GraphColor::Value => gradient(peak),
+                    // Com 1 linha não há altura: a cor vem do valor (como em `Value`), senão
+                    // ficaria sempre na base escura do gradiente.
+                    GraphColor::Height => {
+                        if h > 1 {
+                            gradient(row as f64 / (h - 1) as f64)
+                        } else {
+                            gradient(0.25 + 0.75 * peak)
+                        }
+                    }
+                    // Atividade pequena não some no fundo (a base do gradiente é escura): a cor
+                    // parte de um quarto da escala.
+                    GraphColor::Value => gradient(0.25 + 0.75 * peak),
                     GraphColor::Fixed(c) => c,
                     GraphColor::Threshold { base, alert, at } => {
                         if peak >= at {
@@ -180,10 +219,28 @@ impl Widget for Graph<'_> {
                             base
                         }
                     }
+                    GraphColor::Bands {
+                        base,
+                        over,
+                        low,
+                        low_at,
+                    } => {
+                        if peak > 1.0 {
+                            over
+                        } else if peak < low_at {
+                            low
+                        } else {
+                            base
+                        }
+                    }
                 };
                 // Pelo menos metade da célula na parte de kernel: o mesmo tom, mais escuro (com a
                 // célula inteira, kernel baixo nunca apareceria na grade por núcleo).
                 let color = if k >= base + 2 { darker(color) } else { color };
+                let color = match self.baseline {
+                    Some(b) if base_only => b,
+                    _ => color,
+                };
                 let y = if self.invert { row } else { h - 1 - row };
                 if let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + y as u16)) {
                     cell.set_char(ch).set_fg(color);
@@ -231,9 +288,9 @@ mod tests {
 
     #[test]
     fn gradiente_nas_pontas() {
-        assert_eq!(gradient(0.0), Color::Rgb(0xE0, 0xE7, 0xFF));
-        assert_eq!(gradient(0.5), Color::Rgb(0x7C, 0x3A, 0xED));
-        assert_eq!(gradient(1.0), Color::Rgb(0x43, 0x38, 0xCA));
+        assert_eq!(gradient(0.0), Color::Rgb(0x1E, 0x1B, 0x4B));
+        assert_eq!(gradient(0.5), Color::Rgb(0x7E, 0x57, 0xC2));
+        assert_eq!(gradient(1.0), Color::Rgb(0xFF, 0x8A, 0x65));
         assert_eq!(gradient(f64::NAN), gradient(0.0));
     }
 
@@ -262,6 +319,28 @@ mod tests {
     }
 
     #[test]
+    fn linha_de_base_nas_amostras_zeradas() {
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buf = Buffer::empty(area);
+        let (c, b) = (Color::Rgb(200, 0, 0), Color::Rgb(9, 9, 9));
+        // Célula 0 zerada: só a base (⣀), na cor da base. Célula 1 com valor: cor normal.
+        Graph::new(&[0.0, 0.0, 0.5, 0.0], GraphColor::Fixed(c))
+            .with_baseline(b)
+            .render(area, &mut buf);
+        assert_eq!(buf[(0, 1)].symbol(), "⣀");
+        assert_eq!(buf[(0, 1)].fg, b);
+        assert_eq!(buf[(1, 1)].fg, c);
+        assert_eq!(buf[(0, 0)].symbol(), " ");
+        // Invertido: a base fica na linha de cima (⠉).
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[0.0, 0.0], GraphColor::Fixed(c))
+            .with_baseline(b)
+            .inverted()
+            .render(area, &mut buf);
+        assert_eq!(buf[(1, 0)].symbol(), "⠉");
+    }
+
+    #[test]
     fn parte_de_kernel_mais_escura() {
         // 2 linhas (8 pontos); uso 100%, kernel 50%: a linha de baixo escurece, a de cima não.
         let area = Rect::new(0, 0, 1, 2);
@@ -279,6 +358,10 @@ mod tests {
         let mut buf = Buffer::empty(area);
         Graph::new(&[1.0, 1.0], GraphColor::Value).render(area, &mut buf);
         assert_eq!(buf[(0, 0)].fg, gradient(1.0));
+        // Valor pequeno parte de um quarto da escala (não some no fundo).
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[0.01, 0.0], GraphColor::Value).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].fg, gradient(0.25 + 0.75 * 0.01));
         let mut buf = Buffer::empty(area);
         let t = GraphColor::Threshold {
             base: Color::Green,
@@ -287,6 +370,18 @@ mod tests {
         };
         Graph::new(&[0.7, 0.1], t).render(area, &mut buf);
         assert_eq!(buf[(0, 0)].fg, Color::Red);
+        // Faixas: acima do teto, normal e abaixo do limite.
+        let b = GraphColor::Bands {
+            base: Color::Green,
+            over: Color::Blue,
+            low: Color::Red,
+            low_at: 0.125,
+        };
+        for (s, c) in [(1.2, Color::Blue), (0.5, Color::Green), (0.1, Color::Red)] {
+            let mut buf = Buffer::empty(area);
+            Graph::new(&[s, s], b).render(area, &mut buf);
+            assert_eq!(buf[(0, 0)].fg, c, "{s}");
+        }
     }
 
     #[test]

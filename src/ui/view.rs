@@ -151,6 +151,9 @@ pub struct State {
     cores_kernel: Vec<Series>,
     /// Histórico de cada GPU (todas, para a troca não começar vazia).
     gpu: Vec<Series>,
+    /// Encoder, decoder, atividade da memória, uso geral e a outra engine de cada GPU (grade
+    /// ao lado do gráfico).
+    gpu_video: Vec<[Series; 5]>,
     disks: HashMap<u32, Series>,
     send: HashMap<String, Series>,
     recv: HashMap<String, Series>,
@@ -198,6 +201,8 @@ pub struct State {
     /// Do config (valem na hora quando o arquivo muda).
     pub frametime_alert_ms: f64,
     pub net_bytes: bool,
+    /// Taxa de atualização do monitor principal (teto do gráfico de FPS); vem de fora.
+    pub refresh_hz: Option<u32>,
     /// Tema atual (tecla `t`, gravado no config).
     pub theme_name: String,
     /// Aviso da configuração (arquivo com erro, gravação recusada), no rodapé.
@@ -489,6 +494,18 @@ impl State {
                 let (_, v) = busiest_engine(g);
                 let any = [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok());
                 s.push(if any { f64::from(v) / 100.0 } else { f64::NAN });
+            }
+            self.gpu_video.resize_with(list.len(), Default::default);
+            for (s, g) in self.gpu_video.iter_mut().zip(list) {
+                let other = g
+                    .other_engine
+                    .as_ref()
+                    .map(|(_, v)| *v)
+                    .map_err(Clone::clone);
+                let all = [&g.encoder, &g.decoder, &g.mem_activity, &g.usage, &other];
+                for (s, m) in s.iter_mut().zip(all) {
+                    s.push(m.as_ref().map_or(f64::NAN, |v| f64::from(*v) / 100.0));
+                }
             }
         }
         // A GPU selecionada sumiu (eGPU desconectada): volta para a primeira, com os extremos
@@ -1071,21 +1088,14 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     // Em cima, pelo menos o que CPU + memória e GPU + VRAM precisam para mostrar todas as
     // linhas de detalhe (o conhost do atalho abre com 30 linhas); os gráficos é que encolhem.
     const TOP_MIN: u16 = 23;
-    // Sem jogo nesta sessão (nenhum histórico para manter), a caixa do jogo fica numa faixa de
-    // 5 linhas e a altura que ela não usa vai para os gráficos de cima; com jogo ou com o
-    // histórico do último, ela tem altura.
-    let game_known = st.fps.as_ref().is_some_and(|f| f.game.is_ok()) || !st.game_fps.0.is_empty();
-    let game_min = if game_known { 8 } else { 5 };
+    // A caixa do jogo tem sempre a mesma altura, com ou sem jogo (o layout não pula quando um
+    // jogo abre; pedido do usuário, 2026-11-22).
+    let game_min = 8;
     // Discos: cabeçalho + uma linha por disco visível, mais uma por causa de falha (inteira,
     // embaixo da tabela). Largura da coluna da direita, como no layout abaixo.
     let right_w = body.width - body.width * 34 / 100;
     let disk_rows = (disk_order(st).len() + disk_notes(st, right_w.saturating_sub(2)).len()) as u16;
-    let mut top_h = (body.height * 58 / 100).max(TOP_MIN);
-    if !game_known {
-        // Embaixo, só o que discos e a faixa do jogo pedem (a rede compacta cabe nisso).
-        let bottom_need = (disk_rows + 3 + game_min).max(12);
-        top_h = top_h.max(body.height.saturating_sub(bottom_need));
-    }
+    let top_h = (body.height * 58 / 100).max(TOP_MIN);
     // Embaixo, sempre o mínimo útil: algumas linhas de discos e a faixa do jogo.
     let bottom_min = ((disk_rows.min(3) + 3 + game_min).max(9)).min(body.height / 2);
     let top_h = top_h.min(body.height.saturating_sub(bottom_min));
@@ -1495,6 +1505,7 @@ pub(super) fn failing_sources(st: &State) -> usize {
                     || failed(&g.pcie_link)
                     || failed(&g.encoder)
                     || failed(&g.decoder)
+                    || failed(&g.other_engine)
                     || failed(&g.pstate)
                     || failed(&g.throttle)
             })
@@ -1918,16 +1929,20 @@ fn draw_core_grid(
 /// Engine mais usada (NVML): 3D/compute, encoder ou decoder, como o Task Manager mostra o
 /// máximo dos engines. O Copy não existe no NVML.
 fn busiest_engine(g: &Gpu) -> (&'static str, u32) {
-    let get = |m: &Metric<u32>| m.as_ref().copied().unwrap_or(0);
-    let mut best = (usage_name(g), get(&g.usage));
+    // Só engines com valor: uso geral em falha nunca vira um "0% 3D" falso (a falha aparece
+    // na grade e nas causas da caixa).
+    let mut best: Option<(&'static str, u32)> = g.usage.as_ref().ok().map(|v| (usage_name(g), *v));
     for (name, m) in [("encode", &g.encoder), ("decode", &g.decoder)] {
+        let Ok(v) = m else { continue };
         // Sem NVML o uso geral já é o máximo de todas as engines: no empate, a de vídeo é a
         // mais usada (com NVML a regra fica a mesma).
-        if get(m) > best.1 || (get(m) > 0 && get(m) == best.1) {
-            best = (name, get(m));
-        }
+        best = match best {
+            Some((_, b)) if *v > b || (*v > 0 && *v == b) => Some((name, *v)),
+            None => Some((name, *v)),
+            keep => keep,
+        };
     }
-    best
+    best.unwrap_or((usage_name(g), 0))
 }
 
 /// Nome do uso geral: "3D" no NVML; sem NVML é o máximo de todas as engines (cópia, vídeo,
@@ -1979,118 +1994,64 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let details = gpu_details(st, &g, inner.width);
-    let mut bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
-    // Painel das engines e dos extremos da sessão.
-    let eng = |name: &str, m: &Metric<u32>| -> Vec<(Vec<Span<'static>>, Option<f64>)> {
-        let style = if name == engine {
-            Style::new().fg(th().title).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(th().label)
-        };
-        // Falha: a causa usa a linha toda (sem medidor, que mostraria um 0% falso) e quebra
-        // em mais linhas se não couber no painel.
-        match m {
-            Ok(v) => vec![(
-                vec![
-                    Span::styled(format!("{name:<8}"), style),
-                    text(format!("{v:>3}%")),
-                ],
-                Some(f64::from(*v)),
-            )],
-            Err(e) => {
-                // Só a falha leva o "!" (como em `metric`); o estado neutro não.
-                let mark = if matches!(e, Missing::Fail(_)) {
-                    "! "
-                } else {
-                    ""
-                };
-                let cause = tr(&e.to_string()).into_owned();
-                let words: Vec<Span<'static>> =
-                    std::iter::once(Span::styled(format!("{name:<8}"), style))
-                        .chain(cause.split(' ').enumerate().map(|(i, w)| {
-                            let w = if i == 0 {
-                                format!("{mark}{}", printable(w))
-                            } else {
-                                format!(" {}", printable(w))
-                            };
-                            let mut sp = missing(e);
-                            sp.content = w.into();
-                            sp
-                        }))
-                        .collect();
-                wrap(words, PANEL_W - 1, 0, 8)
-                    .into_iter()
-                    .map(|l| (l.spans, None))
-                    .collect()
-            }
-        }
-    };
-    // Extremos da sessão: "min x · max y unidade" (a unidade só no fim, para caber).
-    let mm = |m: MinMax, f: &dyn Fn(f64) -> String, unit: &str| -> Vec<Span<'static>> {
-        m.get().map_or_else(
-            || vec![label("-")],
-            |(lo, hi)| {
-                vec![
-                    label("min "),
-                    text(f(lo)),
-                    label(" · max "),
-                    text(format!("{}{unit}", f(hi))),
-                ]
-            },
+    let mut details = gpu_details(st, &g, inner.width);
+    // Extremos da sessão como na caixa da CPU: a VRAM numa linha ("session RAM" da memória);
+    // temperatura, potência e clock com o máximo ao lado do valor (`nvml_rows`).
+    let gb = |v: f64| bytes(v as u64);
+    // Sem extremos ainda (troca de GPU, `r`, VRAM sem valor), a linha não aparece vazia.
+    let session = if st.session.vram.get().is_some() {
+        wrap(
+            vec![label("session VRAM "), minmax(st.session.vram, gb)],
+            inner.width,
+            0,
+            8,
         )
+    } else {
+        Vec::new()
     };
-    let row = |name: &str, spans: Vec<Span<'static>>| -> (Vec<Span<'static>>, Option<f64>) {
-        let mut v = vec![label(&format!("{name:<6}"))];
-        v.extend(spans);
-        (v, None)
-    };
-    // Sem NVML, a atividade da memória, a temperatura, a potência e o clock nunca têm valor (o
-    // motivo fica numa linha embaixo): só o que existe.
-    let nvml = g.no_nvml.is_none();
+    // Falhas das engines (as da grade e as fora dela) inteiras, na largura da caixa, como as
+    // causas do uso na caixa da CPU; a grade e o cabeçalho só levam a marca curta.
+    let mut causes: Vec<Line<'static>> = Vec::new();
     let mut engines = vec![
-        eng(usage_name(&g), &g.usage),
-        eng("encode", &g.encoder),
-        eng("decode", &g.decoder),
+        (usage_name(&g), &g.usage),
+        ("encode", &g.encoder),
+        ("decode", &g.decoder),
     ];
-    if nvml {
-        engines.push(eng("mem act", &g.mem_activity));
+    // Sem NVML, a causa da memória já está na linha do NVML (e ela nem entra na grade).
+    if g.no_nvml.is_none() {
+        engines.push(("mem act", &g.mem_activity));
     }
-    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = engines.into_iter().flatten().collect();
-    let engine_rows = rows.len();
-    rows.push((vec![label("session")], None));
-    let n0 = |v: f64| num(v, 0);
-    rows.push(row("util", mm(st.session.gpu, &n0, "%")));
-    if nvml {
-        rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
-        rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
-    }
-    rows.push(row(
-        "VRAM",
-        mm(st.session.vram, &|v| short_bytes(v as u64), ""),
-    ));
-    if nvml {
-        rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
-    }
-    // Sem altura para o painel todo: os extremos da sessão viram uma linha (com quebra) embaixo.
-    let mut session_lines = Vec::new();
-    if inner.height.saturating_sub(bottom_h) < rows.len() as u16 {
-        let mut spans = vec![label("session")];
-        for (r, _) in rows.drain(engine_rows + 1..) {
-            spans.push(label("   "));
-            spans.extend(r);
+    for (name, m) in engines {
+        if let Err(e @ Missing::Fail(_)) = m {
+            causes.extend(wrap(
+                vec![label(&format!("{name} ")), missing(e)],
+                inner.width,
+                0,
+                2,
+            ));
         }
-        rows.truncate(engine_rows);
-        session_lines = wrap(spans, inner.width, 0, 8);
-        // Sem altura nem para isso, a sessão sai da aba Geral (fica na aba Sensores): as
-        // engines ao vivo e os detalhes não podem ser cortados por ela.
-        if inner.height < bottom_h + session_lines.len() as u16 + engine_rows as u16 {
-            session_lines.clear();
-        }
-        bottom_h += session_lines.len() as u16;
     }
+    if let Err(e @ Missing::Fail(_)) = &g.other_engine {
+        causes.extend(wrap(
+            vec![label("other engine "), missing(e)],
+            inner.width,
+            0,
+            2,
+        ));
+    }
+    // Sem altura para tudo, os extremos da VRAM saem primeiro (continuam na aba Sensores): as
+    // leituras ao vivo têm prioridade.
+    let base_h = (2 + details.legend.len() + details.info.len() + causes.len()) as u16;
+    if inner.height >= base_h + session.len() as u16 + 4 {
+        details.info.splice(0..0, session);
+    }
+    details.info.splice(0..0, causes);
+    let bottom_h = (2 + details.legend.len() + details.info.len()) as u16;
+    // Engines ao lado do gráfico, como a grade por lógico da CPU: o 3D (ou, com ele no gráfico
+    // principal, a engine mais usada fora ele e o vídeo), encoder, decoder e a memória.
+    let cells = engine_cells(&g, engine);
     // Os detalhes (métricas) têm prioridade sobre a altura do gráfico.
-    let graph_min = (engine_rows as u16)
+    let graph_min = (cells.len() as u16)
         .max(4)
         .min(inner.height.saturating_sub(bottom_h).max(2));
     let [top, bottom] =
@@ -2098,22 +2059,25 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let [graph, panel] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_W)]).areas(top);
 
-    // Gráfico da engine dominante, com o nome dela no canto.
+    // Gráfico da engine dominante: valor e nome na 1ª linha, extremos na 2ª (como a CPU).
     let head = if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
         vec![
-            text(format!("{engine_v}% ")).add_modifier(Modifier::BOLD),
-            // Mínimo e máximo do uso ficam no painel da sessão (`util`), uma vez só.
+            text(format!("{engine_v}%")).add_modifier(Modifier::BOLD),
+            Span::raw(" "),
             Span::styled(engine.to_string(), Style::new().fg(engine_color(engine))),
         ]
     } else {
-        vec![metric(&g.usage, |v| format!("{v}%"))]
+        // Causa inteira nas linhas de baixo (`causes`).
+        vec![brief(&g.usage, |v| format!("{v}%"))]
     };
     line(frame, head, graph.x, graph.y, graph.width, graph);
+    let mm = minmax(st.session.gpu, |v| format!("{}%", num(v, 0)));
+    line(frame, vec![mm], graph.x, graph.y + 1, graph.width, graph);
     let gr = Rect::new(
         graph.x,
-        graph.y + 1,
+        graph.y + 2,
         graph.width.saturating_sub(1),
-        graph.height.saturating_sub(1),
+        graph.height.saturating_sub(2),
     );
     frame.render_widget(
         Graph::new(
@@ -2122,26 +2086,13 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ),
         gr.intersection(graph),
     );
-
-    for (i, (spans, meter)) in rows.into_iter().enumerate() {
-        let y = panel.y + i as u16;
-        if y >= panel.y + panel.height {
-            break;
-        }
-        // Linhas com medidor: rótulo + valor em 13 colunas; as de extremos usam o painel todo.
-        let w = if meter.is_some() {
-            13
-        } else {
-            panel.width.saturating_sub(1)
-        };
-        line(frame, spans, panel.x + 1, y, w, panel);
-        if let Some(v) = meter {
-            frame.render_widget(
-                Meter { value: v / 100.0 },
-                Rect::new(panel.x + 15, y, panel.width.saturating_sub(15), 1).intersection(panel),
-            );
-        }
-    }
+    let panel = Rect::new(
+        panel.x + 1,
+        panel.y,
+        panel.width.saturating_sub(1),
+        panel.height,
+    );
+    draw_engine_cells(frame, panel, &cells, st.gpu_video.get_mut(sel));
 
     // VRAM por categoria, compartilhada, física e o resto das leituras.
     let slow = st
@@ -2164,14 +2115,177 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         );
     }
     bar_line(frame, b, 1 + n, "shared", &g.shared);
-    let below = details.info.into_iter().chain(session_lines);
-    for (i, l) in below.enumerate() {
+    for (i, l) in details.info.into_iter().enumerate() {
         put(
             frame,
             Paragraph::new(l),
             Rect::new(b.x, b.y + 2 + n + i as u16, b.width, 1),
             b,
         );
+    }
+}
+
+/// Uma engine da grade ao lado do gráfico da GPU: nome, valor e a série em `gpu_video`.
+struct EngineCell {
+    name: String,
+    value: Metric<u32>,
+    series: usize,
+}
+
+/// Séries de `gpu_video`: encoder, decoder, memória, uso geral (3D) e a outra engine.
+const SERIES_3D: usize = 3;
+const SERIES_OTHER: usize = 4;
+
+/// Nome curto de um tipo de engine do PDH ("Compute_0" → "compute 0").
+fn engine_label(t: &str) -> String {
+    printable(&t.replace('_', " ").to_lowercase())
+}
+
+/// Engines da grade: o 3D, ou a outra engine quando o 3D já é o gráfico principal; depois
+/// encoder, decoder e (com NVML) a atividade da memória.
+fn engine_cells(g: &Gpu, main: &str) -> Vec<EngineCell> {
+    // O uso geral fica na grade quando não é o gráfico principal (vídeo dominante, ou ele em
+    // falha); senão, a outra engine.
+    let first = if matches!(main, "encode" | "decode") || g.usage.is_err() {
+        EngineCell {
+            name: usage_name(g).into(),
+            value: g.usage.clone(),
+            series: SERIES_3D,
+        }
+    } else {
+        EngineCell {
+            name: g
+                .other_engine
+                .as_ref()
+                .map_or_else(|_| "other".into(), |(t, _)| engine_label(t)),
+            value: g
+                .other_engine
+                .as_ref()
+                .map(|(_, v)| *v)
+                .map_err(Clone::clone),
+            series: SERIES_OTHER,
+        }
+    };
+    let mut cells = vec![
+        first,
+        EngineCell {
+            name: "encode".into(),
+            value: g.encoder.clone(),
+            series: 0,
+        },
+        EngineCell {
+            name: "decode".into(),
+            value: g.decoder.clone(),
+            series: 1,
+        },
+    ];
+    // Sem NVML a atividade da memória nunca tem valor (o motivo está na linha do NVML).
+    if g.no_nvml.is_none() {
+        cells.push(EngineCell {
+            name: "mem act".into(),
+            value: g.mem_activity.clone(),
+            series: 2,
+        });
+    }
+    cells
+}
+
+/// Grade das engines (uma coluna), no estilo da grade por lógico da CPU: rótulo e valor na 1ª
+/// linha de cada célula e o gráfico com o gradiente embaixo. Sem altura para gráfico, uma lista
+/// compacta. Sem valor, a causa inteira no lugar do gráfico.
+fn draw_engine_cells(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cells: &[EngineCell],
+    mut series: Option<&mut [Series; 5]>,
+) {
+    let n = cells.len() as u16;
+    if n == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let head = |c: &EngineCell| -> Vec<Span<'static>> {
+        // Nome com 8 colunas e sempre um espaço depois ("compute 0 100%").
+        // O alinhamento do valor vai no fim do rótulo: um span que começa com espaço é ponto de
+        // quebra no `wrap`, e o nome nunca se separa do valor.
+        let mut v = vec![label(&format!("{:<8} ", c.name))];
+        match &c.value {
+            Ok(x) => {
+                let s = format!("{x}%");
+                if let Some(l) = v.first_mut() {
+                    *l = label(&format!(
+                        "{:<8} {:pad$}",
+                        c.name,
+                        "",
+                        pad = 4usize.saturating_sub(s.len())
+                    ));
+                }
+                v.push(text(s));
+            }
+            // A causa inteira de uma falha está nas linhas de baixo da caixa.
+            Err(Missing::Fail(_)) => v.push(failed_span()),
+            Err(e) => v.push(missing(e)),
+        }
+        v
+    };
+    let ch = area.height / n;
+    if ch < 2 {
+        // Lista compacta: uma engine por linha (a causa de uma falha quebra em mais linhas,
+        // inteira); sem altura para isso, quebrando só entre uma engine e outra.
+        let mut lines: Vec<Line<'static>> = cells
+            .iter()
+            .flat_map(|c| wrap(head(c), area.width, 0, 8))
+            .collect();
+        if lines.len() > usize::from(area.height) {
+            let spans: Vec<Span<'static>> = cells
+                .iter()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    let mut h = head(c);
+                    if i > 0 {
+                        h.insert(0, Span::raw("  "));
+                    }
+                    h
+                })
+                .collect();
+            lines = wrap(spans, area.width, 0, 0);
+        }
+        put(frame, Paragraph::new(lines), area, area);
+        return;
+    }
+    let extra = area.height % n;
+    let mut y = area.y;
+    for (k, c) in cells.iter().enumerate() {
+        let h = ch + u16::from((k as u16) < extra);
+        let cell = Rect::new(area.x, y, area.width, h).intersection(area);
+        y += h;
+        if let Err(e @ Missing::Neutral(_)) = &c.value {
+            // Estado neutro: o texto alinhado depois do nome, quebrando por palavra.
+            let mut lines = wrap(vec![missing(e)], cell.width, 9, 9);
+            if let Some(first) = lines.first_mut()
+                && let Some(pad) = first.spans.first_mut()
+            {
+                *pad = label(&format!("{:<8} ", c.name));
+            }
+            put(frame, Paragraph::new(lines), cell, cell);
+            continue;
+        }
+        if c.value.is_err() {
+            line(frame, head(c), cell.x, cell.y, cell.width, cell);
+            continue;
+        }
+        line(frame, head(c), cell.x, cell.y, cell.width, cell);
+        if let Some(s) = series.as_mut().and_then(|s| s.get_mut(c.series)) {
+            let g = Rect::new(
+                cell.x,
+                cell.y + 1,
+                cell.width,
+                cell.height.saturating_sub(1),
+            );
+            frame.render_widget(
+                Graph::new(s.values(), GraphColor::Height),
+                g.intersection(cell),
+            );
+        }
     }
 }
 
@@ -2210,7 +2324,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
             vec![label("drv    "), metric(&g.driver, Clone::clone)],
         ]
     } else {
-        nvml_rows(g, slow.as_ref(), slow_err.as_ref())
+        nvml_rows(g, slow.as_ref(), slow_err.as_ref(), &st.session)
     };
     let info = rows
         .into_iter()
@@ -2228,7 +2342,15 @@ fn nvml_rows(
     g: &Gpu,
     slow: Option<&crate::model::GpuSlow>,
     slow_err: Option<&Missing>,
+    session: &Session,
 ) -> Vec<Vec<Span<'static>>> {
+    // Máximo da sessão ao lado do valor, como o Tctl e a potência da CPU.
+    let max = |m: MinMax| -> Span<'static> {
+        m.get().map_or_else(
+            || Span::raw(""),
+            |(_, hi)| label(&format!(" (max {})", num(hi, 0))),
+        )
+    };
     // Máximo 0 = o NVML não informa (GPUs móveis): só o atual.
     let clk = |m: &Metric<(u32, u32)>| {
         metric(m, |(c, mx)| {
@@ -2260,6 +2382,7 @@ fn nvml_rows(
         vec![
             label("clk    gfx "),
             clk(&g.clock_graphics),
+            max(session.gfx_clock),
             label("  SM "),
             clk(&g.clock_sm),
             label("  mem "),
@@ -2271,6 +2394,7 @@ fn nvml_rows(
         vec![
             label("temp   "),
             metric(&g.temp, |v| format!("{v} °C")),
+            max(session.gpu_temp),
             Span::raw(" "),
             metric(&g.temp_slowdown, |v| format!("(slowdown {v} °C)")),
             sep(),
@@ -2282,6 +2406,7 @@ fn nvml_rows(
                     format!("{} W", num(*p, 0))
                 }
             }),
+            max(session.gpu_power),
             sep(),
             metric(&g.pstate, |v| format!("P{v}")),
             sep(),
@@ -2905,14 +3030,15 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let room = inner.height.saturating_sub(bottom_rows);
     // Sobra repartida entre as placas como gráfico espelhado (só a partir de 2 linhas).
     let spare = room.saturating_sub(need(shown));
-    // Gráfico com teto; com sobra, uma linha em branco separa as placas.
-    const NET_GRAPH_MAX: u16 = 6;
+    // Os gráficos ocupam toda a sobra (sem espaço vazio embaixo); com mais de uma placa, uma
+    // linha em branco as separa.
+    let gaps = shown.saturating_sub(1) as u16;
+    let gap = gaps > 0 && spare >= gaps + 2 * shown as u16;
     let graph_h = if shown > 0 {
-        (spare / shown as u16).min(NET_GRAPH_MAX)
+        spare.saturating_sub(if gap { gaps } else { 0 }) / shown as u16
     } else {
         0
     };
-    let gap = shown > 1 && spare >= graph_h * shown as u16 + (shown as u16 - 1);
     let mut y = inner.y;
     for (k, (n, (_, rates))) in up.iter().zip(&fixed).take(shown).enumerate() {
         if gap && k > 0 {
@@ -2977,7 +3103,8 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ] {
                 if let Some(s) = series {
                     let data = s.over(n_samples, scale);
-                    let g = Graph::new(&data, GraphColor::Fixed(color));
+                    // Linha de base apagada no meio: placa parada continua com o eixo visível.
+                    let g = Graph::new(&data, GraphColor::Fixed(color)).with_baseline(th().dim);
                     let g = if inverted { g.inverted() } else { g };
                     frame.render_widget(
                         g,
@@ -3503,6 +3630,9 @@ fn head_fit(mut head: Vec<Span<'static>>, mm: Span<'static>, room: u16) -> Vec<S
     head
 }
 
+/// Abaixo disto o gráfico de FPS muda de cor.
+const FPS_LOW: f64 = 30.0;
+
 /// Teto do gráfico de FPS: o menor degrau acima do máximo visível.
 fn fps_ceiling(max: f64) -> f64 {
     FPS_STEPS
@@ -3606,9 +3736,12 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let [fps_area, ft_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(graphs);
 
-    // FPS: teto em degraus pelo máximo visível.
+    // FPS: teto na taxa do monitor (ou em degraus pelo máximo visível).
     let n = usize::from(fps_area.width) * 2;
-    let ceil = fps_ceiling(st.game_fps.max_of(n));
+    // Teto = taxa do monitor principal (acima dela, cor própria); sem ela, degraus pelo máximo.
+    let ceil = st
+        .refresh_hz
+        .map_or_else(|| fps_ceiling(st.game_fps.max_of(n)), f64::from);
     let ceil_label = format!("{} ", num(ceil, 0));
     let head = head_fit(
         vec![
@@ -3645,11 +3778,19 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         fps_area.height.saturating_sub(1),
     );
     frame.render_widget(
-        Graph::new(&data, GraphColor::Fixed(th().fps)),
+        Graph::new(
+            &data,
+            GraphColor::Bands {
+                base: th().fps,
+                over: th().fps_over,
+                low: th().fps_low,
+                low_at: FPS_LOW / ceil,
+            },
+        ),
         gr.intersection(fps_area),
     );
 
-    // Frametime: teto fixo de 50 ms; picos acima de 33 ms em vermelho.
+    // Frametime: teto fixo de 50 ms; picos acima do limite na cor de pico do tema.
     let n = usize::from(ft_area.width) * 2;
     let head = head_fit(
         vec![
@@ -3689,7 +3830,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             &data,
             GraphColor::Threshold {
                 base: th().frametime,
-                alert: th().fail,
+                alert: th().frametime_spike,
                 at: st.frametime_alert_ms / FT_CEIL_MS,
             },
         ),

@@ -144,6 +144,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("scale ", "escala "),
     ("speed avg ", "clock médio "),
     ("session RAM ", "sessão RAM "),
+    ("session VRAM ", "sessão VRAM "),
     ("disconnected: ", "desconectadas: "),
     ("peak ", "pico "),
     ("(max ", "(máx "),
@@ -173,6 +174,8 @@ const SUFFIXES: &[(&str, &str)] = &[
 /// gfx, clk, PCIe...) ficam como estão: são termos técnicos e mudar a largura desalinharia as
 /// colunas.
 const PT_BR: &[(&str, &str)] = &[
+    ("other", "outra"),
+    ("other engine", "outra engine"),
     // Abas e caixas.
     ("Overview", "Geral"),
     ("Processes", "Processos"),
@@ -450,6 +453,7 @@ const PT_BR: &[(&str, &str)] = &[
         "no video decode engine reported",
         "sem engine de decodificação de vídeo",
     ),
+    ("no other engine reported", "nenhuma outra engine informada"),
     (
         "driver version not reported by DXGI",
         "versão do driver não informada pelo DXGI",
