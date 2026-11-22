@@ -61,7 +61,7 @@ pub fn mode() -> Mode {
     let Ok(me) = std::env::current_exe() else {
         return Mode::Undecided(PathBuf::new());
     };
-    let dir = me.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+    let dir = me.parent().map_or_else(PathBuf::new, crate::win::long_path);
     let canon = |p: &Path| {
         std::fs::canonicalize(p).map_or_else(
             |_| p.to_string_lossy().to_lowercase(),
@@ -451,6 +451,7 @@ pub fn download(version: &str) -> Result<Package, String> {
 
 /// Troca a cópia portátil em `dir` (pasta do usuário: tudo pelo `userfile`, sem seguir links).
 fn apply_portable(dir: &Path, pkg: &Package) -> Result<(), String> {
+    let dir = &crate::win::long_path(dir);
     let base = dir.parent().ok_or("executable folder has no parent")?;
     let name = dir
         .file_name()

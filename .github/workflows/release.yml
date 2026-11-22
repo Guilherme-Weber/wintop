@@ -93,12 +93,11 @@ jobs:
           umask 077
           key=$(mktemp)
           trap 'rm -f "$key" pub.der' EXIT
-          printf '%s
-' "$KEY" > "$key"
+          printf '%s\n' "$KEY" > "$key"
           openssl pkeyutl -sign -rawin -inkey "$key" -in "$zip" -out "$zip.sig"
           # SubjectPublicKeyInfo do Ed25519: prefixo fixo + os 32 bytes da chave.
           echo "302a300506032b6570032100$UPDATE_PUBLIC_KEY" | xxd -r -p > pub.der
-          openssl pkeyutl -verify -rawin -pubin -keyform DER -inkey pub.der             -in "$zip" -sigfile "$zip.sig"
+          openssl pkeyutl -verify -rawin -pubin -keyform DER -inkey pub.der -in "$zip" -sigfile "$zip.sig"
           test "$(stat -c %s "$zip.sig")" -eq 64
       - name: Release (rascunho)
         env:

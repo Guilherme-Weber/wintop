@@ -76,6 +76,27 @@ pub fn windows_dir() -> Option<PathBuf> {
     (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
+/// Caminho com os nomes curtos 8.3 expandidos (`RUNNER~1` -> `runneradmin`), sem resolver links;
+/// o original se a expansão falhar. A conferência do caminho final do `userfile` compara com o
+/// nome longo.
+pub fn long_path(p: &std::path::Path) -> PathBuf {
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let w = wide(&p.to_string_lossy());
+    let mut buf = vec![0u16; 512];
+    for _ in 0..2 {
+        // SAFETY: entrada terminada em zero; buffer local com o tamanho informado.
+        let n = unsafe { GetLongPathNameW(PCWSTR(w.as_ptr()), Some(&mut buf)) } as usize;
+        if n == 0 {
+            break;
+        }
+        if n < buf.len() {
+            return PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+        }
+        buf.resize(n, 0);
+    }
+    p.to_path_buf()
+}
+
 /// Letra da unidade do Windows (ex.: `'C'`).
 pub fn windows_drive() -> Option<char> {
     let mut buf = [0u16; 260];
@@ -328,6 +349,24 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Nome curto 8.3 vira o longo (o teste de troca portátil quebrava na CI com `RUNNER~1`);
+    /// caminho inexistente volta igual.
+    #[test]
+    fn caminho_longo() {
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let dir = std::env::temp_dir().join(format!("wintop_nome_longo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = wide(&dir.to_string_lossy());
+        let mut buf = [0u16; 512];
+        // SAFETY: entrada terminada em zero; buffer local com o tamanho informado.
+        let n = unsafe { GetShortPathNameW(PCWSTR(w.as_ptr()), Some(&mut buf)) } as usize;
+        let short = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+        assert_eq!(long_path(&short), dir, "curto: {}", short.display());
+        let none = dir.join("nao-existe");
+        assert_eq!(long_path(&none), none);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
