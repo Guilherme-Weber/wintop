@@ -71,9 +71,10 @@ pub const DEFAULT: Theme = Theme {
     vram_browser: Color::Rgb(92, 156, 230),
     vram_system: Color::Rgb(154, 160, 176),
     vram_kernel: Color::Rgb(138, 132, 88),
-    low: Color::Rgb(80, 200, 120),
-    mid: Color::Rgb(230, 200, 60),
-    high: Color::Rgb(230, 70, 70),
+    // Gradiente escolhido pelo usuário (1.1): lavanda → violeta → índigo escuro.
+    low: rgb(0xE0E7FF),
+    mid: rgb(0x7C3AED),
+    high: rgb(0x1E1B4B),
 };
 
 const NORD: Theme = Theme {

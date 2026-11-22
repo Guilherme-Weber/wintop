@@ -1,12 +1,12 @@
 //! Widgets no estilo do btop: gráfico em braille preenchido (2 amostras por célula, 4 níveis
-//! por linha) e medidor de blocos com gradiente verde → amarelo → vermelho.
+//! por linha) e medidor de blocos com o gradiente do tema (baixo → meio → alto).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
-/// Gradiente do btop (padrão): verde em 0, amarelo no meio, vermelho em 1.
+/// Gradiente do tema entre baixo (0), meio (0,5) e alto (1).
 pub fn gradient(t: f64) -> Color {
     let rgb = |c: Color| match c {
         Color::Rgb(r, g, b) => (f64::from(r), f64::from(g), f64::from(b)),
@@ -219,9 +219,9 @@ mod tests {
 
     #[test]
     fn gradiente_nas_pontas() {
-        assert_eq!(gradient(0.0), Color::Rgb(80, 200, 120));
-        assert_eq!(gradient(0.5), Color::Rgb(230, 200, 60));
-        assert_eq!(gradient(1.0), Color::Rgb(230, 70, 70));
+        assert_eq!(gradient(0.0), Color::Rgb(0xE0, 0xE7, 0xFF));
+        assert_eq!(gradient(0.5), Color::Rgb(0x7C, 0x3A, 0xED));
+        assert_eq!(gradient(1.0), Color::Rgb(0x1E, 0x1B, 0x4B));
         assert_eq!(gradient(f64::NAN), gradient(0.0));
     }
 

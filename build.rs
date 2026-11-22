@@ -5,6 +5,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=wintop.exe.manifest");
+    println!("cargo:rerun-if-changed=assets/wintop.ico");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -35,6 +36,8 @@ fn main() {
 
     let mut res = winresource::WindowsResource::new();
     res.set_manifest_file("wintop.exe.manifest");
+    // Ícone do programa (Explorer, Menu Iniciar, barra de tarefas): vários tamanhos em PNG.
+    res.set_icon("assets/wintop.ico");
     res.set("FileDescription", "wintop - terminal system monitor");
     res.set("ProductName", "wintop");
     if let Err(e) = res.compile_for("wintop") {
