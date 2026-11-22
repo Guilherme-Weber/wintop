@@ -344,8 +344,15 @@ impl State {
             }
             match &s.gpus {
                 Ok(list) => {
-                    if let Some(p) = self.slow_gpu(list).and_then(|g| g.procs.clone()) {
-                        self.gpu_procs = Some(p);
+                    if let Some(g) = self.slow_gpu(list) {
+                        if let Some(p) = &g.procs {
+                            self.gpu_procs = Some(p.clone());
+                        }
+                    } else {
+                        // A GPU exibida não está na lista lenta (sumiu, ou a lenta ainda não a
+                        // achou): a lista dela não vale mais.
+                        self.gpu_procs = None;
+                        self.runtimes.clear();
                     }
                 }
                 Err(e) => self.gpu_procs = Some(Err(e.clone())),
@@ -1507,8 +1514,14 @@ pub(super) fn failing_sources(st: &State) -> usize {
                 .and_then(|l| l.iter().find(|g| g.index == i))
                 .is_some_and(|g| g.no_nvml.is_some())
         };
+        // Na lista lenta, a GPU exibida é a da posição da rápida (`slow_gpu`).
         add(source_failed(&s.gpus, |l| {
-            shown_gpus(st, l).any(|g| {
+            let shown: Vec<&crate::model::GpuSlow> = if st.tab == Tab::Sensors {
+                l.iter().collect()
+            } else {
+                st.slow_gpu(l).into_iter().collect()
+            };
+            shown.into_iter().any(|g| {
                 failed(&g.vram) || (!no_nvml(g.index) && (failed(&g.pcie_tx) || failed(&g.pcie_rx)))
             })
         }));
