@@ -305,6 +305,9 @@ fn volume_letters() -> Vec<(u32, String)> {
 pub(super) struct Inventory {
     pub(super) number: u32,
     pub(super) model: Metric<String>,
+    /// Modelo do próprio descritor (`model` pode ser o nome do PnP, com outro texto): é o que
+    /// `alive` compara para reconhecer outro disco no mesmo número.
+    desc_model: Option<String>,
     pub(super) bus: Metric<Bus>,
     pub(super) ssd: Metric<bool>,
     capacity: Metric<u64>,
@@ -344,6 +347,7 @@ impl Inventory {
         let mut inv = Self {
             number: n,
             model,
+            desc_model: desc.as_deref().ok().and_then(model_name),
             bus,
             ssd,
             capacity: fail("not read"),
@@ -401,8 +405,8 @@ impl Inventory {
             Some(h) => h.property(PROP_DEVICE).is_ok(),
             None => Handle::open(self.number, 0).is_some_and(|h| {
                 let now = h.property(PROP_DEVICE).ok().and_then(|d| model_name(&d));
-                match (&self.model, now) {
-                    (Ok(m), Some(n)) => *m == n,
+                match (&self.desc_model, now) {
+                    (Some(m), Some(n)) => *m == n,
                     _ => true,
                 }
             }),
@@ -862,6 +866,24 @@ mod tests {
 
     /// Compara com o PDH na mesma janela. Rodar elevado, com carga no disco do sistema:
     /// `winsat disk -seq -read -drive c` em outro terminal.
+    /// Sem o handle guardado (como um disco USB), todo disco real continua "vivo": o modelo
+    /// comparado é o do descritor, não o nome do PnP (que tem outro texto, ex.: "USB Device").
+    #[test]
+    #[ignore = "hardware: abre os discos físicos (terminal elevado)"]
+    fn disco_sem_handle_continua_vivo() {
+        let mut all = discover_all();
+        assert!(!all.is_empty(), "nenhum disco");
+        for d in &mut all {
+            d.handle = None;
+            assert!(
+                d.alive(),
+                "disco {} ({:?}) dado como removido",
+                d.number,
+                d.model
+            );
+        }
+    }
+
     #[test]
     #[ignore = "hardware: compara com o PDH sob carga (terminal elevado)"]
     fn compara_com_pdh() {
