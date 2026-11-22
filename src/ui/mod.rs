@@ -119,7 +119,7 @@ fn event_loop(
                         KeyCode::Backspace => {
                             st.filter.pop();
                         }
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('c' | 'C') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
                         }
                         KeyCode::Char(c) if !c.is_control() && st.filter.chars().count() < 64 => {
@@ -129,7 +129,14 @@ fn event_loop(
                     }
                     dirty = true;
                 }
-                Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                // Atalhos de letra valem com Caps Lock ligado (o filtro, acima, guarda o texto
+                // como digitado).
+                Event::Key(k) if k.kind == KeyEventKind::Press => match lower(k.code) {
+                    // Esc com um filtro aplicado limpa o filtro (o segundo Esc sai).
+                    KeyCode::Esc if st.tab == view::Tab::Processes && !st.filter.is_empty() => {
+                        st.filter.clear();
+                        dirty = true;
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
@@ -188,6 +195,14 @@ fn event_loop(
 
 /// Teclas das listas (abas Processos e GPU). `true` = redesenhar.
 /// Grava no `config.toml` o que a interface muda (intervalo, tema, pool); erro vira aviso.
+/// Tecla de atalho em minúscula (Caps Lock ligado não desliga `q`, `t`, `j`/`k`, Ctrl+C...).
+fn lower(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+        c => c,
+    }
+}
+
 fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {
     let mut c = cfg.config.clone();
     c.interval_ms = st.interval_ms;

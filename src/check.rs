@@ -263,13 +263,23 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 });
                 r.line("  Temperature", &g.temp, |v| format!("{v} °C"));
                 r.line("  Slowdown limit", &g.temp_slowdown, |v| format!("{v} °C"));
-                let clk = |(c, m): &(u32, u32)| format!("{c} / {m} MHz");
+                let clk = |(c, m): &(u32, u32)| {
+                    if *m > 0 {
+                        format!("{c} / {m} MHz")
+                    } else {
+                        format!("{c} MHz (max not reported)")
+                    }
+                };
                 r.line("  Graphics clock", &g.clock_graphics, clk);
                 r.line("  SM clock", &g.clock_sm, clk);
                 r.line("  Memory clock", &g.clock_mem, clk);
                 r.line("  Video clock", &g.clock_video, clk);
                 r.line("  Power / limit", &g.power, |(p, l)| {
-                    format!("{} / {} W", num(*p, 1), num(*l, 0))
+                    if *l > 0.0 {
+                        format!("{} / {} W", num(*p, 1), num(*l, 0))
+                    } else {
+                        format!("{} W (limit not reported)", num(*p, 1))
+                    }
                 });
                 match &g.fans {
                     Err(e) => r.line("  Fans", &Err::<(), _>(e.clone()), |()| String::new()),

@@ -368,6 +368,8 @@ const MAX_FRAMES: usize = 60_000;
 const MAX_SIGNALS_PER_PUMP: u32 = 1024;
 /// Índices ainda fora da Shared Memory: quantos e quantos frames cada (4 s a 1000 FPS).
 const MAX_UNKNOWN_RINGS: usize = 8;
+/// Apps com a janela completa de frames (os 3D mais recentes da Shared Memory).
+const MAX_KNOWN: usize = 8;
 const UNKNOWN_FRAMES: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -878,11 +880,17 @@ impl RtssCollector {
         let (ign, ok): (Vec<&App>, Vec<&App>) = apps
             .iter()
             .partition(|a| is_ignored(&self.ignored_names, &a.name));
-        self.known = ok.iter().map(|a| a.index).collect();
+        // Janela completa (60 s) só para os MAX_KNOWN apps 3D com frames mais recentes: a
+        // tabela do RTSS guarda apps fechados e, com uma Shared Memory falsa, até 256 entradas
+        // (256 × 60 mil frames). Um jogo travado continua entre os mais recentes.
+        let mut active: Vec<&App> = ok.iter().copied().filter(|a| a.api != 0).collect();
+        active.sort_by_key(|a| a.age_ms.unwrap_or(u32::MAX));
+        active.truncate(MAX_KNOWN);
+        self.known = active.iter().map(|a| a.index).collect();
         self.ignored = ign.iter().map(|a| a.index).collect();
         // Índice reaproveitado por outro app: os frames antigos não valem. Ring sem dono
         // (frames que chegaram antes desta amostra) fica com o app atual do índice.
-        for a in &ok {
+        for a in &active {
             let ring = self.exact.entry(a.index).or_default();
             if ring.pid.is_some_and(|p| p != a.pid) {
                 ring.frames.clear();

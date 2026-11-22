@@ -97,7 +97,7 @@ fn gpu() -> Gpu {
     }
 }
 
-fn fast(step: u32) -> Fast {
+pub(super) fn fast(step: u32) -> Fast {
     let mut c = cpu();
     c.usage = Ok(f64::from(step * 7 % 100));
     let mut g = gpu();
@@ -203,7 +203,7 @@ fn slow() -> Slow {
     }
 }
 
-fn game() -> Fps {
+pub(super) fn game() -> Fps {
     Fps {
         rtss: Ok("shared memory 2.21".into()),
         pipe: Ok((8, 1)),
@@ -844,6 +844,24 @@ fn injections() -> Vec<(&'static str, Inject)> {
     vec![
         ("cpu.name", cpu(|c, t| c.name = f(t))),
         ("cpu.topology", cpu(|c, t| c.topology = f(t))),
+        ("cpu.usage", cpu(|c, t| c.usage = f(t))),
+        ("cpu.kernel", cpu(|c, t| c.kernel = f(t))),
+        (
+            "cpu.usage+kernel",
+            cpu(|c, t| {
+                c.usage = f(t);
+                c.kernel = f(t);
+            }),
+        ),
+        ("cpu.per_logical", cpu(|c, t| c.per_logical = f(t))),
+        (
+            "sensors.ccds",
+            Box::new(|fa, _, _, t| {
+                if let Ok(s) = &mut fa.cpu_sensors {
+                    s.ccds = f(t);
+                }
+            }),
+        ),
         ("cpu.base", cpu(|c, t| c.base_mhz = f(t))),
         ("cpu.virt", cpu(|c, t| c.virtualization = f(t))),
         ("cpu.freq", cpu(|c, t| c.freq_mhz = f(t))),
@@ -866,6 +884,10 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         ("mem.commit", mem(|m, t| m.commit = f(t))),
+        ("mem.used", mem(|m, t| m.used = f(t))),
+        ("mem.total", mem(|m, t| m.total = f(t))),
+        ("mem.standby", mem(|m, t| m.standby = f(t))),
+        ("mem.nonpaged", mem(|m, t| m.nonpaged_pool = f(t))),
         ("mem.paged", mem(|m, t| m.paged_pool = f(t))),
         ("mem.pagefile", mem(|m, t| m.pagefile_usage = f(t))),
         ("disk.model", disk(|d, t| d.model = f(t))),
@@ -887,6 +909,29 @@ fn injections() -> Vec<(&'static str, Inject)> {
                 }
             }),
         ),
+        (
+            "nic.link",
+            Box::new(|fa, _, _, t| {
+                if let Ok(l) = &mut fa.nics {
+                    l[0].link = f(t);
+                }
+            }),
+        ),
+        (
+            "nic.recv",
+            Box::new(|fa, _, _, t| {
+                if let Ok(l) = &mut fa.nics {
+                    l[0].recv = f(t);
+                }
+            }),
+        ),
+        ("gpu.name", gpu(|g, t| g.name = f(t))),
+        ("gpu.usage", gpu(|g, t| g.usage = f(t))),
+        ("gpu.dedicated", gpu(|g, t| g.dedicated = f(t))),
+        ("gpu.shared", gpu(|g, t| g.shared = f(t))),
+        ("gpu.temp", gpu(|g, t| g.temp = f(t))),
+        ("gpu.power", gpu(|g, t| g.power = f(t))),
+        ("gpu.clock_graphics", gpu(|g, t| g.clock_graphics = f(t))),
         ("gpu.driver", gpu(|g, t| g.driver = f(t))),
         ("gpu.temp_slowdown", gpu(|g, t| g.temp_slowdown = f(t))),
         ("gpu.encoder", gpu(|g, t| g.encoder = f(t))),
@@ -898,6 +943,22 @@ fn injections() -> Vec<(&'static str, Inject)> {
             Box::new(|fa, _, _, t| {
                 if let Ok(o) = &mut fa.own {
                     o.private_ws = f(t);
+                }
+            }),
+        ),
+        (
+            "own.cpu",
+            Box::new(|fa, _, _, t| {
+                if let Ok(o) = &mut fa.own {
+                    o.cpu = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.vram",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.gpus {
+                    l[0].vram = f(t);
                 }
             }),
         ),
@@ -923,6 +984,8 @@ fn injections() -> Vec<(&'static str, Inject)> {
         ),
         ("game.resolution", game(|g, t| g.resolution = f(t))),
         ("game.fps", game(|g, t| g.fps = f(t))),
+        ("game.frametime", game(|g, t| g.frametime = f(t))),
+        ("game.gpu_time", game(|g, t| g.gpu_time = f(t))),
         ("game.lows", game(|g, t| g.lows = f(t))),
         ("game.bound", game(|g, t| g.bound = f(t))),
         ("rtss.pipe", Box::new(|_, _, fp, t| fp.pipe = f(t))),
@@ -931,23 +994,23 @@ fn injections() -> Vec<(&'static str, Inject)> {
 
 /// As marcas do começo e do fim da causa aparecem em vermelho na tela (a causa pode estar
 /// quebrada em linhas dentro de uma caixa: o fim visível prova que nada foi cortado).
-fn red_text(st: &mut State, tags: &[String], tab: view::Tab) -> bool {
+fn red_text(st: &mut State, tags: &[String], tab: view::Tab, (w, h): (u16, u16)) -> bool {
     st.set_tab(tab);
-    let mut t = Terminal::new(TestBackend::new(200, 60)).expect("terminal de teste");
+    let mut t = Terminal::new(TestBackend::new(w, h)).expect("terminal de teste");
     t.draw(|fr| view::draw(fr, st)).expect("desenho");
     let buf = t.backend().buffer();
     let red_in_row = |y: u16, tag: &str| {
-        let row: Vec<(String, ratatui::style::Color)> = (0..200)
+        let row: Vec<(String, ratatui::style::Color)> = (0..w)
             .map(|x| (buf[(x, y)].symbol().to_string(), buf[(x, y)].fg))
             .collect();
         let chars: Vec<char> = tag.chars().collect();
-        (0..row.len().saturating_sub(chars.len())).any(|i| {
+        (0..=row.len().saturating_sub(chars.len())).any(|i| {
             chars.iter().enumerate().all(|(k, c)| {
                 row[i + k].0 == c.to_string() && row[i + k].1 == super::theme::th().fail
             })
         })
     };
-    tags.iter().all(|tag| (0..60).any(|y| red_in_row(y, tag)))
+    tags.iter().all(|tag| (0..h).any(|y| red_in_row(y, tag)))
 }
 
 #[test]
@@ -965,19 +1028,25 @@ fn toda_falha_contada_aparece_em_vermelho() {
         st.push_slow(sl);
         let counted = view::failing_sources(&st);
         let tags = [tag.clone(), tag.replace("TAG", "END")];
-        let seen = [
-            view::Tab::Overview,
-            view::Tab::Sensors,
-            view::Tab::Gpu,
-            view::Tab::Processes,
-        ]
-        .into_iter()
-        .any(|t| red_text(&mut st, &tags, t));
         if counted == 0 {
             problems.push(format!("{name}: falha não contada no rodapé"));
         }
-        if !seen {
-            problems.push(format!("{name}: causa não aparece inteira em vermelho"));
+        // Em cada tamanho comum de terminal, a causa aparece inteira em alguma aba.
+        for size in [(200, 60), (160, 48), (120, 40)] {
+            let seen = [
+                view::Tab::Overview,
+                view::Tab::Sensors,
+                view::Tab::Gpu,
+                view::Tab::Processes,
+            ]
+            .into_iter()
+            .any(|t| red_text(&mut st, &tags, t, size));
+            if !seen {
+                problems.push(format!(
+                    "{name}: causa não aparece inteira em vermelho em {}x{}",
+                    size.0, size.1
+                ));
+            }
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");

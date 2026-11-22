@@ -209,7 +209,7 @@ fn fit(cols: &[Col], avail: u16) -> Vec<Option<u16>> {
 const FLEX_MAX: u16 = 44;
 
 /// Texto que cabe em `w` colunas do terminal (corta no fim com `…`) e alinhado.
-fn cell(s: &str, w: u16, right: bool) -> String {
+pub(super) fn cell(s: &str, w: u16, right: bool) -> String {
     let w = usize::from(w);
     let total = Span::raw(s).width();
     // Caminho comum: cabe inteiro, só alinha.
@@ -844,7 +844,13 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
                 out.push(num_row(
                     &grp,
                     "Power limit",
-                    g.power.clone().map(|(_, l)| l),
+                    g.power.clone().and_then(|(_, l)| {
+                        if l > 0.0 {
+                            Ok(l)
+                        } else {
+                            crate::model::neutral("not reported by the driver")
+                        }
+                    }),
                     "W",
                     0,
                 ));
@@ -908,6 +914,22 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
                         .clone()
                         .map(|(gen_, w)| format!("Gen{gen_} x{w}")),
                 ));
+                // Tráfego PCIe (coleta lenta) e identificação: na aba Geral ficam numa linha
+                // que um terminal baixo corta; aqui a falha aparece inteira em qualquer tamanho.
+                match st.slow.as_ref().map(|s| &s.gpus) {
+                    Some(Ok(slow)) => {
+                        if let Some(s) = slow.get(g.index as usize) {
+                            let mb = |m: &Metric<u64>| m.clone().map(|v| v as f64 / 1e6);
+                            out.push(num_row(&grp, "PCIe TX", mb(&s.pcie_tx), "MB/s", 1));
+                            out.push(num_row(&grp, "PCIe RX", mb(&s.pcie_rx), "MB/s", 1));
+                        }
+                    }
+                    Some(Err(e)) => out.push(text_row(&grp, "PCIe TX/RX", Err(e.clone()))),
+                    None => {}
+                }
+                out.push(text_row(&grp, "Name", g.name.clone()));
+                out.push(text_row(&grp, "Driver", g.driver.clone()));
+                out.push(text_row(&grp, "VBIOS", g.vbios.clone()));
             }
         }
         Err(e) => out.push(text_row("GPU", "Sensors", Err(e.clone()))),

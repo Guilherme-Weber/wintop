@@ -89,8 +89,8 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | VRAM compartilhada | PDH `\GPU Adapter Memory(*)\Shared Usage`; limite pelo DXGI (`SharedSystemMemory`) | | | E1 |
 | VRAM física (NVML: usada, livre, reservada) | NVML `memory_info` (v2, com `reserved`) | | | Spike |
 | Temperatura e limite de slowdown | NVML | | | Spike |
-| Clocks (gráfico, SM, memória, vídeo) e máximo | NVML | | | Spike |
-| Potência e limite | NVML | | | Spike |
+| Clocks (gráfico, SM, memória, vídeo) e máximo | NVML | | máximo "não informado" (GPUs móveis): só o atual | Spike |
+| Potência e limite | NVML | | limite "not reported by the driver" (GPUs móveis) | Spike |
 | Fans (%, RPM), todos os `num_fans` | NVML | | "parado" (0 RPM, modo silencioso) | Spike (2 fans) |
 | PCIe: geração, largura, TX/RX | NVML (TX/RX custam ~23 ms cada: thread lenta) | | | Spike |
 | Encoder / decoder (%) | NVML | | | Spike |
