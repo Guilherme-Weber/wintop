@@ -363,7 +363,10 @@ mod tests {
         // SAFETY: entrada terminada em zero; buffer local com o tamanho informado.
         let n = unsafe { GetShortPathNameW(PCWSTR(w.as_ptr()), Some(&mut buf)) } as usize;
         let short = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-        assert_eq!(long_path(&short), dir, "curto: {}", short.display());
+        // O próprio TEMP pode vir curto (CI: RUNNER~1): compara com a forma longa dele.
+        let long = long_path(&short);
+        assert_eq!(long, long_path(&dir), "curto: {}", short.display());
+        assert!(!long.to_string_lossy().contains('~'), "{}", long.display());
         let none = dir.join("nao-existe");
         assert_eq!(long_path(&none), none);
         let _ = std::fs::remove_dir_all(&dir);

@@ -694,6 +694,20 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("wintop-upd-{}", std::process::id()));
         let dir = tmp.join("wintop-port");
         std::fs::create_dir_all(&dir).unwrap();
+        // Como a pasta extraída pelo Explorer: dono = o usuário (num processo elevado, como a
+        // CI, o dono padrão seria Administradores, recusado fora das bases padrão).
+        let sid = crate::win::user_sid().unwrap();
+        for p in [&tmp, &dir] {
+            let ok =
+                std::process::Command::new(crate::win::system_dir().unwrap().join("icacls.exe"))
+                    .arg(p)
+                    .args(["/setowner", &format!("*{sid}"), "/q"])
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success();
+            assert!(ok, "icacls /setowner {}", p.display());
+        }
         let ping = crate::win::system_dir().unwrap().join("PING.EXE");
         std::fs::copy(&ping, dir.join("wintop.exe")).unwrap();
         let mut child = std::process::Command::new(dir.join("wintop.exe"))
