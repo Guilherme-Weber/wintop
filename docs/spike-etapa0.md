@@ -3,7 +3,7 @@
 Executado em 2026-11-20, elevado, na máquina de desenvolvimento: Ryzen 7 5700X3D (família 19h,
 modelo 21h), ASUS TUF GAMING X570-PLUS, RTX 5070 Ti (driver 621.01), Windows 11 Pro for
 Workstations, RTSS 7.3.7, PawnIO 2.2.0, PawnIO.Modules 0.2.12. Reexecutado após as correções da
-revisão Neon + Argon.
+revisão.
 
 Cada spike é um programa em `examples/` (`cargo run --example <nome>`, terminal elevado). Eles
 não fazem parte do wintop; servem para provar cada fonte antes dos coletores definitivos.
