@@ -336,6 +336,7 @@ fn list_key(st: &mut view::State, code: KeyCode, jobs: &Sender<RuntimeResult>) -
         KeyCode::Char('i') if st.tab == view::Tab::Processes => {
             st.proc_reverse = !st.proc_reverse;
         }
+        KeyCode::Char('e') if st.tab == view::Tab::Processes => st.proc_tree = !st.proc_tree,
         KeyCode::Left if st.tab == view::Tab::Gpu => st.gpu_sort = st.gpu_sort.prev(),
         KeyCode::Right if st.tab == view::Tab::Gpu => st.gpu_sort = st.gpu_sort.next(),
         KeyCode::Char('i') if st.tab == view::Tab::Gpu => st.gpu_reverse = !st.gpu_reverse,

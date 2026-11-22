@@ -1241,3 +1241,40 @@ fn confirmacao_de_encerrar_processo() {
     ));
     assert!(!render(&mut st, 160, 48).contains("old"));
 }
+
+#[test]
+fn arvore_de_processos() {
+    use super::view::tabs::{ProcSort, tree};
+    let p = |pid, parent, create, name: &str, cpu| crate::model::Proc {
+        pid,
+        parent,
+        name: name.into(),
+        create,
+        cpu,
+        ..proc(pid, name, cpu, 1)
+    };
+    let list = vec![
+        p(100, 4, 10, "explorer.exe", 1.0),
+        p(200, 100, 20, "wt.exe", 2.0),
+        p(300, 200, 30, "pwsh.exe", 5.0),
+        p(310, 200, 31, "cargo.exe", 9.0),
+        // Pai com o PID 100, mas criado depois do "pai": o PID foi reaproveitado; é raiz.
+        p(400, 999, 5, "orphan.exe", 0.5),
+        p(999, 1, 50, "newer.exe", 0.1),
+    ];
+    let rows: Vec<String> = tree(&list, ProcSort::Cpu, false)
+        .into_iter()
+        .map(|(p, pre)| format!("{pre}{}", p.name))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "explorer.exe",
+            "└─ wt.exe",
+            "   ├─ cargo.exe",
+            "   └─ pwsh.exe",
+            "orphan.exe",
+            "newer.exe",
+        ]
+    );
+}

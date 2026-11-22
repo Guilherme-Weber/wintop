@@ -164,6 +164,8 @@ pub struct State {
     pub proc_sort: ProcSort,
     /// Inverte a ordem natural da coluna (tecla `i`).
     pub proc_reverse: bool,
+    /// Árvore de processos (tecla `e`), sem filtro.
+    pub proc_tree: bool,
     pub filter: String,
     /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
     pub filtering: bool,
@@ -352,9 +354,9 @@ impl State {
         let Some(Ok(list)) = &self.procs else {
             return None;
         };
-        let rows = tabs::sorted_procs(list, self.proc_sort, self.proc_reverse, &self.filter);
-        let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
-        self.proc_cursor.peek(&pids).map(|i| rows[i].clone())
+        let rows = tabs::proc_rows(self, list);
+        let pids: Vec<u32> = rows.iter().map(|(p, _)| p.pid).collect();
+        self.proc_cursor.peek(&pids).map(|i| rows[i].0.clone())
     }
 
     pub fn reset_session(&mut self) {
@@ -767,6 +769,7 @@ const HELP: &[(&str, &str)] = &[
         "del",
         "Processes tab: end the selected process (asks to confirm)",
     ),
+    ("e", "Processes tab: tree of parent and child processes"),
     ("q, esc", "quit (Ctrl+C also works)"),
     ("", ""),
     (
@@ -942,6 +945,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("i", " invert  "),
             ("/", " filter  "),
             ("esc", " clear filter  "),
+            ("e", " tree  "),
             ("del", " end process  "),
         ],
         Tab::Processes => &[
@@ -949,6 +953,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("←→", " sort  "),
             ("i", " invert  "),
             ("/", " filter  "),
+            ("e", " tree  "),
             ("del", " end process  "),
         ],
         Tab::Gpu if !st.filter.is_empty() => &[

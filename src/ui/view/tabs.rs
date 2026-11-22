@@ -9,6 +9,8 @@
 //!
 //! As colunas menos importantes saem primeiro quando a largura não dá (nada é cortado no meio).
 
+use std::collections::HashMap;
+
 use super::{State, bar_sep, boxed, empty_box, label, metric, missing, put, text, vram_bar};
 use crate::fmt::{bytes, num};
 use crate::model::{GpuProc, Metric, Missing, Proc};
@@ -402,6 +404,67 @@ pub(super) fn sorted_procs<'a>(
     v
 }
 
+/// Linhas da aba Processos: a lista plana ordenada, ou a árvore (tecla `e`) com o prefixo de
+/// cada nome. Com filtro, sempre plana (a árvore esconderia quem casa sob quem não casa).
+pub(in crate::ui) fn proc_rows<'a>(st: &State, list: &'a [Proc]) -> Vec<(&'a Proc, String)> {
+    if !st.proc_tree || !st.filter.is_empty() {
+        return sorted_procs(list, st.proc_sort, st.proc_reverse, &st.filter)
+            .into_iter()
+            .map(|p| (p, String::new()))
+            .collect();
+    }
+    tree(list, st.proc_sort, st.proc_reverse)
+}
+
+/// Árvore pai → filhos; irmãos na ordem da coluna. Um pai só vale se foi criado antes do filho
+/// (o PID do pai pode ter sido reaproveitado por um processo mais novo); sem pai válido, o
+/// processo é raiz.
+pub(in crate::ui) fn tree(list: &[Proc], sort: ProcSort, reverse: bool) -> Vec<(&Proc, String)> {
+    let ordered = sorted_procs(list, sort, reverse, "");
+    let by_pid: HashMap<u32, &Proc> = list.iter().map(|p| (p.pid, p)).collect();
+    let parent_of = |p: &Proc| -> Option<u32> {
+        by_pid
+            .get(&p.parent)
+            .filter(|q| q.pid != p.pid && q.create <= p.create)
+            .map(|q| q.pid)
+    };
+    let mut children: HashMap<u32, Vec<&Proc>> = HashMap::new();
+    let mut roots = Vec::new();
+    for p in &ordered {
+        match parent_of(p) {
+            Some(pp) => children.entry(pp).or_default().push(p),
+            None => roots.push(*p),
+        }
+    }
+    let mut out = Vec::with_capacity(list.len());
+    // Pilha explícita (árvores fundas não estouram a pilha): (processo, recuo dos ancestrais,
+    // é o último irmão).
+    let mut stack: Vec<(&Proc, String, bool, bool)> = roots
+        .iter()
+        .rev()
+        .map(|p| (*p, String::new(), false, true))
+        .collect();
+    while let Some((p, indent, last, root)) = stack.pop() {
+        let prefix = if root {
+            String::new()
+        } else {
+            format!("{indent}{}", if last { "└─ " } else { "├─ " })
+        };
+        out.push((p, prefix));
+        if let Some(kids) = children.get(&p.pid) {
+            let child_indent = if root {
+                String::new()
+            } else {
+                format!("{indent}{}", if last { "   " } else { "│  " })
+            };
+            for (k, c) in kids.iter().enumerate().rev() {
+                stack.push((*c, child_indent.clone(), k + 1 == kids.len(), false));
+            }
+        }
+    }
+    out
+}
+
 fn game_pid(st: &State) -> Option<u32> {
     st.fps
         .as_ref()
@@ -414,9 +477,17 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
         empty_box(frame, area, "processes", st.procs.as_ref());
         return;
     };
-    let rows = sorted_procs(list, st.proc_sort, st.proc_reverse, &st.filter);
+    let rows = proc_rows(st, list);
     let desc = st.proc_sort.natural_desc() != st.proc_reverse;
-    let mut right = format!("{} processes", list.len());
+    let mut right = format!(
+        "{} processes{}",
+        list.len(),
+        if st.proc_tree && st.filter.is_empty() {
+            " · tree"
+        } else {
+            ""
+        }
+    );
     if !st.filter.is_empty() || st.filtering {
         right = format!(
             "{} of {} · filter: {}{}",
@@ -445,7 +516,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
         inner,
     );
     let body_h = usize::from(inner.height - 1);
-    let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
+    let pids: Vec<u32> = rows.iter().map(|(p, _)| p.pid).collect();
     let (sel, offset) = st.proc_cursor.resolve(&pids, body_h);
     if rows.is_empty() {
         note(
@@ -456,7 +527,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
         return;
     }
     let game = game_pid(st);
-    for (i, p) in rows.iter().enumerate().skip(offset).take(body_h) {
+    for (i, (p, prefix)) in rows.iter().enumerate().skip(offset).take(body_h) {
         let name_style = if Some(p.pid) == game {
             Style::new().fg(th().game).add_modifier(Modifier::BOLD)
         } else {
@@ -467,7 +538,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
             &widths,
             vec![
                 dim(p.pid.to_string()),
-                (printable(&p.name), name_style),
+                (format!("{prefix}{}", printable(&p.name)), name_style),
                 pct_cell(p.cpu),
                 plain(bytes(p.mem)),
                 plain(bytes(p.commit)),
