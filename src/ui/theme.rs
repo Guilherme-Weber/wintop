@@ -72,10 +72,11 @@ pub const DEFAULT: Theme = Theme {
     vram_browser: Color::Rgb(92, 156, 230),
     vram_system: Color::Rgb(154, 160, 176),
     vram_kernel: Color::Rgb(138, 132, 88),
-    // Gradiente escolhido pelo usuário (1.1): lavanda → violeta → índigo escuro.
+    // Gradiente escolhido pelo usuário (1.1): lavanda → violeta → índigo. O topo era #1E1B4B,
+    // que some no fundo escuro (contraste 1,21:1); trocado por #4338CA (decisão do usuário).
     low: rgb(0xE0E7FF),
     mid: rgb(0x7C3AED),
-    high: rgb(0x1E1B4B),
+    high: rgb(0x4338CA),
 };
 
 const NORD: Theme = Theme {

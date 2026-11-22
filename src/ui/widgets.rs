@@ -233,7 +233,7 @@ mod tests {
     fn gradiente_nas_pontas() {
         assert_eq!(gradient(0.0), Color::Rgb(0xE0, 0xE7, 0xFF));
         assert_eq!(gradient(0.5), Color::Rgb(0x7C, 0x3A, 0xED));
-        assert_eq!(gradient(1.0), Color::Rgb(0x1E, 0x1B, 0x4B));
+        assert_eq!(gradient(1.0), Color::Rgb(0x43, 0x38, 0xCA));
         assert_eq!(gradient(f64::NAN), gradient(0.0));
     }
 
