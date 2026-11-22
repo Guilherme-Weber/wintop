@@ -31,9 +31,19 @@ pub fn gradient(t: f64) -> Color {
 /// O mesmo tom com metade do brilho (parte de kernel dos gráficos de CPU).
 pub fn darker(c: Color) -> Color {
     match c {
-        // Metade do brilho, com um piso: a parte do kernel sobre uma cor já escura (o topo do
-        // gradiente padrão) continua visível no fundo do terminal.
-        Color::Rgb(r, g, b) => Color::Rgb((r / 2).max(24), (g / 2).max(22), (b / 2).max(64)),
+        // Metade do brilho, mas o canal mais forte nunca abaixo de 64: a parte do kernel sobre
+        // uma cor já escura (o topo do gradiente padrão) continua visível no fundo, e a
+        // proporção entre os canais (a matiz, em qualquer tema) se mantém.
+        Color::Rgb(r, g, b) => {
+            let top = f64::from(r.max(g).max(b));
+            let k = if top <= 0.0 {
+                0.5
+            } else {
+                (64.0 / top).max(0.5).min(1.0)
+            };
+            let f = |c: u8| (f64::from(c) * k).round() as u8;
+            Color::Rgb(f(r), f(g), f(b))
+        }
         other => other,
     }
 }
@@ -259,7 +269,7 @@ mod tests {
         Graph::new(&[1.0, 1.0], GraphColor::Fixed(Color::Rgb(200, 100, 50)))
             .with_under(&[0.5, 0.5])
             .render(area, &mut buf);
-        assert_eq!(buf[(0, 1)].fg, Color::Rgb(100, 50, 64));
+        assert_eq!(buf[(0, 1)].fg, Color::Rgb(100, 50, 25));
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(200, 100, 50));
     }
 

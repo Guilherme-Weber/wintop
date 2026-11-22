@@ -975,7 +975,9 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
         let bottom_need = (disk_rows + 3 + game_min).max(12);
         top_h = top_h.max(body.height.saturating_sub(bottom_need));
     }
-    let top_h = top_h.min(body.height.saturating_sub(9));
+    // Embaixo, sempre o mínimo útil: algumas linhas de discos e a faixa do jogo.
+    let bottom_min = ((disk_rows.min(3) + 3 + game_min).max(9)).min(body.height / 2);
+    let top_h = top_h.min(body.height.saturating_sub(bottom_min));
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
     let [cpu, gpu] =
@@ -997,14 +999,16 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+    // Estreito: abas com um espaço só entre elas (sobra para o estado à direita).
+    let pad = if area.width < 100 { "" } else { " " };
     let tab = |n: &str, name: &str, t: Tab| -> Span<'static> {
         if st.tab == t {
             Span::styled(
-                format!(" [{n} {name}] "),
+                format!("{pad}[{n} {name}]{pad}"),
                 Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             )
         } else {
-            label(&format!("  {n} {name}  "))
+            label(&format!(" {pad}{n} {name}{pad} "))
         }
     };
     let spans = vec![
@@ -1026,51 +1030,48 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let tw = (tabs.width() as u16).min(area.width);
     let [left, rest] = Layout::horizontal([Constraint::Length(tw), Constraint::Min(0)]).areas(area);
     frame.render_widget(Paragraph::new(tabs), left);
+    let room = usize::from(rest.width.saturating_sub(1));
+    let width = |v: &[Span<'static>]| v.iter().map(Span::width).sum::<usize>();
+    let key = |k: &str| {
+        Span::styled(
+            k.to_string(),
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        )
+    };
+    // O essencial primeiro (ampliação, pausa, intervalo); uptime e relógio só se couberem.
+    let mut right = Vec::new();
+    if let Some(z) = st.zoom
+        && st.tab == Tab::Overview
+    {
+        right.push(key(&format!("zoom: {} ", z.name())));
+        right.push(label("(z next, esc back)"));
+        right.push(bar_sep());
+    }
+    if st.paused {
+        // Destaque sem a cor de falha (vermelho é só para erro); os colchetes valem em
+        // monocromático. Forma curta quando estreito.
+        let long = "[PAUSED · p resumes]";
+        right.push(Span::styled(
+            if room >= 40 { long } else { "[PAUSED]" },
+            Style::new()
+                .fg(th().frametime)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+        right.push(bar_sep());
+    }
+    // Intervalo com as teclas que o mudam ao lado (como o btop).
+    right.extend([
+        key("- "),
+        label(&format!("{} ms", st.interval_ms)),
+        key(" +"),
+    ]);
     let up = st
         .fast
         .as_ref()
         .and_then(|f| f.cpu.as_ref().ok())
         .map(|c| c.uptime.as_secs());
-    let mut right = Vec::new();
-    if let Some(z) = st.zoom
-        && st.tab == Tab::Overview
-    {
-        right.extend([
-            Span::styled(
-                format!("zoom: {} ", z.name()),
-                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
-            ),
-            label("(z next, esc back)"),
-            bar_sep(),
-        ]);
-    }
-    if st.paused {
-        right.extend([
-            // Destaque sem a cor de falha (vermelho é só para erro); os colchetes valem em
-            // monocromático.
-            Span::styled(
-                "[PAUSED · p resumes]",
-                Style::new()
-                    .fg(th().frametime)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            ),
-            bar_sep(),
-        ]);
-    }
-    // Intervalo com as teclas que o mudam ao lado (como o btop); some do rodapé.
-    right.extend([
-        Span::styled(
-            "- ",
-            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
-        ),
-        label(&format!("{} ms", st.interval_ms)),
-        Span::styled(
-            " +",
-            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
-        ),
-    ]);
     if let Some(s) = up {
-        right.extend([
+        let extra = [
             bar_sep(),
             label(&format!(
                 "up {}d {:02}:{:02}:{:02}",
@@ -1079,10 +1080,16 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 s / 60 % 60,
                 s % 60
             )),
-        ]);
+        ];
+        if width(&right) + width(&extra) <= room {
+            right.extend(extra);
+        }
     }
     if !st.clock.is_empty() {
-        right.extend([bar_sep(), text(st.clock.clone())]);
+        let extra = [bar_sep(), text(st.clock.clone())];
+        if width(&right) + width(&extra) <= room {
+            right.extend(extra);
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), rest);
 }
@@ -1177,52 +1184,62 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         groups.push([key("?"), label(" help  ")]);
         groups.push([key("q"), label(" quit")]);
     }
-    // Terminal estreito (o conhost do atalho abre com 120 colunas): o estado fica mais curto
-    // para sobrar espaço às teclas; uma falha aparece sempre inteira.
-    let narrow = area.width < 130;
-    let mut right = Vec::new();
-    if let Some(f) = &st.fast {
-        match &f.own {
-            Ok(o) => {
-                right.extend([
-                    label("wintop "),
-                    metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
-                    Span::raw(" "),
-                    metric(&o.private_ws, |v| bytes(*v)),
-                ]);
-                if !narrow || o.commit.is_err() {
-                    right.extend([
-                        label(" ("),
-                        metric(&o.commit, |v| format!("{} commit", bytes(*v))),
-                        label(")"),
-                    ]);
-                }
-            }
-            Err(e) => right.extend([label("wintop "), missing(e)]),
-        }
-        if !narrow {
-            right.extend([
-                bar_sep(),
-                label(&format!(
-                    "collection {} ms",
-                    num(f.took.as_secs_f64() * 1e3, 1)
-                )),
-            ]);
-        }
-    }
+    // O estado completo à direita, ou o curto quando as teclas não cabem com ele (uma falha
+    // aparece sempre inteira).
     let failing = failing_sources(st);
-    if !right.is_empty() {
-        right.push(bar_sep());
-    }
-    right.push(match failing {
-        0 if narrow => label("all OK "),
-        0 => label("sources: all OK "),
-        1 => Span::styled("! 1 source failing ", Style::new().fg(th().fail)),
-        n => Span::styled(
-            format!("! {n} sources failing "),
-            Style::new().fg(th().fail),
-        ),
-    });
+    let status = |narrow: bool| -> Vec<Span<'static>> {
+        let mut right = Vec::new();
+        if let Some(f) = &st.fast {
+            match &f.own {
+                Ok(o) => {
+                    right.extend([
+                        label("wintop "),
+                        metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
+                        Span::raw(" "),
+                        metric(&o.private_ws, |v| bytes(*v)),
+                    ]);
+                    if !narrow || o.commit.is_err() {
+                        right.extend([
+                            label(" ("),
+                            metric(&o.commit, |v| format!("{} commit", bytes(*v))),
+                            label(")"),
+                        ]);
+                    }
+                }
+                Err(e) => right.extend([label("wintop "), missing(e)]),
+            }
+            if !narrow {
+                right.extend([
+                    bar_sep(),
+                    label(&format!(
+                        "collection {} ms",
+                        num(f.took.as_secs_f64() * 1e3, 1)
+                    )),
+                ]);
+            }
+        }
+        if !right.is_empty() {
+            right.push(bar_sep());
+        }
+        right.push(match failing {
+            0 if narrow => label("all OK "),
+            0 => label("sources: all OK "),
+            1 => Span::styled("! 1 source failing ", Style::new().fg(th().fail)),
+            n => Span::styled(
+                format!("! {n} sources failing "),
+                Style::new().fg(th().fail),
+            ),
+        });
+        right
+    };
+    let keys_w: usize = groups.iter().map(|g| g[0].width() + g[1].width()).sum();
+    let full = status(false);
+    let full_w: usize = full.iter().map(Span::width).sum();
+    let right = if keys_w + full_w + 2 <= usize::from(area.width) {
+        full
+    } else {
+        status(true)
+    };
     // O lado direito (estado) tem prioridade; a ajuda usa o que sobra, com 2 colunas de folga.
     let right = Line::from(right);
     let rw = (right.width() as u16).min(area.width);
@@ -1233,9 +1250,11 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let mut priority: Vec<usize> = if st.filtering || n < 4 {
         (0..n).collect()
     } else {
-        [0, n - 1, n - 2, n - 3]
+        // Abas, sair, ajuda, os atalhos da aba e por último a pausa.
+        [0, n - 1, n - 2]
             .into_iter()
             .chain(1..n - 3)
+            .chain([n - 3])
             .collect()
     };
     priority.dedup();
@@ -1658,25 +1677,40 @@ fn draw_core_grid(
         // grupo começa com espaço; uso e clock ficam no mesmo trecho, que nunca é partido).
         // Todos os lógicos sempre aparecem: sem altura para os clocks, só o uso (média e pico
         // continuam na linha de velocidade).
-        let list = |clocks: bool| {
-            let spans: Vec<Span<'static>> = per
+        let list = |clocks: bool, gap: &str, k: usize| {
+            let mut spans: Vec<Span<'static>> = per
                 .iter()
+                .take(k)
                 .enumerate()
                 .flat_map(|(i, v)| {
                     // Sem preenchimento à esquerda: um espaço no começo abriria outro grupo.
                     let pct = format!("{}%", num(*v, 0));
                     let g = if clocks { ghz(i) } else { None };
                     [
-                        label(&format!("  C{i} ")),
+                        label(&format!("{gap}C{i} ")),
                         text(g.map_or_else(|| pct.clone(), |g| format!("{pct} {g}"))),
                     ]
                 })
                 .collect();
+            if k < per.len() {
+                spans.push(label(&format!(" +{} more (z)", per.len() - k)));
+            }
             wrap(spans, area.width, 0, 0)
         };
-        let mut lines = list(true);
-        if lines.len() > usize::from(area.height) {
-            lines = list(false);
+        let n = per.len();
+        let fits = |l: &Vec<Line<'static>>| l.len() <= usize::from(area.height);
+        let mut lines = list(true, "  ", n);
+        if !fits(&lines) {
+            lines = list(false, "  ", n);
+        }
+        if !fits(&lines) {
+            lines = list(false, " ", n);
+        }
+        // Nem assim: os que couberem e quantos ficaram de fora (a tecla z amplia a caixa).
+        let mut k = n;
+        while !fits(&lines) && k > 0 {
+            k -= 1;
+            lines = list(false, " ", k);
         }
         put(frame, Paragraph::new(lines), area, area);
         return;
@@ -1690,19 +1724,22 @@ fn draw_core_grid(
         let (x, y) = (at(c, cw, extra_w), at(r, ch, extra_h));
         let (w, h) = (cw + u16::from(c < extra_w), ch + u16::from(r < extra_h));
         let cell = Rect::new(area.x + x, area.y + y, w.saturating_sub(1), h).intersection(area);
+        // Índice e percentual sempre separados ("C12 100%" = 8 colunas, nunca "C12100%").
         let mut head = vec![
-            label(&format!("C{i:<2}")),
+            label(&format!("C{i:<2} ")),
             text(format!("{:>4}", format!("{}%", num(*v, 0)))),
         ];
-        // Clock na mesma linha do uso ("C0   90% 4.05 GHz" = 16 colunas; só o número a partir
-        // de 12); sem largura, numa linha própria acima do gráfico (se a célula tiver altura).
+        // Clock na mesma linha do uso: "C12 100% 4.05 GHz" com 17 colunas, "4.05G" com 14, só
+        // o número com 13; sem largura, numa linha própria acima do gráfico (se houver altura).
         // O formato vem da célula mais estreita: a grade inteira fica igual.
         let narrowest = cw.saturating_sub(1);
         let mut graph_top = 1;
         if let Some(g) = ghz(i) {
-            if narrowest >= 16 {
+            if narrowest >= 17 {
                 head.push(label(&format!(" {g} GHz")));
-            } else if narrowest >= 12 {
+            } else if narrowest >= 14 {
+                head.push(label(&format!(" {g}G")));
+            } else if narrowest >= 13 {
                 head.push(label(&format!(" {g}")));
             } else if cell.height >= 3 {
                 line(
@@ -1874,6 +1911,11 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         rows.truncate(engine_rows);
         session_lines = wrap(spans, inner.width, 0, 8);
+        // Sem altura nem para isso, a sessão sai da aba Geral (fica na aba Sensores): as
+        // engines ao vivo e os detalhes não podem ser cortados por ela.
+        if inner.height < bottom_h + session_lines.len() as u16 + engine_rows as u16 {
+            session_lines.clear();
+        }
         bottom_h += session_lines.len() as u16;
     }
     // Os detalhes (métricas) têm prioridade sobre a altura do gráfico.
@@ -2748,13 +2790,17 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     );
                 }
             }
-            // Escala por cima do canto do gráfico, depois de desenhá-lo.
-            put(
-                frame,
-                Paragraph::new(label(&format!("scale {} ", net_rate(st, scale)))).right_aligned(),
-                Rect::new(inner.x, y, inner.width, 1),
-                inner,
-            );
+            // Escala por cima do canto do gráfico, depois de desenhá-lo (com uma linha só ela
+            // cobriria o gráfico de envio inteiro).
+            if up_h >= 2 {
+                put(
+                    frame,
+                    Paragraph::new(label(&format!("scale {} ", net_rate(st, scale))))
+                        .right_aligned(),
+                    Rect::new(inner.x, y, inner.width, 1),
+                    inner,
+                );
+            }
             y += graph_h;
         }
     }
@@ -2968,9 +3014,14 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Sem largura para tudo (o conhost abre com 120 colunas), saem primeiro barramento, tipo e
     // resposta (as falhas deles continuam nas notas); leitura, escrita e temperatura ficam.
     let compact = inner.width < 12 + 24 + 41;
+    // Ainda mais estreito (o piso de 80 colunas): as flags S/P vão junto do nome, para a
+    // temperatura não ser cortada.
+    let tiny = inner.width < 12 + 13 + 33;
     // Com folga (nome inteiro e a atividade), IOPS e fila entram depois da escrita.
     let wide = inner.width >= 26 + 24 + 52 + 12;
-    let (left_w, info_full): (u16, u16) = if compact {
+    let (left_w, info_full): (u16, u16) = if tiny {
+        (8, 33)
+    } else if compact {
         (13, 33)
     } else if wide {
         (24, 52)
@@ -2992,7 +3043,9 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let nw = usize::from(name_w);
     // Cabeçalho nas mesmas posições das colunas de cada linha.
     let head = if nw > 14 { "drive / model" } else { "drive" };
-    let left_head = if compact {
+    let left_head = if tiny {
+        format!("{:>6}  ", "cap")
+    } else if compact {
         format!("{:>6} {:<4}  ", "cap", "flg")
     } else {
         format!("{:<7}{:<4}{:>6} {:<4}  ", "bus", "typ", "cap", "flg")
@@ -3063,10 +3116,17 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             .model
             .as_ref()
             .map_or_else(ToString::to_string, |m| printable(m));
+        // Estreito: as flags entram no nome, logo depois das letras.
+        let tag = match (tiny, d.system, d.pagefile) {
+            (true, true, true) => " S P",
+            (true, true, false) => " S",
+            (true, false, true) => " P",
+            _ => "",
+        };
         let mut name = if *member {
             format!("  └ {letters} {model}")
         } else {
-            format!("{letters} {model}")
+            format!("{letters}{tag} {model}")
         };
         if !member
             && folded
@@ -3106,7 +3166,9 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     name,
                     Style::new().fg(if *member { th().label } else { th().text }),
                 ),
-                label(&if compact {
+                label(&if tiny {
+                    format!("{cap:>6}  ")
+                } else if compact {
                     format!("{cap:>6} {flags:<4}  ")
                 } else {
                     format!("{bus:<7}{typ:<4}{cap:>6} {flags:<4}  ")
@@ -3258,6 +3320,8 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Sem jogo em foco: "idle", e os gráficos continuam com o histórico (parado até voltar).
     let g = fps.game.as_ref().ok();
     let rtss_failed = matches!(fps.rtss, Err(Missing::Fail(_)));
+    // Sem nenhum jogo nesta sessão, não há gráfico a manter: sem escalas nem aviso sobre ele.
+    let has_history = !st.game_fps.0.is_empty();
     let (title, source) = match g {
         Some(g) => {
             // Sem resolução: a causa vai para as linhas de baixo, com a cor do estado.
@@ -3286,17 +3350,31 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     let mut lines = match (g, &fps.game) {
         (Some(g), _) => game_lines(g, st.interval_ms),
-        (None, Err(_)) if rtss_failed => vec![
-            Line::from(vec![label("RTSS "), metric(&fps.rtss, Clone::clone)]),
-            Line::from(label("graphs keep the last game until r")),
-        ],
+        (None, Err(_)) if rtss_failed => {
+            let mut v = vec![Line::from(vec![
+                label("RTSS "),
+                metric(&fps.rtss, Clone::clone),
+            ])];
+            if has_history {
+                v.push(Line::from(label("graphs keep the last game until r")));
+            }
+            v
+        }
         (None, Err(e)) => vec![
             Line::from(vec![missing(e)]),
             Line::from(vec![
                 label("RTSS "),
                 metric(&fps.rtss, Clone::clone),
-                bar_sep(),
-                label("graphs keep the last game until r"),
+                if has_history {
+                    bar_sep()
+                } else {
+                    Span::raw("")
+                },
+                label(if has_history {
+                    "graphs keep the last game until r"
+                } else {
+                    ""
+                }),
             ]),
         ],
         (None, Ok(_)) => Vec::new(),
@@ -3354,7 +3432,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     put(
         frame,
-        Paragraph::new(label(&ceil_label)).right_aligned(),
+        Paragraph::new(label(if has_history { &ceil_label } else { "" })).right_aligned(),
         Rect::new(fps_area.x, fps_area.y, fps_area.width, 1),
         fps_area,
     );
@@ -3394,7 +3472,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     put(
         frame,
-        Paragraph::new(label("50 ms ")).right_aligned(),
+        Paragraph::new(label(if has_history { "50 ms " } else { "" })).right_aligned(),
         Rect::new(ft_area.x, ft_area.y, ft_area.width, 1),
         ft_area,
     );

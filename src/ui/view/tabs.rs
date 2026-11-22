@@ -799,6 +799,9 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         _ => note(frame, r0, label("VRAM: waiting")),
     }
+    // Embaixo da barra: a legenda das cores da VRAM (a mesma da aba Geral) e as engines do
+    // adaptador, quebradas em quantas linhas precisarem; a tabela começa depois delas.
+    let mut head_lines = super::vram_legend(vram.as_ref(), game, inner.width);
     if let Some(g) = &gpu {
         let pctm = |m: &Metric<u32>| metric(m, |v| format!("{v}%"));
         let spans = vec![
@@ -814,28 +817,22 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             label("memory activity "),
             pctm(&g.mem_activity),
         ];
-        put(
-            frame,
-            Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, inner.y + 2, inner.width, 1),
-            inner,
-        );
+        head_lines.extend(super::wrap(spans, inner.width, 0, 9));
     }
-    // Legenda das cores da barra da VRAM (a mesma da aba Geral), logo abaixo da barra.
-    if let Some(l) = super::vram_legend(vram.as_ref(), game, inner.width)
-        .into_iter()
-        .next()
-    {
+    // Sem altura, a tabela fica com pelo menos o cabeçalho e 3 linhas.
+    let head_max = usize::from(inner.height.saturating_sub(1 + 4 + 3));
+    head_lines.truncate(head_max.max(1));
+    for (k, l) in head_lines.iter().enumerate() {
         put(
             frame,
-            Paragraph::new(l),
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            Paragraph::new(l.clone()),
+            Rect::new(inner.x, inner.y + 1 + k as u16, inner.width, 1),
             inner,
         );
     }
     // Detalhe do selecionado embaixo (linhas quebradas, nada cortado); a tabela fica com o
     // meio. A seleção é resolvida antes, para o detalhe ser do processo que vai aparecer.
-    let table_y = inner.y + 3;
+    let table_y = inner.y + 1 + head_lines.len() as u16;
     let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
     let detail = gpu_detail(
         st,
