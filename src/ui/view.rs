@@ -553,6 +553,15 @@ fn text(s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), Style::new().fg(th().text))
 }
 
+/// Valor zerado em tom de rótulo (o número fica, só sai do primeiro plano).
+fn faded(sp: Span<'static>, zero: bool) -> Span<'static> {
+    if zero {
+        sp.style(Style::new().fg(th().label))
+    } else {
+        sp
+    }
+}
+
 fn sep() -> Span<'static> {
     Span::raw("  ")
 }
@@ -1898,7 +1907,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         match &g.physical {
             Ok([u, f, r, t]) => vec![
                 // O total físico é o mesmo da barra da VRAM: só aparece se diferir.
-                label("phys  "),
+                label("phys   "),
                 text(format!("{} used", bytes(*u))),
                 sep(),
                 text(format!("{} free", bytes(*f))),
@@ -1910,10 +1919,10 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
                     format!("  {} total (NVML)", bytes(*t))
                 }),
             ],
-            Err(e) => vec![label("phys  "), missing(e)],
+            Err(e) => vec![label("phys   "), missing(e)],
         },
         vec![
-            label("clk   gfx "),
+            label("clk    gfx "),
             clk(&g.clock_graphics),
             label("  SM "),
             clk(&g.clock_sm),
@@ -1924,7 +1933,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
             label(" MHz"),
         ],
         vec![
-            label("temp  "),
+            label("temp   "),
             metric(&g.temp, |v| format!("{v} °C")),
             Span::raw(" "),
             metric(&g.temp_slowdown, |v| format!("(slowdown {v} °C)")),
@@ -1950,7 +1959,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
             }),
         ],
         {
-            let mut v = vec![label("fans  ")];
+            let mut v = vec![label("fans   ")];
             match &g.fans {
                 Ok(list) => {
                     for (i, f) in list.iter().enumerate() {
@@ -1969,7 +1978,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         },
         {
             let mut v = vec![
-                label("PCIe  "),
+                label("PCIe   "),
                 metric(&g.pcie_link, |(gen_, w)| format!("Gen{gen_} x{w}")),
             ];
             if let Some(s) = &slow {
@@ -1994,7 +2003,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
     ];
     let info = rows
         .into_iter()
-        .flat_map(|r| wrap(r, width, 0, 6))
+        .flat_map(|r| wrap(r, width, 0, 7))
         .collect();
     GpuDetails {
         game_pid,
@@ -2296,7 +2305,7 @@ impl MemText {
     }
 }
 
-const RAM_LABEL_W: u16 = 8;
+const RAM_LABEL_W: u16 = 9;
 
 /// Partes da RAM como o Task Manager: (em uso, modificada, standby, livre).
 fn ram_parts(m: &Memory) -> Option<(u64, u64, u64, u64, u64)> {
@@ -2462,7 +2471,7 @@ fn ram_bar(frame: &mut Frame<'_>, area: Rect, m: &Memory, ram: &Metric<(u64, u64
     let text_w = text_room(&t, ram.is_err(), area.width, label_w);
     line(
         frame,
-        vec![label("RAM     ")],
+        vec![label("RAM      ")],
         area.x,
         area.y,
         label_w,
@@ -2546,7 +2555,8 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 spans.push(label(&format!(" max {}", net_rate(st, hi))));
             }
         }
-        spans.push(label(&format!("  scale {}", net_rate(st, scale))));
+        // A escala vai no canto do gráfico (como no jogo), não na linha das taxas.
+        let _ = scale;
         wrap(spans, inner.width, 0, 2)
     };
     let fixed: Vec<(usize, Vec<Line<'static>>)> = up.iter().map(|n| (1, rate_lines(n))).collect();
@@ -2568,9 +2578,19 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let room = inner.height.saturating_sub(bottom_rows);
     // Sobra repartida entre as placas como gráfico espelhado (só a partir de 2 linhas).
     let spare = room.saturating_sub(need(shown));
-    let graph_h = if shown > 0 { spare / shown as u16 } else { 0 };
+    // Gráfico com teto; com sobra, uma linha em branco separa as placas.
+    const NET_GRAPH_MAX: u16 = 6;
+    let graph_h = if shown > 0 {
+        (spare / shown as u16).min(NET_GRAPH_MAX)
+    } else {
+        0
+    };
+    let gap = shown > 1 && spare >= graph_h * shown as u16 + (shown as u16 - 1);
     let mut y = inner.y;
-    for (n, (_, rates)) in up.iter().zip(&fixed).take(shown) {
+    for (k, (n, (_, rates))) in up.iter().zip(&fixed).take(shown).enumerate() {
+        if gap && k > 0 {
+            y += 1;
+        }
         // Identificação: nome e descrição à esquerda, erros e link à direita.
         let mut right = Vec::new();
         match &n.errors {
@@ -2638,6 +2658,13 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                     );
                 }
             }
+            // Escala por cima do canto do gráfico, depois de desenhá-lo.
+            put(
+                frame,
+                Paragraph::new(label(&format!("scale {} ", net_rate(st, scale)))).right_aligned(),
+                Rect::new(inner.x, y, inner.width, 1),
+                inner,
+            );
             y += graph_h;
         }
     }
@@ -2865,7 +2892,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let name_w = inner
         .width
         .saturating_sub(left_w + info_full + 4)
-        .clamp(12, 26);
+        .clamp(12, if wide { 34 } else { 26 });
     let spark_w = inner.width.saturating_sub(name_w + left_w + info_full);
     let info_x = inner.x + name_w + left_w + spark_w;
     let info_w = inner
@@ -3047,25 +3074,45 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 t,
             ],
             _ => vec![
-                metric(&d.active, |v| format!("{:>4}%", num(*v, 0))),
+                // Valores zerados esmaecidos: os discos com tráfego saltam à vista (falha continua
+                // em vermelho).
+                faded(
+                    metric(&d.active, |v| format!("{:>4}%", num(*v, 0))),
+                    d.active.as_ref().is_ok_and(|v| *v < 0.5),
+                ),
                 if compact {
                     Span::raw("")
                 } else {
-                    metric(&d.response, |v| format!(" {:>5}ms", num(v * 1000.0, 1)))
+                    faded(
+                        metric(&d.response, |v| format!(" {:>5}ms", num(v * 1000.0, 1))),
+                        d.response.as_ref().is_ok_and(|v| *v < 0.000_05),
+                    )
                 },
-                metric(&d.read, |v| {
-                    format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
-                }),
-                metric(&d.write, |v| {
-                    format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
-                }),
+                faded(
+                    metric(&d.read, |v| {
+                        format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                    }),
+                    d.read.as_ref().is_ok_and(|v| *v < 1.0),
+                ),
+                faded(
+                    metric(&d.write, |v| {
+                        format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                    }),
+                    d.write.as_ref().is_ok_and(|v| *v < 1.0),
+                ),
                 if wide {
-                    metric(&d.iops, |v| format!(" {:>6}", num(*v, 0)))
+                    faded(
+                        metric(&d.iops, |v| format!(" {:>6}", num(*v, 0))),
+                        d.iops.as_ref().is_ok_and(|v| *v < 0.5),
+                    )
                 } else {
                     Span::raw("")
                 },
                 if wide {
-                    metric(&d.queue, |v| format!(" {v:>3}"))
+                    faded(
+                        metric(&d.queue, |v| format!(" {v:>3}")),
+                        d.queue.as_ref().is_ok_and(|v| *v == 0),
+                    )
                 } else {
                     Span::raw("")
                 },
