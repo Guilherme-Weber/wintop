@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use super::{State, bar_sep, boxed, empty_box, label, metric, missing, put, text, vram_bar};
+use super::{
+    State, bar_sep, boxed, boxed_ready, empty_box, label, metric, missing, put, text, vram_bar,
+};
 use crate::collect::{is_decode, is_encode};
 use crate::fmt::{bytes, num};
 use crate::i18n::tr;
@@ -517,7 +519,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
     };
     let rows = proc_rows(st, list);
     let desc = st.proc_sort.natural_desc() != st.proc_reverse;
-    let mut right = format!(
+    let mut right = tr(&format!(
         "{} processes{}",
         list.len(),
         if st.proc_tree && st.filter.is_empty() {
@@ -525,7 +527,8 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
         } else {
             ""
         }
-    );
+    ))
+    .into_owned();
     if !st.filter.is_empty() || st.filtering {
         right = format!(
             "{} {} {} · {} {}{}",
@@ -537,7 +540,7 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
             if st.filtering { "_" } else { "" }
         );
     }
-    let block = boxed("processes", &right);
+    let block = boxed_ready("processes", &right);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 2 || inner.width < 4 {
@@ -769,7 +772,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     };
     let rows = sorted_gpu(list, st.gpu_sort, st.gpu_reverse, &st.filter);
     let desc = st.gpu_sort.natural_desc() != st.gpu_reverse;
-    let mut right = format!("{} processes", list.len());
+    let mut right = tr(&format!("{} processes", list.len())).into_owned();
     if !st.filter.is_empty() || st.filtering {
         right = format!(
             "{} {} {} · {} {}{}",
@@ -781,7 +784,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             if st.filtering { "_" } else { "" }
         );
     }
-    let block = boxed(&title, &right);
+    let block = boxed_ready(&title, &right);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // VRAM, adapter, folga, cabeçalho, 1 linha, divisória e 2 de detalhe.
@@ -795,7 +798,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .as_ref()
         .and_then(|s| s.gpus.as_ref().ok())
         // Pela lista lenta, como a tabela (`push_slow`): a rápida pode ter falhado no ciclo.
-        .and_then(|l| l.get(st.gpu_index(l.len())))
+        .and_then(|l| st.slow_gpu(l))
         .map(|g| g.vram.clone());
     let r0 = Rect::new(inner.x, inner.y, inner.width, 1);
     let fast_gpu_err = st

@@ -246,16 +246,19 @@ impl State {
         if n < 2 {
             return;
         }
-        self.gpu_sel = (self.gpu_index(n) + 1) % n;
+        self.select_gpu((self.gpu_index(n) + 1) % n);
+    }
+
+    /// Troca a GPU exibida (tecla `g`, ou a selecionada sumiu): extremos zerados, e a lista da
+    /// aba GPU vem da última coleta lenta, que já trouxe todas as GPUs (ou a falha).
+    fn select_gpu(&mut self, sel: usize) {
+        self.gpu_sel = sel;
         self.reset_gpu_session();
-        // A última coleta lenta da aba GPU já trouxe a lista de todas as GPUs (ou a falha).
         self.gpu_procs = None;
         if self.tab == Tab::Gpu {
             match self.slow.as_ref().map(|s| &s.gpus) {
                 Some(Ok(list)) => {
-                    self.gpu_procs = list
-                        .get(self.gpu_index(list.len()))
-                        .and_then(|g| g.procs.clone());
+                    self.gpu_procs = self.slow_gpu(list).and_then(|g| g.procs.clone());
                 }
                 Some(Err(e)) => self.gpu_procs = Some(Err(e.clone())),
                 None => {}
@@ -263,6 +266,19 @@ impl State {
         }
         self.gpu_cursor = Cursor::default();
         self.runtimes.clear();
+    }
+
+    /// A GPU exibida na lista lenta. As threads refazem a lista cada uma no seu tempo (GPU que
+    /// apareceu ou sumiu): pela posição da lista rápida, que dá o título; sem a GPU na lenta,
+    /// `None` (aguarda) em vez dos dados de outra. Sem a lista rápida, pela própria lenta.
+    pub fn slow_gpu<'a>(
+        &self,
+        list: &'a [crate::model::GpuSlow],
+    ) -> Option<&'a crate::model::GpuSlow> {
+        match self.gpu_count() {
+            0 => list.get(self.gpu_index(list.len())),
+            n => list.get(self.gpu_index(n)),
+        }
     }
 
     /// Extremos da sessão da GPU exibida (zerados ao trocar de GPU).
@@ -328,8 +344,7 @@ impl State {
             }
             match &s.gpus {
                 Ok(list) => {
-                    let sel = self.gpu_index(list.len());
-                    if let Some(p) = list.get(sel).and_then(|g| g.procs.clone()) {
+                    if let Some(p) = self.slow_gpu(list).and_then(|g| g.procs.clone()) {
                         self.gpu_procs = Some(p);
                     }
                 }
@@ -475,8 +490,8 @@ impl State {
             && !list.is_empty()
             && self.gpu_sel >= list.len()
         {
-            self.gpu_sel = 0;
-            self.reset_gpu_session();
+            // `fast` ainda é a coleta anterior: a lista da aba vem da lenta, já pelo índice 0.
+            self.select_gpu(0);
         }
         if let Ok(list) = &f.gpus
             && let Some(g) = list.get(self.gpu_index(list.len()))
@@ -665,6 +680,12 @@ fn minmax(m: MinMax, f: impl Fn(f64) -> String) -> Span<'static> {
 
 /// Caixa com borda neutra, título à esquerda e contexto à direita, na própria borda.
 fn boxed(title: &str, right: &str) -> Block<'static> {
+    boxed_ready(title, &tr(right))
+}
+
+/// Como `boxed`, com o texto da direita já no idioma da interface: o que o usuário digitou (o
+/// filtro) não pode passar pela tradução ("free" viraria "livre").
+fn boxed_ready(title: &str, right: &str) -> Block<'static> {
     let mut b = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(th().border))
@@ -679,7 +700,7 @@ fn boxed(title: &str, right: &str) -> Block<'static> {
     if !right.is_empty() {
         b = b.title(
             Line::from(Span::styled(
-                format!(" {} ", tr(right)),
+                format!(" {right} "),
                 Style::new().fg(th().label),
             ))
             .right_aligned(),

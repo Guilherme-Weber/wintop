@@ -1508,6 +1508,15 @@ fn abas_pt_br() {
     insta::assert_snapshot!(format!("{p}\n{g}\n{s}"));
 }
 
+/// O filtro é o que o usuário digitou: não passa pela tradução ("free" não vira "livre").
+#[test]
+fn filtro_pt_br_sem_traducao() {
+    let mut st = tab_state(view::Tab::Processes);
+    st.filter = "free".into();
+    let out = pt_br(st, 140, 16);
+    assert!(out.contains("filtro: free"), "{out}");
+}
+
 #[test]
 fn ajuda_pt_br() {
     let mut st = filled();
