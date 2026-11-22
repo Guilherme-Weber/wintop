@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.1.0] - 2026-11-22
+
 ### Adicionado
 
 - Várias GPUs: a tecla `g` troca a GPU das abas Geral e GPU; a aba Sensores e o `--check`
