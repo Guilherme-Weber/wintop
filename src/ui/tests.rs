@@ -334,13 +334,16 @@ fn bordas_intactas(st: &mut State, w: u16, h: u16) {
 #[test]
 fn larguras_estreitas_sem_vazamento() {
     let mut st = filled();
-    // A borda direita da caixa da CPU continua sendo borda em toda a altura (a linha 0 é a
-    // barra de abas; a caixa começa na 1).
-    let mut t = Terminal::new(TestBackend::new(60, 24)).expect("terminal de teste");
+    // Abaixo do piso da aba Geral: o aviso honesto, com o tamanho pedido e o atual.
+    let out = render(&mut st, 60, 24);
+    assert!(out.contains("terminal too small") && out.contains("80x24") && out.contains("60x24"));
+    // No piso, a borda direita da caixa da CPU continua sendo borda em toda a altura (a linha
+    // 0 é a barra de abas; a caixa começa na 1).
+    let mut t = Terminal::new(TestBackend::new(80, 24)).expect("terminal de teste");
     t.draw(|f| view::draw(f, &mut st)).expect("desenho");
     let buf = t.backend().buffer();
     let top = 1u16;
-    let cpu_right = (0..60u16)
+    let cpu_right = (0..80u16)
         .find(|&x| buf[(x, top)].symbol() == "╮")
         .expect("canto da caixa da CPU");
     let bottom = (top + 1..24u16)
@@ -349,7 +352,7 @@ fn larguras_estreitas_sem_vazamento() {
     for y in top + 1..bottom {
         assert_eq!(buf[(cpu_right, y)].symbol(), "│", "linha {y}");
     }
-    bordas_intactas(&mut st, 60, 24);
+    bordas_intactas(&mut st, 80, 24);
 }
 
 #[test]

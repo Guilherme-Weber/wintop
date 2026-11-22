@@ -648,8 +648,36 @@ fn temp(m: &Metric<f64>) -> Span<'static> {
 
 // --- Layout ---
 
+/// Menor terminal em que a aba mostra tudo sem virar ruído (a Geral tem seis caixas; as outras
+/// são tabelas); abaixo, o aviso honesto.
+pub fn min_size(tab: Tab) -> (u16, u16) {
+    match tab {
+        Tab::Overview => (80, 24),
+        _ => (60, 12),
+    }
+}
+
 pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     st.hits = Hits::default();
+    let a = frame.area();
+    let (min_w, min_h) = min_size(st.tab);
+    if a.width < min_w || a.height < min_h {
+        let msg = vec![
+            Line::from(Span::styled(
+                "terminal too small",
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(label(&format!(
+                "this tab needs {min_w}x{min_h}; the terminal is {}x{}",
+                a.width, a.height
+            ))),
+            Line::from(label("resize the window, or press q to quit")),
+        ];
+        let h = (msg.len() as u16).min(a.height);
+        let r = Rect::new(a.x, a.y + a.height.saturating_sub(h) / 2, a.width, h);
+        frame.render_widget(Paragraph::new(msg).centered(), r);
+        return;
+    }
     // Aviso do config (arquivo com erro, gravação recusada): linhas próprias acima do rodapé,
     // inteiras, sem disputar espaço com o estado das fontes.
     let mut notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
@@ -861,8 +889,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     // Em cima, CPU + memória (como GPU + VRAM ao lado); embaixo, rede compacta à esquerda e
     // discos sobre o jogo à direita.
+    // Em cima, pelo menos o que CPU + memória e GPU + VRAM precisam para mostrar todas as
+    // linhas de detalhe (o conhost do atalho abre com 30 linhas); os gráficos é que encolhem.
+    const TOP_MIN: u16 = 23;
+    let top_h = (body.height * 58 / 100)
+        .max(TOP_MIN)
+        .min(body.height.saturating_sub(9));
     let [top, bottom] =
-        Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
+        Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
     let [cpu, gpu] =
         Layout::horizontal([Constraint::Percentage(59), Constraint::Percentage(41)]).areas(top);
     let [net, right] =
@@ -873,7 +907,13 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     // Mais uma linha por temperatura com falha (a causa inteira, embaixo da tabela).
     let disk_rows =
         (disk_order(st).len() + disk_notes(st, right.width.saturating_sub(2)).len()) as u16;
-    let disks_h = (disk_rows + 3).min(right.height / 2).max(4);
+    // Sem jogo nesta sessão (nenhum histórico para manter), a caixa do jogo fica numa faixa de
+    // 5 linhas e os discos crescem; com jogo ou com o histórico do último, ela tem altura.
+    let game_known = st.fps.as_ref().is_some_and(|f| f.game.is_ok()) || !st.game_fps.0.is_empty();
+    let game_min = if game_known { 8 } else { 5 };
+    let disks_h = (disk_rows + 3)
+        .min(right.height.saturating_sub(game_min))
+        .max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
     draw_cpu(frame, cpu, st, mem_rows);
@@ -1463,7 +1503,7 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State, mem_rows: u16) {
         brief(&c.kernel, |v| format!("{}%", num(*v, 0))),
     ];
     line(frame, head, total.x, total.y, total.width, total);
-    let mm = minmax(st.session.cpu, |v| num(v, 0));
+    let mm = minmax(st.session.cpu, |v| format!("{}%", num(v, 0)));
     line(frame, vec![mm], total.x, total.y + 1, total.width, total);
     let g = Rect::new(
         total.x,
@@ -1517,24 +1557,29 @@ fn draw_core_grid(
     if cw < 9 || ch < 2 {
         // Lista compacta: todos os lógicos, quebrando linha só entre um lógico e outro (cada
         // grupo começa com espaço; uso e clock ficam no mesmo trecho, que nunca é partido).
-        let spans: Vec<Span<'static>> = per
-            .iter()
-            .enumerate()
-            .flat_map(|(i, v)| {
-                // Sem preenchimento à esquerda: um espaço no começo abriria outro grupo.
-                let pct = format!("{}%", num(*v, 0));
-                [
-                    label(&format!("  C{i} ")),
-                    text(ghz(i).map_or_else(|| pct.clone(), |g| format!("{pct} {g}"))),
-                ]
-            })
-            .collect();
-        put(
-            frame,
-            Paragraph::new(wrap(spans, area.width, 0, 0)),
-            area,
-            area,
-        );
+        // Todos os lógicos sempre aparecem: sem altura para os clocks, só o uso (média e pico
+        // continuam na linha de velocidade).
+        let list = |clocks: bool| {
+            let spans: Vec<Span<'static>> = per
+                .iter()
+                .enumerate()
+                .flat_map(|(i, v)| {
+                    // Sem preenchimento à esquerda: um espaço no começo abriria outro grupo.
+                    let pct = format!("{}%", num(*v, 0));
+                    let g = if clocks { ghz(i) } else { None };
+                    [
+                        label(&format!("  C{i} ")),
+                        text(g.map_or_else(|| pct.clone(), |g| format!("{pct} {g}"))),
+                    ]
+                })
+                .collect();
+            wrap(spans, area.width, 0, 0)
+        };
+        let mut lines = list(true);
+        if lines.len() > usize::from(area.height) {
+            lines = list(false);
+        }
+        put(frame, Paragraph::new(lines), area, area);
         return;
     }
     for (i, v) in per.iter().enumerate() {
@@ -1725,11 +1770,12 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         session_lines = wrap(spans, inner.width, 0, 8);
         bottom_h += session_lines.len() as u16;
     }
-    let [top, bottom] = Layout::vertical([
-        Constraint::Min((engine_rows as u16).max(4)),
-        Constraint::Length(bottom_h),
-    ])
-    .areas(inner);
+    // Os detalhes (métricas) têm prioridade sobre a altura do gráfico.
+    let graph_min = (engine_rows as u16)
+        .max(4)
+        .min(inner.height.saturating_sub(bottom_h).max(2));
+    let [top, bottom] =
+        Layout::vertical([Constraint::Min(graph_min), Constraint::Length(bottom_h)]).areas(inner);
     let [graph, panel] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_W)]).areas(top);
 
@@ -2180,7 +2226,8 @@ fn text_room(t: &Span<'_>, missing: bool, width: u16, label_w: u16) -> u16 {
     if missing {
         w.min(width.saturating_sub(label_w))
     } else {
-        w.min(width / 2)
+        // O valor inteiro antes da barra: a barra encolhe (ex.: "(69%)" não perde o parêntese).
+        w.min(width.saturating_sub(label_w + 4))
     }
 }
 
@@ -3030,6 +3077,16 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
 
 // --- Jogo ---
 
+/// Cabeçalho de gráfico: o valor sempre; o mínimo e o máximo só se couberem inteiros (cortado,
+/// "min 5." encostaria no rótulo do teto e viraria outro número).
+fn head_fit(mut head: Vec<Span<'static>>, mm: Span<'static>, room: u16) -> Vec<Span<'static>> {
+    let w: usize = head.iter().map(Span::width).sum::<usize>() + 2 + mm.width();
+    if w <= usize::from(room) {
+        head.extend([sep(), mm]);
+    }
+    head
+}
+
 /// Teto do gráfico de FPS: o menor degrau acima do máximo visível.
 fn fps_ceiling(max: f64) -> f64 {
     FPS_STEPS
@@ -3106,7 +3163,13 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Sem jogo: só o "idle" do título; os cabeçalhos ficam com "-".
     let idle = || label("-");
     let [graphs, info] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(info_h)]).areas(inner);
+        // As linhas de dados (FPS, lows, frametime...) têm prioridade sobre a altura dos gráficos.
+        Layout::vertical([
+            // Pelo menos o cabeçalho com o FPS e o frametime atuais.
+            Constraint::Min(3.min(inner.height.saturating_sub(info_h)).max(1)),
+            Constraint::Length(info_h),
+        ])
+        .areas(inner);
     put(frame, Paragraph::new(lines), info, info);
     let [fps_area, ft_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(graphs);
@@ -3114,28 +3177,31 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // FPS: teto em degraus pelo máximo visível.
     let n = usize::from(fps_area.width) * 2;
     let ceil = fps_ceiling(st.game_fps.max_of(n));
-    let head = vec![
-        label("FPS "),
-        // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
-        g.map_or_else(idle, |g| match &g.fps {
-            Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
-            Err(Missing::Neutral(_)) => label("-"),
-            Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(th().fail)),
-        }),
-        sep(),
+    let ceil_label = format!("{} ", num(ceil, 0));
+    let head = head_fit(
+        vec![
+            label("FPS "),
+            // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
+            g.map_or_else(idle, |g| match &g.fps {
+                Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
+                Err(Missing::Neutral(_)) => label("-"),
+                Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(th().fail)),
+            }),
+        ],
         minmax(st.session.fps, |v| num(v, 0)),
-    ];
+        fps_area.width.saturating_sub(ceil_label.len() as u16 + 2),
+    );
     line(
         frame,
         head,
         fps_area.x,
         fps_area.y,
-        fps_area.width.saturating_sub(6),
+        fps_area.width.saturating_sub(ceil_label.len() as u16 + 2),
         fps_area,
     );
     put(
         frame,
-        Paragraph::new(label(&format!("{} ", num(ceil, 0)))).right_aligned(),
+        Paragraph::new(label(&ceil_label)).right_aligned(),
         Rect::new(fps_area.x, fps_area.y, fps_area.width, 1),
         fps_area,
     );
@@ -3153,22 +3219,24 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
 
     // Frametime: teto fixo de 50 ms; picos acima de 33 ms em vermelho.
     let n = usize::from(ft_area.width) * 2;
-    let head = vec![
-        label("FT "),
-        // Como no FPS: marca curta sem valor (a causa inteira está nas linhas de baixo).
-        g.map_or_else(idle, |g| {
-            brief(&g.frametime, |(a, _, _)| format!("{} ms", num(*a, 2)))
-                .add_modifier(Modifier::BOLD)
-        }),
-        sep(),
-        minmax(st.session.ft, |v| num(v, 1)),
-    ];
+    let head = head_fit(
+        vec![
+            label("FT "),
+            // Como no FPS: marca curta sem valor (a causa inteira está nas linhas de baixo).
+            g.map_or_else(idle, |g| {
+                brief(&g.frametime, |(a, _, _)| format!("{} ms", num(*a, 2)))
+                    .add_modifier(Modifier::BOLD)
+            }),
+        ],
+        minmax(st.session.ft, |v| format!("{} ms", num(v, 1))),
+        ft_area.width.saturating_sub(1 + 6 + 2),
+    );
     line(
         frame,
         head,
         ft_area.x + 1,
         ft_area.y,
-        ft_area.width.saturating_sub(7),
+        ft_area.width.saturating_sub(1 + 6 + 2),
         ft_area,
     );
     put(
