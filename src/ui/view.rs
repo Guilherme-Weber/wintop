@@ -873,6 +873,7 @@ pub(super) fn failing_sources(st: &State) -> usize {
                 || failed(&c.kernel_per_logical)
                 || failed(&c.kernel)
                 || failed(&c.freq_mhz)
+                || failed(&c.freq_per_logical)
                 || failed(&c.counts)
         }));
         add(source_failed(&f.cpu_sensors, |s| {
@@ -1049,9 +1050,15 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     frame.render_widget(block, area);
     // Linhas de sensores e topologia.
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
+    // Clock: média de todos os lógicos e o pico (o lógico mais rápido agora).
     let mut l1 = vec![
-        label("speed "),
+        label("speed avg "),
         metric(&c.freq_mhz, |v| format!("{} GHz", num(v / 1000.0, 2))),
+        label("  peak "),
+        metric(&c.freq_per_logical, |f| {
+            let peak = f.iter().copied().fold(0.0_f64, f64::max);
+            format!("{} GHz", num(peak / 1000.0, 2))
+        }),
         Span::raw(" "),
         metric(&c.base_mhz, |m| {
             format!("(base {})", num(f64::from(*m) / 1000.0, 2))
@@ -1161,7 +1168,14 @@ fn draw_cpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
 
     match &c.per_logical {
-        Ok(per) => draw_core_grid(frame, grid, &mut st.cores, &mut st.cores_kernel, per),
+        Ok(per) => draw_core_grid(
+            frame,
+            grid,
+            &mut st.cores,
+            &mut st.cores_kernel,
+            per,
+            c.freq_per_logical.as_deref().ok(),
+        ),
         Err(e) => put(
             frame,
             Paragraph::new(wrap(vec![label("per core "), missing(e)], grid.width, 0, 2)),
@@ -1179,7 +1193,10 @@ fn draw_core_grid(
     cores: &mut [Series],
     kernel: &mut [Series],
     per: &[f64],
+    freq: Option<&[f64]>,
 ) {
+    // Clock de cada lógico ao lado do uso ("C0  90% 4.05 GHz"), se couber.
+    let ghz = |i: usize| freq.and_then(|f| f.get(i)).map(|mhz| num(mhz / 1000.0, 2));
     let n = per.len();
     if n == 0 || area.width == 0 || area.height == 0 {
         return;
@@ -1196,7 +1213,8 @@ fn draw_core_grid(
             .flat_map(|(i, v)| {
                 [
                     label(&format!("C{i} ")),
-                    text(format!("{:>3}%  ", num(*v, 0))),
+                    text(format!("{:>3}%", num(*v, 0))),
+                    label(&ghz(i).map_or_else(|| "  ".into(), |g| format!(" {g}  "))),
                 ]
             })
             .collect();
@@ -1210,23 +1228,37 @@ fn draw_core_grid(
         let (c, r) = ((i % cols) as u16, (i / cols) as u16);
         let cell = Rect::new(area.x + c * cw, area.y + r * ch, cw.saturating_sub(1), ch)
             .intersection(area);
-        line(
-            frame,
-            vec![
-                label(&format!("C{i:<2} ")),
-                text(format!("{:>3}%", num(*v, 0))),
-            ],
-            cell.x,
-            cell.y,
-            cell.width,
-            cell,
-        );
+        let mut head = vec![
+            label(&format!("C{i:<2} ")),
+            text(format!("{:>3}%", num(*v, 0))),
+        ];
+        // Clock na mesma linha do uso ("C0   90% 4.05 GHz" = 17 colunas; só o número a partir
+        // de 13); sem largura, numa linha própria acima do gráfico (se a célula tiver altura).
+        let mut graph_top = 1;
+        if let Some(g) = ghz(i) {
+            if cell.width >= 17 {
+                head.push(label(&format!(" {g} GHz")));
+            } else if cell.width >= 13 {
+                head.push(label(&format!(" {g}")));
+            } else if cell.height >= 3 {
+                line(
+                    frame,
+                    vec![label(&format!("{g} GHz"))],
+                    cell.x,
+                    cell.y + 1,
+                    cell.width,
+                    cell,
+                );
+                graph_top = 2;
+            }
+        }
+        line(frame, head, cell.x, cell.y, cell.width, cell);
         if let Some(s) = cores.get_mut(i) {
             let g = Rect::new(
                 cell.x,
-                cell.y + 1,
+                cell.y + graph_top,
                 cell.width,
-                cell.height.saturating_sub(1),
+                cell.height.saturating_sub(graph_top),
             );
             let mut graph = Graph::new(s.values(), GraphColor::Height);
             if let Some(k) = kernel.get_mut(i) {

@@ -40,7 +40,8 @@ impl CpuCollector {
         };
         let per = add(r"\Processor Information(*)\% Processor Time");
         let per_kernel = add(r"\Processor Information(*)\% Privileged Time");
-        let perf = add(r"\Processor Information(_Total)\% Processor Performance");
+        // Todas as instâncias: o `_Total` dá a média e cada lógico o próprio clock.
+        let perf = add(r"\Processor Information(*)\% Processor Performance");
         let topology = topology();
         // Sem topologia, o número de lógicos vem do sistema (com 1, o buffer do
         // CallNtPowerInformation seria pequeno demais e a frequência cairia junto).
@@ -74,12 +75,6 @@ impl CpuCollector {
 
     pub fn read(&mut self, perf_info: Result<&PERFORMANCE_INFORMATION, &String>) -> Cpu {
         let sampled = self.sample();
-        let pdh_val = |slot: &Slot| -> Metric<f64> {
-            if let Err(e) = &sampled {
-                return fail(e.clone());
-            }
-            pdh::read(&self.query, slot).or_else(fail)
-        };
         // Um contador só: a instância `_Total` vem junto com as dos lógicos.
         let array = match &sampled {
             Err(e) => fail(e.clone()),
@@ -104,10 +99,33 @@ impl CpuCollector {
             (Ok(u), Ok(k)) if u.len() != k.len() => fail("kernel instances differ from usage"),
             (_, k) => k,
         };
-        let freq_mhz = match (pdh_val(&self.perf), &self.base_mhz) {
-            (Ok(p), Ok(b)) => Ok(p / 100.0 * f64::from(*b)),
-            (Err(e), _) => Err(e),
-            (_, Err(e)) => Err(e.clone()),
+        // Clock efetivo = % Processor Performance × base (como o Task Manager); passa de 100%
+        // com o turbo.
+        let perf = match &sampled {
+            Err(e) => fail(e.clone()),
+            Ok(()) => pdh::read_array(&self.query, &self.perf).or_else(fail),
+        };
+        let to_mhz = |p: f64| -> Metric<f64> {
+            self.base_mhz
+                .as_ref()
+                .map(|b| p / 100.0 * f64::from(*b))
+                .map_err(Clone::clone)
+        };
+        let freq_mhz = perf.as_ref().map_err(Clone::clone).and_then(|a| {
+            a.iter()
+                .find(|(n, _)| n == "_Total")
+                .map(|(_, v)| *v)
+                .filter(|v| v.is_finite())
+                .map_or_else(|| fail("no _Total instance"), to_mhz)
+        });
+        let freq_per_logical: Metric<Vec<f64>> = perf.and_then(|a| {
+            per_logical_raw(&a, PERF_MAX)
+                .map_or_else(|| fail("no instances"), Ok)
+                .and_then(|v| v.into_iter().map(to_mhz).collect())
+        });
+        let freq_per_logical = match (&per_logical, freq_per_logical) {
+            (Ok(u), Ok(f)) if u.len() != f.len() => fail("clock instances differ from usage"),
+            (_, f) => f,
         };
         Cpu {
             name: self.name.clone(),
@@ -119,6 +137,7 @@ impl CpuCollector {
             kernel_per_logical,
             kernel: self.kernel_share(),
             freq_mhz,
+            freq_per_logical,
             counts: perf_info.map_or_else(
                 |e| fail(e.clone()),
                 |p| {
@@ -166,6 +185,14 @@ fn kernel_share(prev: (u64, u64, u64), now: (u64, u64, u64)) -> Option<f64> {
 
 /// Uso por processador lógico, ordenado por (grupo, número); ignora as instâncias `_Total`.
 fn per_logical(items: &[(String, f64)]) -> Option<Vec<f64>> {
+    per_logical_raw(items, 100.0)
+}
+
+/// Teto do `% Processor Performance` (turbo passa de 100%; acima disto é contador corrompido).
+const PERF_MAX: f64 = 1000.0;
+
+/// Valores por lógico em 0..=`max`, ordenados por (grupo, número).
+fn per_logical_raw(items: &[(String, f64)], max: f64) -> Option<Vec<f64>> {
     let mut v: Vec<((u32, u32), f64)> = items
         .iter()
         .filter_map(|(name, val)| {
@@ -174,7 +201,7 @@ fn per_logical(items: &[(String, f64)]) -> Option<Vec<f64>> {
             let val = if val.is_nan() {
                 0.0
             } else {
-                val.clamp(0.0, 100.0)
+                val.clamp(0.0, max)
             };
             Some(((g.parse().ok()?, n.parse().ok()?), val))
         })

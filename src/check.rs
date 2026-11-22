@@ -136,6 +136,12 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 format!("{} logical", v.len())
             });
             r.line("Current speed", &c.freq_mhz, |v| format!("{v:.0} MHz"));
+            r.line("Speed per logical", &c.freq_per_logical, |f| {
+                let (lo, hi) = f
+                    .iter()
+                    .fold((f64::MAX, 0.0_f64), |(a, b), v| (a.min(*v), b.max(*v)));
+                format!("{} logical, {lo:.0}-{hi:.0} MHz (peak {hi:.0})", f.len())
+            });
             r.line("Processes / threads / handles", &c.counts, |n| {
                 format!("{} / {} / {}", n.processes, n.threads, n.handles)
             });

@@ -32,7 +32,8 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Uso total (%) | PDH `\Processor Information(_Total)\% Processor Time` (tempo ocupado, sem escalar pela frequência, como o Task Manager atual; o `% Processor Utility` escala pelo turbo), limitado a 0-100 | | | E1 (= Task Manager) |
 | Uso por processador lógico (grade dimensionada pela CPU real; 16 = 4×4 na máquina de desenvolvimento) | PDH `\Processor Information(*)\% Processor Time` | | | E1 |
 | Parcela de kernel (opcional) | `GetSystemTimes` (total do sistema): `(kernel - idle) / (kernel + user)`; KernelTime inclui IdleTime | | | E1 |
-| Frequência atual | PDH `% Processor Performance` × frequência base | | | E1 |
+| Frequência atual (média) | PDH `% Processor Performance` (`_Total`) × frequência base | | | E1 |
+| Frequência por lógico e pico | PDH `\Processor Information(*)\% Processor Performance` × frequência base; pico = maior entre os lógicos | | | 1.1 |
 | Frequência base | `CallNtPowerInformation(ProcessorInformation)` | | | E1 |
 | Sockets, núcleos, lógicos, L1/L2/L3 | `GetLogicalProcessorInformationEx` | | | E1 |
 | Virtualização | `IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED)` | | | E1 |

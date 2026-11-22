@@ -66,7 +66,10 @@ pub struct Cpu {
     pub kernel_per_logical: Metric<Vec<f64>>,
     /// Parcela do tempo total gasta em modo kernel, 0-100.
     pub kernel: Metric<f64>,
+    /// Clock médio (MHz).
     pub freq_mhz: Metric<f64>,
+    /// Clock efetivo de cada lógico (MHz), na ordem de `per_logical`.
+    pub freq_per_logical: Metric<Vec<f64>>,
     pub counts: Metric<Counts>,
     pub uptime: Duration,
 }

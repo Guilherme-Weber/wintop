@@ -33,6 +33,7 @@ fn cpu() -> Cpu {
         kernel_per_logical: Ok((0..16).map(|i| f64::from(i * 2 % 30)).collect()),
         kernel: Ok(5.6),
         freq_mhz: Ok(3812.0),
+        freq_per_logical: Ok((0..16).map(|i| 3600.0 + f64::from(i) * 60.0).collect()),
         counts: Ok(Counts {
             processes: 362,
             threads: 7651,
@@ -880,6 +881,10 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         ("cpu.per_logical", cpu(|c, t| c.per_logical = f(t))),
+        (
+            "cpu.freq_per_logical",
+            cpu(|c, t| c.freq_per_logical = f(t)),
+        ),
         (
             "sensors.ccds",
             Box::new(|fa, _, _, t| {
