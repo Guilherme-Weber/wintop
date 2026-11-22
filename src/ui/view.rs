@@ -1582,21 +1582,28 @@ fn draw_core_grid(
         put(frame, Paragraph::new(lines), area, area);
         return;
     }
+    // A sobra da divisão (linhas e colunas) vai para as primeiras fileiras e colunas: a grade
+    // ocupa a área inteira, sem faixa vazia embaixo.
+    let (extra_h, extra_w) = (area.height % rows as u16, area.width % cols as u16);
+    let at = |k: u16, size: u16, extra: u16| k * size + k.min(extra);
     for (i, v) in per.iter().enumerate() {
         let (c, r) = ((i % cols) as u16, (i / cols) as u16);
-        let cell = Rect::new(area.x + c * cw, area.y + r * ch, cw.saturating_sub(1), ch)
-            .intersection(area);
+        let (x, y) = (at(c, cw, extra_w), at(r, ch, extra_h));
+        let (w, h) = (cw + u16::from(c < extra_w), ch + u16::from(r < extra_h));
+        let cell = Rect::new(area.x + x, area.y + y, w.saturating_sub(1), h).intersection(area);
         let mut head = vec![
-            label(&format!("C{i:<2} ")),
-            text(format!("{:>3}%", num(*v, 0))),
+            label(&format!("C{i:<2}")),
+            text(format!("{:>4}", format!("{}%", num(*v, 0)))),
         ];
-        // Clock na mesma linha do uso ("C0   90% 4.05 GHz" = 17 colunas; só o número a partir
-        // de 13); sem largura, numa linha própria acima do gráfico (se a célula tiver altura).
+        // Clock na mesma linha do uso ("C0   90% 4.05 GHz" = 16 colunas; só o número a partir
+        // de 12); sem largura, numa linha própria acima do gráfico (se a célula tiver altura).
+        // O formato vem da célula mais estreita: a grade inteira fica igual.
+        let narrowest = cw.saturating_sub(1);
         let mut graph_top = 1;
         if let Some(g) = ghz(i) {
-            if cell.width >= 17 {
+            if narrowest >= 16 {
                 head.push(label(&format!(" {g} GHz")));
-            } else if cell.width >= 13 {
+            } else if narrowest >= 12 {
                 head.push(label(&format!(" {g}")));
             } else if cell.height >= 3 {
                 line(
