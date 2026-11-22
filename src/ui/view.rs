@@ -1516,8 +1516,12 @@ pub(super) fn failing_sources(st: &State) -> usize {
         };
         // Na lista lenta, a GPU exibida é a da posição da rápida (`slow_gpu`).
         add(source_failed(&s.gpus, |l| {
+            // Na aba Sensores, só as GPUs que a lista rápida (a que a aba mostra) ainda tem.
             let shown: Vec<&crate::model::GpuSlow> = if st.tab == Tab::Sensors {
-                l.iter().collect()
+                match st.gpu_count() {
+                    0 => l.iter().collect(),
+                    n => l.iter().take(n).collect(),
+                }
             } else {
                 st.slow_gpu(l).into_iter().collect()
             };
