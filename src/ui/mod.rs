@@ -78,6 +78,10 @@ fn on_mouse(st: &mut view::State, m: event::MouseEvent) -> (bool, bool) {
     use event::{MouseButton, MouseEventKind};
     let lists = matches!(st.tab, view::Tab::Processes | view::Tab::Gpu);
     match m.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if st.tab == view::Tab::Sensors => {
+            sensor_scroll(st, m.kind == MouseEventKind::ScrollDown, 3);
+            (true, false)
+        }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if lists => {
             let cursor = if st.tab == view::Tab::Processes {
                 &mut st.proc_cursor
@@ -293,6 +297,15 @@ fn event_loop(
                             dirty = true;
                         }
                     }
+                    // Uma caixa ampliada: Esc volta ao normal antes de sair.
+                    KeyCode::Esc if st.zoom.is_some() && st.tab == view::Tab::Overview => {
+                        st.zoom = None;
+                        dirty = true;
+                    }
+                    KeyCode::Char('z') if st.tab == view::Tab::Overview => {
+                        st.zoom = view::Zoom::next(st.zoom);
+                        dirty = true;
+                    }
                     KeyCode::Char('?') => {
                         st.help = true;
                         dirty = true;
@@ -426,7 +439,29 @@ fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {
 /// Resultado de uma leitura de runtimes: (PID, nome, runtimes).
 type RuntimeResult = (u32, String, crate::model::Metric<Vec<&'static str>>);
 
+/// Rolagem da aba Sensores (só para baixo enquanto houver linhas de fora).
+fn sensor_scroll(st: &mut view::State, down: bool, n: usize) {
+    if down {
+        if st.sensor_overflow {
+            st.sensor_offset += n;
+        }
+    } else {
+        st.sensor_offset = st.sensor_offset.saturating_sub(n);
+    }
+}
+
 fn list_key(st: &mut view::State, code: KeyCode, jobs: &Sender<RuntimeResult>) -> bool {
+    if st.tab == view::Tab::Sensors {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => sensor_scroll(st, false, 1),
+            KeyCode::Down | KeyCode::Char('j') => sensor_scroll(st, true, 1),
+            KeyCode::PageUp => sensor_scroll(st, false, 10),
+            KeyCode::PageDown => sensor_scroll(st, true, 10),
+            KeyCode::Home => st.sensor_offset = 0,
+            _ => return false,
+        }
+        return true;
+    }
     let cursor = match st.tab {
         view::Tab::Processes => &mut st.proc_cursor,
         view::Tab::Gpu => &mut st.gpu_cursor,

@@ -1234,8 +1234,17 @@ const SENSOR_COLS: [Col; 4] = [
 ];
 
 pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
-    let rows = sensor_rows(st);
-    let block = boxed("sensors", "session min · max (r resets)");
+    // Rolagem (↑↓, PgUp/PgDn, rodinha) só quando nem com colunas tudo cabe.
+    let all = sensor_rows(st);
+    let offset = st.sensor_offset.min(all.len().saturating_sub(1));
+    st.sensor_offset = offset;
+    let rows: Vec<SensorRow> = all.into_iter().skip(offset).collect();
+    let title = if offset > 0 {
+        format!("from row {} · session min · max (r resets)", offset + 1)
+    } else {
+        "session min · max (r resets)".to_string()
+    };
+    let block = boxed("sensors", &title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if rows.is_empty() {
@@ -1292,6 +1301,7 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .flatten()
         .filter_map(sensor_of)
         .collect();
+    st.sensor_overflow = !beyond.is_empty();
     if !beyond.is_empty()
         && let Some(last) = layout.get_mut(ncols - 1)
     {

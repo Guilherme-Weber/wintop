@@ -168,6 +168,12 @@ pub struct State {
     pub proc_tree: bool,
     /// Áreas clicáveis do último desenho (mouse).
     pub hits: Hits,
+    /// Caixa da aba Geral ampliada para a aba inteira (tecla `z`).
+    pub zoom: Option<Zoom>,
+    /// Aba Sensores: primeira linha mostrada e se o último desenho deixou linhas de fora (só
+    /// então ela rola para baixo).
+    pub sensor_offset: usize,
+    pub sensor_overflow: bool,
     pub filter: String,
     /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
     pub filtering: bool,
@@ -746,6 +752,41 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     }
 }
 
+/// Caixas da aba Geral que a tecla `z` amplia, na ordem em que ela as percorre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zoom {
+    Cpu,
+    Gpu,
+    Net,
+    Disks,
+    Game,
+}
+
+impl Zoom {
+    const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Net, Self::Disks, Self::Game];
+
+    /// Próxima caixa; depois da última, a aba volta ao normal.
+    pub fn next(z: Option<Self>) -> Option<Self> {
+        match z {
+            None => Some(Self::ALL[0]),
+            Some(z) => {
+                let i = Self::ALL.iter().position(|x| *x == z).unwrap_or(0);
+                Self::ALL.get(i + 1).copied()
+            }
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu + memory",
+            Self::Gpu => "gpu",
+            Self::Net => "net",
+            Self::Disks => "disks",
+            Self::Game => "game",
+        }
+    }
+}
+
 /// Onde cada coisa clicável ficou no último desenho (o mouse só acelera o que o teclado faz).
 #[derive(Default)]
 pub struct Hits {
@@ -812,6 +853,10 @@ const HELP: &[(&str, &str)] = &[
         "update interval (100 ms steps, saved to config.toml)",
     ),
     ("p, space", "pause the screen (collection keeps running)"),
+    (
+        "z",
+        "Overview: enlarge one box to the whole tab (z next, esc back)",
+    ),
     ("r", "reset session min/max and the game history"),
     ("t", "next color theme"),
     (
@@ -896,6 +941,20 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
+    // Uma caixa ampliada ocupa a aba inteira.
+    if let Some(z) = st.zoom {
+        match z {
+            Zoom::Cpu => {
+                let mem_rows = mem_text(st, body.width).map_or(2, |t| t.height().saturating_sub(2));
+                draw_cpu(frame, body, st, mem_rows);
+            }
+            Zoom::Gpu => draw_gpu(frame, body, st),
+            Zoom::Net => draw_net(frame, body, st),
+            Zoom::Disks => draw_disks(frame, body, st),
+            Zoom::Game => draw_game(frame, body, st),
+        }
+        return;
+    }
     // Em cima, CPU + memória (como GPU + VRAM ao lado); embaixo, rede compacta à esquerda e
     // discos sobre o jogo à direita.
     // Em cima, pelo menos o que CPU + memória e GPU + VRAM precisam para mostrar todas as
@@ -973,6 +1032,18 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .and_then(|f| f.cpu.as_ref().ok())
         .map(|c| c.uptime.as_secs());
     let mut right = Vec::new();
+    if let Some(z) = st.zoom
+        && st.tab == Tab::Overview
+    {
+        right.extend([
+            Span::styled(
+                format!("zoom: {} ", z.name()),
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+            ),
+            label("(z next, esc back)"),
+            bar_sep(),
+        ]);
+    }
     if st.paused {
         right.extend([
             // Destaque sem a cor de falha (vermelho é só para erro); os colchetes valem em
@@ -1039,9 +1110,23 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         " fold pool  "
     };
     let overview: Vec<(&str, &str)> = if pool {
-        vec![("r", " reset min/max  "), ("d", fold), ("t", " theme  ")]
+        vec![
+            ("r", " reset min/max  "),
+            ("z", " zoom  "),
+            ("d", fold),
+            ("t", " theme  "),
+        ]
     } else {
-        vec![("r", " reset min/max  "), ("t", " theme  ")]
+        vec![
+            ("r", " reset min/max  "),
+            ("z", " zoom  "),
+            ("t", " theme  "),
+        ]
+    };
+    let sensors: Vec<(&str, &str)> = if st.sensor_overflow || st.sensor_offset > 0 {
+        vec![("↑↓", " scroll  "), ("r", " reset min/max  ")]
+    } else {
+        vec![("r", " reset min/max  ")]
     };
     let pairs: &[(&str, &str)] = match st.tab {
         Tab::Overview => &overview,
@@ -1082,7 +1167,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("/", " filter  "),
             ("enter", " runtimes  "),
         ],
-        Tab::Sensors => &[("r", " reset min/max  ")],
+        Tab::Sensors => &sensors,
     };
     for (k, l) in pairs {
         groups.push([key(k), label(l)]);

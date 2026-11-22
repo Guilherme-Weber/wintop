@@ -1335,3 +1335,42 @@ fn mouse_abas_cabecalho_linhas_e_rodinha() {
         .expect("na lista");
     assert_eq!(pos, (2 + 3).min(rows.len() - 1));
 }
+
+#[test]
+fn zoom_amplia_uma_caixa_e_volta() {
+    let mut st = filled();
+    let mut z = None;
+    let mut names = Vec::new();
+    loop {
+        z = view::Zoom::next(z);
+        let Some(zz) = z else { break };
+        names.push(zz.name());
+        st.zoom = z;
+        let out = render(&mut st, 160, 48);
+        assert!(out.contains(&format!("zoom: {}", zz.name())), "{out}");
+    }
+    assert_eq!(names, ["cpu + memory", "gpu", "net", "disks", "game"]);
+    // Ampliada, a caixa dos discos mostra todos (sem "+N more").
+    st.zoom = Some(view::Zoom::Disks);
+    let out = render(&mut st, 120, 30);
+    assert!(!out.contains("more"), "{out}");
+    st.zoom = None;
+    assert!(!render(&mut st, 160, 48).contains("zoom:"));
+}
+
+#[test]
+fn sensores_rolam_quando_nao_cabem() {
+    let mut st = tab_state(view::Tab::Sensors);
+    // Tão baixo que nem com colunas cabe tudo: há linhas de fora e a rolagem anda.
+    let out = render(&mut st, 60, 12);
+    assert!(st.sensor_overflow, "{out}");
+    let first = out.lines().nth(4).unwrap_or_default().to_string();
+    st.sensor_offset = 3;
+    let out = render(&mut st, 60, 12);
+    assert!(out.contains("from row 4"), "{out}");
+    assert_ne!(out.lines().nth(4).unwrap_or_default(), first);
+    // Com espaço, sem rolagem.
+    st.sensor_offset = 0;
+    let _ = render(&mut st, 200, 60);
+    assert!(!st.sensor_overflow);
+}
