@@ -49,6 +49,9 @@ pub struct Query {
     id: u64,
     handle: PDH_HQUERY,
     counters: RefCell<Vec<PDH_HCOUNTER>>,
+    /// Buffer das leituras de arrays, reaproveitado entre as coletas (cresce até o maior
+    /// tamanho pedido; sem alocar a cada leitura).
+    buf: RefCell<Vec<u64>>,
 }
 
 // SAFETY: os handles do PDH podem ser usados de outra thread, desde que não simultaneamente; a
@@ -70,6 +73,7 @@ impl Query {
             id: NEXT_QUERY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: h,
             counters: RefCell::new(Vec::new()),
+            buf: RefCell::new(Vec::new()),
         })
     }
 
@@ -133,13 +137,18 @@ impl Query {
             return Ok(Vec::new());
         }
         // Buffer alinhado a 8 (os itens têm ponteiro e f64); os nomes ficam no mesmo buffer.
-        let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+        let mut buf = self.buf.borrow_mut();
+        let words = (size as usize).div_ceil(8);
+        if buf.len() < words {
+            buf.resize(words, 0);
+        }
         let items = buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        // O PDH escreve até `size` bytes: o que há além no buffer reaproveitado não é lido.
         // SAFETY: buffer de `size` bytes, alinhado.
         check(unsafe {
             PdhGetFormattedCounterArrayW(h, FMT, &raw mut size, &raw mut count, Some(items))
         })?;
-        let fits = buf.len() * 8 / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        let fits = words * 8 / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         let n = (count as usize).min(fits);
         let mut out = Vec::with_capacity(n);
         let mut first_err = None;
