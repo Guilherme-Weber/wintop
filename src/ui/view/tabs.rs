@@ -741,16 +741,24 @@ pub(in crate::ui) fn sorted_gpu<'a>(
 }
 
 pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+    let n = st.gpu_count();
+    let sel = st.gpu_index(n);
     let gpu = st
         .fast
         .as_ref()
         .and_then(|f| f.gpus.as_ref().ok())
-        .and_then(|l| l.first())
+        .and_then(|l| l.get(sel))
         .cloned();
-    let title = gpu.as_ref().and_then(|g| g.name.as_ref().ok()).map_or_else(
-        || "gpu processes".to_string(),
-        |n| format!("gpu processes · {n}"),
-    );
+    // Com mais de uma GPU, a posição da exibida (tecla `g` troca).
+    let head = if n > 1 {
+        format!("gpu {}/{n} processes", sel + 1)
+    } else {
+        "gpu processes".to_string()
+    };
+    let title = gpu
+        .as_ref()
+        .and_then(|g| g.name.as_ref().ok())
+        .map_or_else(|| head.clone(), |name| format!("{head} · {name}"));
     let Some(Ok(list)) = &st.gpu_procs else {
         empty_box(frame, area, &title, st.gpu_procs.as_ref());
         return;
@@ -780,7 +788,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .slow
         .as_ref()
         .and_then(|s| s.gpus.as_ref().ok())
-        .and_then(|l| l.first())
+        .and_then(|l| l.get(sel))
         .map(|g| g.vram.clone());
     let r0 = Rect::new(inner.x, inner.y, inner.width, 1);
     let fast_gpu_err = st
@@ -804,8 +812,14 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mut head_lines = super::vram_legend(vram.as_ref(), game, inner.width);
     if let Some(g) = &gpu {
         let pctm = |m: &Metric<u32>| metric(m, |v| format!("{v}%"));
-        let spans = vec![
-            label("adapter  3D/compute "),
+        // Sem NVML o uso é a engine mais ocupada (como o Gerenciador de Tarefas), e a atividade
+        // da memória não existe.
+        let mut spans = vec![
+            label(if g.no_nvml.is_some() {
+                "adapter  busiest engine "
+            } else {
+                "adapter  3D/compute "
+            }),
             pctm(&g.usage),
             bar_sep(),
             label("encoder "),
@@ -813,10 +827,10 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             bar_sep(),
             label("decoder "),
             pctm(&g.decoder),
-            bar_sep(),
-            label("memory activity "),
-            pctm(&g.mem_activity),
         ];
+        if g.no_nvml.is_none() {
+            spans.extend([bar_sep(), label("memory activity "), pctm(&g.mem_activity)]);
+        }
         head_lines.extend(super::wrap(spans, inner.width, 0, 9));
     }
     // Sem altura, a tabela fica com pelo menos o cabeçalho e 3 linhas.
@@ -1058,6 +1072,13 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
         Ok(list) => {
             for g in list {
                 let grp = format!("GPU {}", g.index);
+                // Sem NVML: os sensores dele numa linha, com o motivo.
+                if let Some(m) = &g.no_nvml {
+                    out.push(text_row(&grp, "NVML sensors", Err(m.clone())));
+                    out.push(text_row(&grp, "Name", g.name.clone()));
+                    out.push(text_row(&grp, "Driver", g.driver.clone()));
+                    continue;
+                }
                 let u = |m: &Metric<u32>| m.clone().map(f64::from);
                 let first = |m: &Metric<(u32, u32)>| m.clone().map(|(a, _)| f64::from(a));
                 out.push(num_row(&grp, "Temperature", u(&g.temp), "°C", 0));

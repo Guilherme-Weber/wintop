@@ -88,7 +88,9 @@ redirecionamentos e caminhos que não sejam locais são recusados.
 
 - Windows 10 ou 11, 64 bits.
 - Execução como administrador (o executável solicita elevação).
-- GPU NVIDIA com driver recente (NVML).
+- GPU NVIDIA com driver recente (NVML) para todas as métricas da GPU. GPUs AMD e Intel aparecem
+  com nome, driver, uso, encoder/decoder e VRAM (DXGI e contadores do Windows); com mais de uma
+  GPU, a tecla `g` troca a exibida.
 - [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/)
   para FPS e frametime.
 - [PawnIO](https://pawnio.eu) para temperatura e potência de processadores AMD

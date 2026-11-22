@@ -13,11 +13,60 @@ use crate::pdh::{self, Query, Slot};
 
 /// `pid_1234_luid_..._phys_0_eng_3_engtype_VideoDecode` → (1234, "luid_..._phys_0", "VideoDecode").
 fn parse(name: &str) -> Option<(u32, &str, &str)> {
+    parse_engine(name).map(|(pid, adapter, _, engtype)| (pid, adapter, engtype))
+}
+
+/// Como `parse`, com o número da engine ("3").
+fn parse_engine(name: &str) -> Option<(u32, &str, &str, &str)> {
     let rest = name.strip_prefix("pid_")?;
     let (pid, rest) = rest.split_once('_')?;
-    let (adapter, engtype) = rest.split_once("_eng_")?;
-    let (_, engtype) = engtype.split_once("_engtype_")?;
-    Some((pid.parse().ok()?, adapter, engtype))
+    let (adapter, engine) = rest.split_once("_eng_")?;
+    let (eng, engtype) = engine.split_once("_engtype_")?;
+    Some((pid.parse().ok()?, adapter, eng, engtype))
+}
+
+/// Uso do adaptador inteiro (GPU sem NVML), como o Gerenciador de Tarefas: cada engine física
+/// soma o uso de todos os processos (teto 100); o uso da GPU é a engine mais ocupada.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct AdapterUse {
+    pub usage: f64,
+    /// Engines de vídeo: `None` = o adaptador não tem engine desse tipo.
+    pub encode: Option<f64>,
+    pub decode: Option<f64>,
+}
+
+pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
+    // (adaptador físico, engine) → (tipo, soma).
+    let mut per: HashMap<(String, &str), (&str, f64)> = HashMap::new();
+    for (name, v) in rows {
+        let Some((_, adapter, eng, engtype)) = parse_engine(name) else {
+            continue;
+        };
+        let adapter = adapter.to_ascii_lowercase();
+        if !adapter.starts_with(luid) {
+            continue;
+        }
+        let v = if v.is_finite() {
+            v.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        per.entry((adapter, eng)).or_insert((engtype, 0.0)).1 += v;
+    }
+    let mut out = AdapterUse::default();
+    let max = |slot: &mut Option<f64>, v: f64| *slot = Some(slot.unwrap_or(0.0).max(v));
+    for (engtype, sum) in per.into_values() {
+        let v = sum.min(100.0);
+        out.usage = out.usage.max(v);
+        // A AMD expõe encode e decode numa engine só ("VideoCodec"): vale para os dois.
+        if engtype.contains("Encode") || engtype.contains("Codec") {
+            max(&mut out.encode, v);
+        }
+        if engtype.contains("Decode") || engtype.contains("Codec") {
+            max(&mut out.decode, v);
+        }
+    }
+    out
 }
 
 /// PID → (tipo de engine → uso %), só das instâncias do adaptador `luid`.
@@ -115,6 +164,10 @@ mod tests {
             for v in edges {
                 let rows = [(name.to_string(), v), (other.to_string(), v)];
                 for luid in ["luid_0x00000000_0x0000d1e1", ""] {
+                    let u = adapter_use(&rows, luid);
+                    for x in [Some(u.usage), u.encode, u.decode].into_iter().flatten() {
+                        assert!((0.0..=100.0).contains(&x));
+                    }
                     for engines in group(&rows, luid).values() {
                         assert!(engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)));
                         assert!(engines.windows(2).all(|w| w[0].0 < w[1].0));
@@ -122,6 +175,36 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Uso do adaptador: soma por engine física entre os processos, máximo entre as engines.
+    #[test]
+    fn uso_do_adaptador() {
+        let l = "luid_0x00000000_0x0000d1e1_phys_";
+        let row = |pid: u32, luid: &str, eng: u32, t: &str, v: f64| {
+            (
+                format!("pid_{pid}_luid_0x00000000_0x0000{luid}_phys_0_eng_{eng}_engtype_{t}"),
+                v,
+            )
+        };
+        let rows = vec![
+            row(10, "D1E1", 0, "3D", 30.0),
+            row(11, "D1E1", 0, "3D", 25.0),
+            row(10, "D1E1", 1, "Copy", 70.0),
+            row(12, "D1E1", 4, "VideoDecode", 80.0),
+            row(12, "D1E1", 4, "VideoDecode", 50.0),
+            row(13, "AAAA", 0, "3D", 99.0),
+            row(14, "D1E1", 2, "3D", f64::NAN),
+        ];
+        let u = adapter_use(&rows, l);
+        assert_eq!(u.usage, 100.0); // 80 + 50 na mesma engine de decode, teto 100
+        assert_eq!(u.decode, Some(100.0));
+        assert_eq!(u.encode, None);
+        let only3d = adapter_use(&rows[..3], l);
+        assert_eq!(only3d.usage, 70.0);
+        let codec = adapter_use(&[row(1, "D1E1", 5, "VideoCodec", 12.0)], l);
+        assert_eq!((codec.encode, codec.decode), (Some(12.0), Some(12.0)));
+        assert_eq!(adapter_use(&rows, "luid_0x1_"), AdapterUse::default());
     }
 
     #[test]

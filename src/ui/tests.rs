@@ -67,6 +67,7 @@ fn gpu() -> Gpu {
     let clock = |c| Ok((c, 3090));
     Gpu {
         index: 0,
+        no_nvml: None,
         name: Ok("NVIDIA GeForce RTX 5070 Ti".into()),
         driver: Ok("621.01".into()),
         vbios: Ok("98.03.58.00.96".into()),
@@ -1373,4 +1374,108 @@ fn sensores_rolam_quando_nao_cabem() {
     st.sensor_offset = 0;
     let _ = render(&mut st, 200, 60);
     assert!(!st.sensor_overflow);
+}
+
+/// Segunda GPU, sem NVML (AMD), como o coletor a monta: uso, encode, decode e VRAM pelo DXGI e
+/// pelo PDH; o resto com o motivo.
+fn amd_gpu() -> Gpu {
+    let why = Missing::Neutral("needs NVML (NVIDIA only)".into());
+    let mut g = gpu();
+    g.index = 1;
+    g.no_nvml = Some(why.clone());
+    g.name = Ok("AMD Radeon RX 7900 XTX".into());
+    g.driver = Ok("32.0.21025.1024".into());
+    g.vbios = Err(why.clone());
+    g.usage = Ok(12);
+    g.encoder = neutral("no video encode engine reported");
+    g.decoder = Ok(3);
+    g.mem_activity = Err(why.clone());
+    g.dedicated = Ok((2 * GB, 24 * GB));
+    g.physical = Err(why.clone());
+    g.temp = Err(why.clone());
+    g.temp_slowdown = Err(why.clone());
+    g.clock_graphics = Err(why.clone());
+    g.clock_sm = Err(why.clone());
+    g.clock_mem = Err(why.clone());
+    g.clock_video = Err(why.clone());
+    g.power = Err(why.clone());
+    g.fans = Err(why.clone());
+    g.pcie_link = Err(why.clone());
+    g.pstate = Err(why.clone());
+    g.throttle = Err(why);
+    g
+}
+
+/// Estado com duas GPUs (a NVIDIA do NVML e a AMD sem ele) na aba `tab`.
+fn two_gpus(tab: view::Tab) -> State {
+    let mut st = State::new(1000);
+    for i in 0..120 {
+        let mut f = fast(i);
+        if let Ok(l) = &mut f.gpus {
+            l.push(amd_gpu());
+        }
+        st.push_fast(f);
+        st.push_fps(game());
+    }
+    st.set_tab(tab);
+    let mut s = slow();
+    s.procs = Some(Ok(proc_list()));
+    if let Ok(g) = &mut s.gpus {
+        g[0].procs = Some(Ok(gpu_list()));
+        let why = Missing::Neutral("needs NVML (NVIDIA only)".into());
+        let mut amd = g[0].clone();
+        amd.index = 1;
+        amd.pcie_tx = Err(why.clone());
+        amd.pcie_rx = Err(why);
+        amd.procs = Some(Ok(gpu_list().into_iter().take(2).collect()));
+        g.push(amd);
+    }
+    st.push_slow(s);
+    st
+}
+
+/// Tecla `g`: a caixa da GPU troca de placa, com a posição no título e os campos do NVML numa
+/// linha só.
+#[test]
+fn geral_segunda_gpu_sem_nvml() {
+    let mut st = two_gpus(view::Tab::Overview);
+    let first = render(&mut st, 160, 48);
+    assert!(first.contains("gpu 1/2 · NVIDIA GeForce RTX 5070 Ti"));
+    assert!(first.contains("g next gpu"));
+    st.next_gpu();
+    insta::assert_snapshot!(render(&mut st, 160, 48));
+    // Volta à primeira.
+    st.next_gpu();
+    assert!(render(&mut st, 160, 48).contains("gpu 1/2"));
+}
+
+#[test]
+fn aba_gpu_segunda_gpu() {
+    let mut st = two_gpus(view::Tab::Gpu);
+    st.next_gpu();
+    // A lista espera a próxima coleta lenta (a anterior era da outra GPU).
+    assert!(st.gpu_procs.is_none());
+    let mut s = st.slow.clone().expect("coleta lenta");
+    s.procs = Some(Ok(proc_list()));
+    st.push_slow(s);
+    insta::assert_snapshot!(render(&mut st, 160, 20));
+}
+
+#[test]
+fn sensores_de_gpu_sem_nvml_numa_linha() {
+    let mut st = two_gpus(view::Tab::Sensors);
+    let out = render(&mut st, 200, 60);
+    assert!(out.contains("NVML sensors"));
+    assert!(out.contains("AMD Radeon RX 7900 XTX"));
+}
+
+/// Uma GPU só: a tecla não faz nada e o título não mostra posição.
+#[test]
+fn uma_gpu_sem_seletor() {
+    let mut st = filled();
+    st.next_gpu();
+    assert_eq!(st.gpu_sel, 0);
+    let out = render(&mut st, 160, 48);
+    assert!(!out.contains("next gpu"));
+    assert!(!out.contains("gpu 1/"));
 }

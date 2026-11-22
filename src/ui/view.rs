@@ -148,7 +148,8 @@ pub struct State {
     /// Tempo de kernel (total e por lógico), alinhado com `cpu` e `cores`.
     cpu_kernel: Series,
     cores_kernel: Vec<Series>,
-    gpu: Series,
+    /// Histórico de cada GPU (todas, para a troca não começar vazia).
+    gpu: Vec<Series>,
     disks: HashMap<u32, Series>,
     send: HashMap<String, Series>,
     recv: HashMap<String, Series>,
@@ -180,6 +181,8 @@ pub struct State {
     /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
     pub gpu_cursor: Cursor,
+    /// GPU exibida nas abas Geral e GPU (tecla `g`; posição na lista, 1ª se sumir).
+    pub gpu_sel: usize,
     pub gpu_sort: tabs::GpuSort,
     pub gpu_reverse: bool,
     /// Tela congelada (tecla `p` ou Espaço): as coletas continuam, mas não entram na tela.
@@ -220,6 +223,41 @@ impl State {
             .and_then(|f| f.disks.as_ref().ok())
             .map_or(0, Vec::len);
         self.fold_pool = Some(!pool_folded(self, total));
+    }
+
+    /// Posição da GPU exibida numa lista de `n` GPUs (a 1ª se a escolhida sumiu).
+    pub fn gpu_index(&self, n: usize) -> usize {
+        if self.gpu_sel < n { self.gpu_sel } else { 0 }
+    }
+
+    /// Quantas GPUs a última coleta trouxe.
+    pub fn gpu_count(&self) -> usize {
+        self.fast
+            .as_ref()
+            .and_then(|f| f.gpus.as_ref().ok())
+            .map_or(0, Vec::len)
+    }
+
+    /// Tecla `g`: próxima GPU. Os extremos da sessão da GPU passam a ser os da nova (zerados);
+    /// a lista da aba GPU espera a coleta seguinte, como na troca de aba.
+    pub fn next_gpu(&mut self) {
+        let n = self.gpu_count();
+        if n < 2 {
+            return;
+        }
+        self.gpu_sel = (self.gpu_index(n) + 1) % n;
+        for m in [
+            &mut self.session.gpu,
+            &mut self.session.gpu_temp,
+            &mut self.session.gpu_power,
+            &mut self.session.vram,
+            &mut self.session.gfx_clock,
+        ] {
+            *m = MinMax::default();
+        }
+        self.gpu_procs = None;
+        self.gpu_cursor = Cursor::default();
+        self.runtimes.clear();
     }
 
     /// Zera os extremos da sessão (tecla `r`).
@@ -272,7 +310,8 @@ impl State {
             }
             match &s.gpus {
                 Ok(list) => {
-                    if let Some(p) = list.first().and_then(|g| g.procs.clone()) {
+                    let sel = self.gpu_index(list.len());
+                    if let Some(p) = list.get(sel).and_then(|g| g.procs.clone()) {
                         self.gpu_procs = Some(p);
                     }
                 }
@@ -404,13 +443,18 @@ impl State {
                 self.session.cpu_power.update(*w);
             }
         }
+        if let Ok(list) = &f.gpus {
+            self.gpu.resize_with(list.len(), Series::default);
+            for (s, g) in self.gpu.iter_mut().zip(list) {
+                let (_, v) = busiest_engine(g);
+                let any = [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok());
+                s.push(if any { f64::from(v) / 100.0 } else { f64::NAN });
+            }
+        }
         if let Ok(list) = &f.gpus
-            && let Some(g) = list.first()
+            && let Some(g) = list.get(self.gpu_index(list.len()))
         {
             let (_, v) = busiest_engine(g);
-            let any = [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok());
-            self.gpu
-                .push(if any { f64::from(v) / 100.0 } else { f64::NAN });
             if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
                 self.session.gpu.update(f64::from(v));
             }
@@ -858,6 +902,7 @@ const HELP: &[(&str, &str)] = &[
         "Overview: enlarge one box to the whole tab (z next, esc back)",
     ),
     ("r", "reset session min/max and the game history"),
+    ("g", "next GPU, with more than one (Overview, GPU)"),
     ("t", "next color theme"),
     (
         "d",
@@ -1179,6 +1224,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     for (k, l) in pairs {
         groups.push([key(k), label(l)]);
     }
+    if !st.filtering && matches!(st.tab, Tab::Overview | Tab::Gpu) && st.gpu_count() > 1 {
+        groups.push([key("g"), label(" next gpu  ")]);
+    }
     if !st.filtering {
         groups.push([key("p"), label(" pause  ")]);
         groups.push([key("?"), label(" help  ")]);
@@ -1344,9 +1392,9 @@ pub(super) fn failing_sources(st: &State) -> usize {
             l.iter()
                 .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv) || failed(&x.errors))
         }));
-        // Só a GPU exibida (a 1ª): a interface ainda não mostra outras.
+        // Só a GPU exibida (tecla `g`); as outras aparecem na aba Sensores.
         add(source_failed(&f.gpus, |l| {
-            l.iter().take(1).any(|g| {
+            l.iter().skip(st.gpu_index(l.len())).take(1).any(|g| {
                 failed(&g.name)
                     || failed(&g.driver)
                     || failed(&g.vbios)
@@ -1381,6 +1429,7 @@ pub(super) fn failing_sources(st: &State) -> usize {
         slow_gpus_failed = s.gpus.is_err();
         add(source_failed(&s.gpus, |l| {
             l.iter()
+                .skip(st.gpu_index(l.len()))
                 .take(1)
                 .any(|g| failed(&g.pcie_tx) || failed(&g.pcie_rx) || failed(&g.vram))
         }));
@@ -1802,19 +1851,25 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         empty_box(frame, area, "gpu", gpus);
         return;
     };
-    let Some(g) = list.first().cloned() else {
+    let sel = st.gpu_index(list.len());
+    let Some(g) = list.get(sel).cloned() else {
         frame.render_widget(
-            Paragraph::new(missing(&Missing::Fail("NVML reported no GPU".into())))
-                .block(boxed("gpu", "")),
+            Paragraph::new(missing(&Missing::Fail("no GPU found".into()))).block(boxed("gpu", "")),
             area,
         );
         return;
     };
     let (engine, engine_v) = busiest_engine(&g);
+    // Com mais de uma GPU, a posição da exibida (tecla `g` troca).
+    let gpu = if list.len() > 1 {
+        format!("gpu {}/{}", sel + 1, list.len())
+    } else {
+        "gpu".to_string()
+    };
     let name = g
         .name
         .as_ref()
-        .map_or_else(|_| "gpu".to_string(), |n| format!("gpu · {n}"));
+        .map_or_else(|_| gpu.clone(), |n| format!("{gpu} · {n}"));
     let block = with_failure(
         // A engine ativa já está no cabeçalho do gráfico e no painel (em negrito).
         boxed(&name, ""),
@@ -1881,26 +1936,33 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         v.extend(spans);
         (v, None)
     };
-    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = [
+    // Sem NVML, a atividade da memória, a temperatura, a potência e o clock nunca têm valor (o
+    // motivo fica numa linha embaixo): só o que existe.
+    let nvml = g.no_nvml.is_none();
+    let mut engines = vec![
         eng("3D", &g.usage),
         eng("encode", &g.encoder),
         eng("decode", &g.decoder),
-        eng("mem act", &g.mem_activity),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    ];
+    if nvml {
+        engines.push(eng("mem act", &g.mem_activity));
+    }
+    let mut rows: Vec<(Vec<Span<'static>>, Option<f64>)> = engines.into_iter().flatten().collect();
     let engine_rows = rows.len();
     rows.push((vec![label("session")], None));
     let n0 = |v: f64| num(v, 0);
     rows.push(row("util", mm(st.session.gpu, &n0, "%")));
-    rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
-    rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
+    if nvml {
+        rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
+        rows.push(row("power", mm(st.session.gpu_power, &n0, " W")));
+    }
     rows.push(row(
         "VRAM",
         mm(st.session.vram, &|v| short_bytes(v as u64), ""),
     ));
-    rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
+    if nvml {
+        rows.push(row("gfx", mm(st.session.gfx_clock, &n0, " MHz")));
+    }
     // Sem altura para o painel todo: os extremos da sessão viram uma linha (com quebra) embaixo.
     let mut session_lines = Vec::new();
     if inner.height.saturating_sub(bottom_h) < rows.len() as u16 {
@@ -1945,7 +2007,10 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         graph.height.saturating_sub(1),
     );
     frame.render_widget(
-        Graph::new(st.gpu.values(), GraphColor::Height),
+        Graph::new(
+            st.gpu.get_mut(sel).map_or(&[][..], Series::values),
+            GraphColor::Height,
+        ),
         gr.intersection(graph),
     );
 
@@ -2025,6 +2090,36 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .and_then(|f| f.game.as_ref().ok())
         .map(|g| g.pid);
     let legend = vram_legend(slow.as_ref().map(|s| &s.vram), game_pid, width);
+    // GPU sem NVML: os campos só dele numa linha, com o motivo (não repetido em cada um).
+    let rows: Vec<Vec<Span<'static>>> = if let Some(m) = &g.no_nvml {
+        vec![
+            vec![
+                label("NVML   "),
+                missing(m),
+                label(" (clocks, temp, power, fans, PCIe, P-state)"),
+            ],
+            vec![label("drv    "), metric(&g.driver, Clone::clone)],
+        ]
+    } else {
+        nvml_rows(g, slow.as_ref(), slow_err.as_ref())
+    };
+    let info = rows
+        .into_iter()
+        .flat_map(|r| wrap(r, width, 0, 7))
+        .collect();
+    GpuDetails {
+        game_pid,
+        legend,
+        info,
+    }
+}
+
+/// Linhas de detalhe de uma GPU do NVML (aba Geral).
+fn nvml_rows(
+    g: &Gpu,
+    slow: Option<&crate::model::GpuSlow>,
+    slow_err: Option<&Missing>,
+) -> Vec<Vec<Span<'static>>> {
     // Máximo 0 = o NVML não informa (GPUs móveis): só o atual.
     let clk = |m: &Metric<(u32, u32)>| {
         metric(m, |(c, mx)| {
@@ -2035,7 +2130,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
             }
         })
     };
-    let rows: Vec<Vec<Span<'static>>> = vec![
+    vec![
         match &g.physical {
             Ok([u, f, r, t]) => vec![
                 // O total físico é o mesmo da barra da VRAM: só aparece se diferir.
@@ -2132,16 +2227,7 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
             ]);
             v
         },
-    ];
-    let info = rows
-        .into_iter()
-        .flat_map(|r| wrap(r, width, 0, 7))
-        .collect();
-    GpuDetails {
-        game_pid,
-        legend,
-        info,
-    }
+    ]
 }
 
 /// Quebra uma linha em várias de até `width` colunas, em vez de cortar. Os pontos de quebra são

@@ -349,6 +349,12 @@ fn event_loop(
                         st.reset_session();
                         dirty = true;
                     }
+                    KeyCode::Char('g')
+                        if matches!(st.tab, view::Tab::Overview | view::Tab::Gpu) =>
+                    {
+                        st.next_gpu();
+                        dirty = true;
+                    }
                     KeyCode::Char('d') => {
                         // Automático → recolhe → expande → recolhe...
                         st.toggle_fold_pool();

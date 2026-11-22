@@ -43,6 +43,21 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Temperatura por CCD | SMN por família/modelo; validado só Zen 3 Vermeer (19h, 20h-2Fh): `0x59954 + 4·n`, bit 11 = válido | A | "não validado nesta família" | E2 (Zen 3) |
 | Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | "CPU não suportada" | E2 (Zen 3) |
 
+### Outras CPUs (1.1, sem validação em hardware)
+
+Regra do projeto: só entra na tabela `cpu_support` (`src/collect/pawnio.rs`) o que foi conferido
+numa CPU real. A máquina de desenvolvimento tem só um Zen 3, então o estado atual é:
+
+| CPU | Tctl e potência | CCD | Referência para validar (LibreHardwareMonitor, AMD PPR) |
+| --- | --- | --- | --- |
+| Zen 3 Vermeer (19h, 20h-2Fh) | sim | sim | validado no 5700X3D |
+| Zen 2 (17h, 31h/71h) | sim (mesmos registradores de 17h-1Ah) | neutro "not validated on this CPU family" | CCD no mesmo `0x59954 + 4·n` do Zen 3 |
+| Zen 4 (19h, 60h-7Fh) e Zen 5 (1Ah) | sim | neutro | CCD em `0x59B08 + 4·n` (outra base), bit 11 = válido |
+| Intel | neutro "CPU not supported (not AMD)" | — | outro módulo do PawnIO (`IntelMSR`): `IA32_PACKAGE_THERM_STATUS` (`0x1B1`) e `IA32_THERM_STATUS` (`0x19C`) por núcleo, com o TjMax de `MSR_TEMPERATURE_TARGET` (`0x1A2`); potência pelo RAPL (`0x611` com a unidade de `0x606`) |
+
+Para validar uma família: rodar `cargo run --example spike_pawnio` numa CPU dela, comparar com o
+HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_support` (com teste).
+
 ## Memória
 
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
@@ -100,6 +115,25 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Encoder / decoder (%) | NVML | | | Spike |
 | P-state, motivos de throttling | NVML | | | Spike |
 | Hotspot e temperatura da memória | não expostos pela RTX 5070 Ti / NVML | | fora do escopo | — |
+
+### Várias GPUs e GPUs sem NVML (1.1)
+
+A lista de GPUs tem as do NVML, na ordem dele, e depois os adaptadores DXGI de hardware que o NVML
+não cobre (fabricante Microsoft, adaptador de software e LUID repetido ficam de fora). A tecla `g`
+troca a GPU exibida nas abas Geral e GPU; a aba Sensores e o `--check` mostram todas.
+
+| Métrica (GPU sem NVML) | Fonte | Elev. | Estado neutro | Prova |
+| --- | --- | --- | --- | --- |
+| Nome, driver | DXGI `GetDesc1` e `CheckInterfaceSupport` (versão WDDM, ex. 32.0.15.8180) | | | E1.1 (RTX forçada sem NVML) |
+| Uso (%) | PDH `\GPU Engine(*)\Utilization Percentage` do LUID: soma dos processos por engine física (teto 100), máximo entre as engines (conta do Task Manager). Consulta aberta na thread rápida só quando existe GPU sem NVML | | "waiting for a second sample" (1ª coleta) | E1.1: 2 pontos de diferença média do NVML com carga, 6 parado (picos de Copy) |
+| Encoder / decoder (%) | mesmas engines: `*Encode*` / `*Decode*`; `VideoCodec` (AMD) vale para os dois | | "no video encode/decode engine reported" | E1.1 |
+| VRAM dedicada, compartilhada, por categoria, processos | mesmo PDH das GPUs do NVML; total = DXGI `DedicatedVideoMemory` | | | E1.1 (idêntica ao caminho do NVML) |
+| Campos só do NVML (física, temperatura, clocks, potência, fans, PCIe, P-state, throttling, VBIOS, atividade da memória) | — | | "needs NVML (NVIDIA only)" (AMD, Intel), numa linha só; NVIDIA com o NVML em falha mostra a falha | E1.1 |
+
+Validação: teste ignorado `sem_nvml_bate_com_o_nvml` (`src/collect/gpu.rs`) força o NVML em falha
+e compara os dois caminhos lado a lado na RTX 5070 Ti. Não há GPU AMD ou Intel na máquina de
+desenvolvimento: o caminho delas é o mesmo, mas os nomes das engines de vídeo ("VideoCodec",
+"VideoEncode") seguem a documentação do WDDM, sem prova em hardware.
 
 ## GPU por processo (aba GPU)
 

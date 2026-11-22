@@ -180,7 +180,12 @@ pub struct Fan {
 
 #[derive(Clone, Debug)]
 pub struct Gpu {
+    /// Posição na lista do wintop (as GPUs do NVML, na ordem dele, e depois as só do DXGI).
     pub index: u32,
+    /// GPU sem NVML (AMD, Intel, ou NVIDIA com o NVML em falha): o motivo, que vale para todos
+    /// os campos só do NVML (a interface mostra uma linha em vez de repetir em cada um). Uso,
+    /// encode, decode e VRAM vêm do DXGI e do PDH.
+    pub no_nvml: Option<Missing>,
     pub name: Metric<String>,
     pub driver: Metric<String>,
     pub vbios: Metric<String>,
