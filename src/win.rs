@@ -81,6 +81,11 @@ pub fn windows_dir() -> Option<PathBuf> {
 /// nome longo.
 pub fn long_path(p: &std::path::Path) -> PathBuf {
     use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    // Só caminho local: o processo elevado não toca um compartilhamento de rede nem um
+    // dispositivo para expandir nomes (o que não é local é recusado depois, sem acesso).
+    if !is_local_absolute(p) {
+        return p.to_path_buf();
+    }
     let w = wide(&p.to_string_lossy());
     let mut buf = vec![0u16; 512];
     for _ in 0..2 {
@@ -369,6 +374,8 @@ mod tests {
         assert!(!long.to_string_lossy().contains('~'), "{}", long.display());
         let none = dir.join("nao-existe");
         assert_eq!(long_path(&none), none);
+        let unc = PathBuf::from(r"\\127.0.0.1\c$\PROGRA~1");
+        assert_eq!(long_path(&unc), unc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
