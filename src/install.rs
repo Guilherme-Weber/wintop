@@ -411,6 +411,54 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Versão da cópia instalada (`wintop.exe --version`), se houver uma.
+fn installed_version(exe: &Path) -> Option<String> {
+    if !exe.is_file() {
+        return None;
+    }
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().strip_prefix("wintop ").map(str::to_string)
+}
+
+/// Troca o exe instalado mesmo com o wintop aberto: o Windows deixa renomear um exe em
+/// execução (não sobrescrever). O novo entra como `.new`, o atual vira `.old` e o novo assume o
+/// nome; a instância aberta segue na versão antiga até fechar. O `.old` de uma troca anterior é
+/// apagado antes (se ainda estiver em uso, fica para a próxima).
+fn replace_exe(from: &Path, exe: &Path) -> Result<(), String> {
+    let new = exe.with_extension("exe.new");
+    let old = exe.with_extension("exe.old");
+    for p in [&new, &old] {
+        if is_link(p) {
+            return Err(format!("{} is a link (refused)", p.display()));
+        }
+        let _ = std::fs::remove_file(p);
+    }
+    std::fs::copy(from, &new).map_err(|e| format!("copy to {}: {e}", new.display()))?;
+    if exe.exists() {
+        if let Err(e) = std::fs::rename(exe, &old) {
+            let _ = std::fs::remove_file(&new);
+            return Err(format!("{}: {e}", exe.display()));
+        }
+        if running_from(exe) {
+            println!("wintop is open: the new version starts the next time it opens");
+        }
+    }
+    std::fs::rename(&new, exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+/// Há um wintop aberto a partir de `exe` (pelo `.old` ainda travado depois da troca).
+fn running_from(exe: &Path) -> bool {
+    let old = exe.with_extension("exe.old");
+    // Exe em execução não pode ser apagado: se o .old some, ninguém o usava.
+    old.exists() && std::fs::OpenOptions::new().write(true).open(&old).is_err()
+}
+
 /// A pasta `modules\` de origem: não é link, tem o módulo, e cada arquivo da lista que existe
 /// é um arquivo comum.
 fn check_modules(from: &Path) -> Result<(), String> {
@@ -530,9 +578,17 @@ pub fn install() -> Result<(), String> {
         // A origem é conferida antes de qualquer cópia: uma falha não deixa o exe novo pela
         // metade da instalação.
         check_modules(&here.join("modules"))?;
-        std::fs::copy(&me, &exe).map_err(|e| format!("copy to {}: {e}", exe.display()))?;
+        let before = installed_version(&exe);
+        replace_exe(&me, &exe)?;
         copy_modules(&here.join("modules"), &dir.join("modules"))?;
-        println!("copied to {}", dir.display());
+        match before {
+            Some(v) => println!(
+                "updated {} ({v} -> {})",
+                dir.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+            None => println!("copied to {}", dir.display()),
+        }
     }
     // Depois da cópia: tudo o que o wintop elevado executa ou carrega (o exe e os módulos do
     // PawnIO) com dono Administradores e protegido.
@@ -621,6 +677,52 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Troca do exe: o novo assume o nome e não sobram `.new` nem `.old`.
+    #[test]
+    fn troca_do_exe_sem_sobras() {
+        let dir = std::env::temp_dir().join(format!("wintop_replace_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("pasta");
+        let (src, exe) = (dir.join("novo.bin"), dir.join("wintop.exe"));
+        std::fs::write(&src, b"novo").expect("origem");
+        std::fs::write(&exe, b"antigo").expect("instalado");
+        replace_exe(&src, &exe).expect("troca");
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("lista")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        let content = std::fs::read(&exe).expect("leitura");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(content, b"novo");
+        let mut left = left;
+        left.sort();
+        assert_eq!(left, ["novo.bin", "wintop.exe"]);
+    }
+
+    /// Com o exe instalado em execução (aqui um ping copiado), a troca funciona: o processo
+    /// aberto segue no arquivo antigo e o nome passa a ser do novo.
+    #[test]
+    fn troca_do_exe_em_execucao() {
+        let dir = std::env::temp_dir().join(format!("wintop_running_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("pasta");
+        let exe = dir.join("wintop.exe");
+        let ping = crate::win::system_dir().expect("System32").join("PING.EXE");
+        std::fs::copy(&ping, &exe).expect("cópia");
+        let mut child = std::process::Command::new(&exe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("processo");
+        let src = dir.join("novo.bin");
+        std::fs::write(&src, b"novo").expect("origem");
+        let r = replace_exe(&src, &exe);
+        let content = std::fs::read(&exe);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        r.expect("troca com o exe aberto");
+        assert_eq!(content.expect("leitura"), b"novo");
+    }
 
     /// Programa de outro projeto que o wintop elevado executaria: numa pasta do usuário é
     /// recusado; nas instalações reais (Program Files), aceito.

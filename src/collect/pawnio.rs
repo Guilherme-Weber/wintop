@@ -328,6 +328,11 @@ fn open_pci_mutex() -> Result<OwnedHandle, String> {
 /// relativo é erro (processo elevado não carrega DLL de caminho incerto). Só `REG_SZ` (o que o
 /// instalador grava): um `REG_EXPAND_SZ` seria expandido com o ambiente herdado do processo
 /// sem elevação que abriu o wintop.
+/// `PawnIOLib.dll` da instalação do PawnIO (para a auditoria do `--check`).
+pub fn dll_path() -> Option<PathBuf> {
+    install_dir().ok().map(|d| d.join("PawnIOLib.dll"))
+}
+
 fn install_dir() -> Result<PathBuf, String> {
     let mut buf = [0u16; 520];
     let mut len = (buf.len() * 2) as u32;

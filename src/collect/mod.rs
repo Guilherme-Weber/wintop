@@ -33,6 +33,7 @@ pub fn shared_nvml() -> SharedNvml {
     std::sync::Arc::new(gpu::init_nvml())
 }
 
+pub use pawnio::dll_path as pawnio_dll;
 pub use rtss::RtssCollector;
 
 /// Executa um coletor; pânico vira falha com a mensagem.

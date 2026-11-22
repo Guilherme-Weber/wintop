@@ -59,6 +59,7 @@ usage: wintop [option]
 
   (no option)   open the monitor (+/- change the refresh interval, q quits)
   --check       collect twice and show the status of every metric
+                (--check --json: the same report as a JSON object)
   --install     copy to Program Files and add a Start menu shortcut that opens
                 wintop elevated without the UAC prompt (scheduled task)
   --uninstall   remove the scheduled task, the shortcut and the installed copy
@@ -98,7 +99,15 @@ fn main() {
 
     // O --check só diagnostica (não cria o pipe nem inicia o RTSS): roda com a TUI aberta.
     if arg.is_some() {
-        std::process::exit(check::run());
+        let json = match std::env::args().nth(2).as_deref() {
+            None => false,
+            Some("--json") => true,
+            Some(other) => {
+                eprintln!("unknown option for --check: {other}\n\n{HELP}");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(check::run(json));
     }
     let _instance = match instance::acquire() {
         Ok(guard) => guard,

@@ -10,48 +10,124 @@ use crate::win::printable;
 
 const WARMUP: Duration = Duration::from_millis(300);
 
+/// Uma linha do relatório (para o `--json`).
+struct Entry {
+    section: String,
+    subject: String,
+    name: String,
+    status: &'static str,
+    value: String,
+}
+
 #[derive(Default)]
 struct Report {
     ok: u32,
     neutral: u32,
     failed: u32,
+    /// `--json`: nada é impresso durante a coleta; tudo sai num objeto no fim.
+    json: bool,
+    section: String,
+    subject: String,
+    entries: Vec<Entry>,
 }
 
 impl Report {
-    fn section(title: &str) {
-        println!("\n{title}");
+    fn section(&mut self, title: &str) {
+        if !self.json {
+            println!("\n{title}");
+        }
+        self.section = title.to_string();
+        self.subject.clear();
+    }
+
+    /// Dispositivo das linhas seguintes (disco, placa, GPU, jogo).
+    fn subject(&mut self, text: &str) {
+        if !self.json {
+            println!("  {}", printable(text));
+        }
+        self.subject = printable(text);
     }
 
     fn line<T>(&mut self, label: &str, m: &Metric<T>, show: impl FnOnce(&T) -> String) {
-        let (tag, text) = match m {
+        let (tag, status, text) = match m {
             Ok(v) => {
                 self.ok += 1;
-                ("OK    ", show(v))
+                ("OK    ", "ok", show(v))
             }
             Err(Missing::Neutral(s)) => {
                 self.neutral += 1;
-                ("N/A   ", s.clone())
+                ("N/A   ", "neutral", s.clone())
             }
             Err(Missing::Fail(s)) => {
                 self.failed += 1;
-                ("FAIL  ", s.clone())
+                ("FAIL  ", "failed", s.clone())
             }
         };
         // Nomes e mensagens vêm de dispositivos e do sistema: sem controles no terminal.
-        println!("  {tag}  {label:<34} {}", printable(&text));
+        if !self.json {
+            println!("  {tag}  {label:<34} {}", printable(&text));
+        }
+        self.entries.push(Entry {
+            section: self.section.clone(),
+            subject: self.subject.clone(),
+            name: label.trim().to_string(),
+            status,
+            value: printable(&text),
+        });
+    }
+
+    /// O relatório inteiro num objeto JSON (uma linha).
+    fn to_json(&self, elevated: bool, fast_ms: f64, slow_ms: f64) -> String {
+        let metrics: Vec<String> = self
+            .entries
+            .iter()
+            .map(|e| {
+                format!(
+                    r#"{{"section":{},"subject":{},"name":{},"status":{},"value":{}}}"#,
+                    json_str(&e.section),
+                    json_str(&e.subject),
+                    json_str(&e.name),
+                    json_str(e.status),
+                    json_str(&e.value)
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"version":{},"elevated":{elevated},"ok":{},"neutral":{},"failed":{},"fast_ms":{fast_ms:.1},"slow_ms":{slow_ms:.1},"metrics":[{}]}}"#,
+            json_str(env!("CARGO_PKG_VERSION")),
+            self.ok,
+            self.neutral,
+            self.failed,
+            metrics.join(",")
+        )
     }
 }
 
-pub fn run() -> i32 {
-    println!(
-        "wintop {} --check (elevated: {})",
-        env!("CARGO_PKG_VERSION"),
-        if crate::win::is_elevated() {
-            "yes"
-        } else {
-            "no"
+/// Texto JSON (aspas, barras e controles escapados).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!(r"\u{:04x}", c as u32)),
+            c => out.push(c),
         }
-    );
+    }
+    out.push('"');
+    out
+}
+
+pub fn run(json: bool) -> i32 {
+    let elevated = crate::win::is_elevated();
+    if !json {
+        println!(
+            "wintop {} --check (elevated: {})",
+            env!("CARGO_PKG_VERSION"),
+            if elevated { "yes" } else { "no" }
+        );
+    }
     let nvml = crate::collect::shared_nvml();
     let mut fast = FastCollectors::new(nvml.clone());
     let mut slow = SlowCollectors::new(nvml);
@@ -73,11 +149,14 @@ pub fn run() -> i32 {
         .with_ignored(cfg.config.rtss_ignored.clone())
         .sample();
 
-    let mut r = Report::default();
+    let mut r = Report {
+        json,
+        ..Report::default()
+    };
     fast_report(&mut r, &f);
     slow_report(&mut r, &s);
     fps_report(&mut r, &fps);
-    Report::section("Configuration");
+    r.section("Configuration");
     let path = crate::config::default_path().map_or_else(
         || "no AppData folder".to_string(),
         |p| p.display().to_string(),
@@ -93,20 +172,22 @@ pub fn run() -> i32 {
         )
     });
     own_report(&mut r, &f);
-    println!(
-        "\nFast collection: {:.1} ms; slow: {:.1} ms",
-        f.took.as_secs_f64() * 1e3,
-        s.took.as_secs_f64() * 1e3
-    );
-    println!(
-        "Result: {} OK, {} neutral, {} failed",
-        r.ok, r.neutral, r.failed
-    );
+    security_report(&mut r);
+    let (fast_ms, slow_ms) = (f.took.as_secs_f64() * 1e3, s.took.as_secs_f64() * 1e3);
+    if json {
+        println!("{}", r.to_json(elevated, fast_ms, slow_ms));
+    } else {
+        println!("\nFast collection: {fast_ms:.1} ms; slow: {slow_ms:.1} ms");
+        println!(
+            "Result: {} OK, {} neutral, {} failed",
+            r.ok, r.neutral, r.failed
+        );
+    }
     i32::from(r.failed > 0)
 }
 
 fn fast_report(r: &mut Report, f: &Fast) {
-    Report::section("CPU");
+    r.section("CPU");
     match &f.cpu {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(c) => {
@@ -146,19 +227,19 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 format!("{} / {} / {}", n.processes, n.threads, n.handles)
             });
             let up = c.uptime.as_secs();
-            println!(
-                "  OK      {:<34} {}d {:02}:{:02}:{:02}",
-                "Up time",
-                up / 86400,
-                up / 3600 % 24,
-                up / 60 % 60,
-                up % 60
-            );
-            r.ok += 1;
+            r.line("Up time", &Ok(()), |()| {
+                format!(
+                    "{}d {:02}:{:02}:{:02}",
+                    up / 86400,
+                    up / 3600 % 24,
+                    up / 60 % 60,
+                    up % 60
+                )
+            });
         }
     }
 
-    Report::section("CPU sensors");
+    r.section("CPU sensors");
     match &f.cpu_sensors {
         Err(e) => r.line("PawnIO", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(s) => {
@@ -175,7 +256,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
         }
     }
 
-    Report::section("Memory");
+    r.section("Memory");
     match &f.memory {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(m) => {
@@ -198,7 +279,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
         }
     }
 
-    Report::section("Disks");
+    r.section("Disks");
     match &f.disks {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
@@ -210,7 +291,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 if d.pagefile {
                     tags.push_str(" page-file");
                 }
-                println!("  Disk {} {}", d.number, printable(tags.trim()));
+                r.subject(&format!("Disk {} {}", d.number, tags.trim()));
                 r.line("  Model", &d.model, Clone::clone);
                 r.line("  Bus", &d.bus, ToString::to_string);
                 r.line("  Type", &d.ssd, |s| if *s { "SSD" } else { "HDD" }.into());
@@ -230,12 +311,12 @@ fn fast_report(r: &mut Report, f: &Fast) {
         }
     }
 
-    Report::section("Network");
+    r.section("Network");
     match &f.nics {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for n in list {
-                println!("  {} ({})", printable(&n.alias), printable(&n.description));
+                r.subject(&format!("{} ({})", n.alias, n.description));
                 r.line("  Link", &n.link, |v| bits(*v as f64));
                 r.line("  Send", &n.send, |v| bits(*v));
                 r.line("  Receive", &n.recv, |v| bits(*v));
@@ -246,12 +327,12 @@ fn fast_report(r: &mut Report, f: &Fast) {
         }
     }
 
-    Report::section("GPU");
+    r.section("GPU");
     match &f.gpus {
         Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
             for g in list {
-                println!("  GPU {}", g.index);
+                r.subject(&format!("GPU {}", g.index));
                 r.line("  Name", &g.name, Clone::clone);
                 r.line("  Driver", &g.driver, Clone::clone);
                 r.line("  VBIOS", &g.vbios, Clone::clone);
@@ -324,7 +405,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 }
 
 fn slow_report(r: &mut Report, s: &Slow) {
-    Report::section("Slow thread");
+    r.section("Slow thread");
     match &s.gpus {
         Err(e) => r.line("GPU PCIe", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(list) => {
@@ -394,7 +475,7 @@ fn slow_report(r: &mut Report, s: &Slow) {
 }
 
 fn fps_report(r: &mut Report, f: &Fps) {
-    Report::section("FPS (RTSS)");
+    r.section("FPS (RTSS)");
     r.line("RTSS", &f.rtss, Clone::clone);
     r.line("Frametime pipe", &f.pipe, |(n, c)| {
         format!("{n} instances, {c} clients")
@@ -407,12 +488,10 @@ fn fps_report(r: &mut Report, f: &Fps) {
             } else {
                 ""
             };
-            println!(
-                "  Game: {} (PID {}, {}){approx}",
-                printable(&g.name),
-                g.pid,
-                g.api
-            );
+            r.subject(&format!(
+                "Game: {} (PID {}, {}){approx}",
+                g.name, g.pid, g.api
+            ));
             r.line("  Resolution", &g.resolution, |(x, y)| format!("{x}x{y}"));
             r.line("  FPS", &g.fps, |v| num(*v, 1));
             r.line(
@@ -432,7 +511,7 @@ fn fps_report(r: &mut Report, f: &Fps) {
 }
 
 fn own_report(r: &mut Report, f: &Fast) {
-    Report::section("Diagnostics");
+    r.section("Diagnostics");
     match &f.own {
         Err(e) => r.line("wintop usage", &Err::<(), _>(e.clone()), |()| String::new()),
         Ok(o) => {
@@ -442,5 +521,50 @@ fn own_report(r: &mut Report, f: &Fast) {
             r.line("wintop memory (private WS)", &o.private_ws, |v| bytes(*v));
             r.line("wintop committed memory", &o.commit, |v| bytes(*v));
         }
+    }
+}
+
+/// O que o wintop elevado executa ou carrega de outros programas, e a cópia instalada: nada
+/// pode ser alterado sem elevação (a mesma regra aplicada antes de usar cada um).
+fn security_report(r: &mut Report) {
+    r.section("Security (files run or loaded elevated)");
+    let check = |p: Option<std::path::PathBuf>, missing: &str| -> Metric<String> {
+        match p {
+            None => crate::model::neutral(missing),
+            Some(p) => crate::install::trusted_file(&p)
+                .map(|()| format!("{} (protected)", p.display()))
+                .or_else(crate::model::fail),
+        }
+    };
+    let rtss = crate::win::reg_sz_32(r"SOFTWARE\Unwinder\RTSS", "InstallPath")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file());
+    r.line("RTSS.exe", &check(rtss, "RTSS not installed"), Clone::clone);
+    let pawn = crate::collect::pawnio_dll().filter(|p| p.is_file());
+    r.line(
+        "PawnIOLib.dll",
+        &check(pawn, "PawnIO not installed"),
+        Clone::clone,
+    );
+    let installed = crate::install::install_dir()
+        .ok()
+        .map(|d| d.join("wintop.exe"))
+        .filter(|p| p.is_file());
+    r.line(
+        "Installed copy",
+        &check(installed, "not installed (wintop --install)"),
+        Clone::clone,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texto_json_escapado() {
+        assert_eq!(json_str(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_str("x\ny\u{1}"), r#""x\u000ay\u0001""#);
+        assert_eq!(json_str("°C ok"), "\"°C ok\"");
     }
 }
