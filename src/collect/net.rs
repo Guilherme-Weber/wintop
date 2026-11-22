@@ -136,6 +136,7 @@ impl NetCollector {
                 link: fail(""),
                 send: fail(""),
                 recv: fail(""),
+                errors: fail(""),
             };
             if r.is_err() {
                 lost = true;
@@ -143,6 +144,7 @@ impl NetCollector {
                     link: fail(format!("GetIfEntry2: error {}", r.0)),
                     send: fail("interface disappeared"),
                     recv: fail("interface disappeared"),
+                    errors: fail("interface disappeared"),
                     ..nic
                 });
                 continue;
@@ -165,6 +167,9 @@ impl NetCollector {
                 },
                 send: taxa(|p| p.2, tx),
                 recv: taxa(|p| p.1, rx),
+                // Só erros (pacote com defeito); descartes são comuns (filtros, protocolos
+                // desconhecidos) e não indicam problema.
+                errors: Ok((k.row.InErrors, k.row.OutErrors)),
                 ..nic
             });
         }

@@ -1023,11 +1023,13 @@ pub(super) fn failing_sources(st: &State) -> usize {
                     || failed(&d.read)
                     || failed(&d.write)
                     || failed(&d.response)
+                    || failed(&d.iops)
+                    || failed(&d.queue)
             })
         }));
         add(source_failed(&f.nics, |l| {
             l.iter()
-                .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv))
+                .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv) || failed(&x.errors))
         }));
         // Só a GPU exibida (a 1ª): a interface ainda não mostra outras.
         add(source_failed(&f.gpus, |l| {
@@ -1076,7 +1078,8 @@ pub(super) fn failing_sources(st: &State) -> usize {
             _ => true,
         };
         add(source_failed(&s.disk_temps, |l| {
-            l.iter().any(|t| shown(t) && failed(&t.celsius))
+            l.iter()
+                .any(|t| shown(t) && (failed(&t.celsius) || failed(&t.health)))
         }));
     }
     // Fontes das abas Processos e GPU (só quando visíveis). A lista da GPU herda a falha da
@@ -2271,7 +2274,19 @@ fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             break;
         }
         // Cabeçalho: alias (descrição) à esquerda, link à direita (na largura real dele).
-        let link = Line::from(vec![label("link "), metric(&n.link, |v| bits(*v as f64))]);
+        // Erros de pacote do driver: só aparecem quando há algum (em vermelho), ou a causa
+        // se o contador falhou.
+        let mut link = Vec::new();
+        match &n.errors {
+            Ok((0, 0)) => {}
+            Ok((rx, tx)) => link.push(Span::styled(
+                format!("errors ↓{rx} ↑{tx}  "),
+                Style::new().fg(th().fail),
+            )),
+            Err(e) => link.extend([label("errors "), missing(e), Span::raw("  ")]),
+        }
+        link.extend([label("link "), metric(&n.link, |v| bits(*v as f64))]);
+        let link = Line::from(link);
         let link_w = (link.width() as u16).min(inner.width);
         line(
             frame,
@@ -2552,6 +2567,16 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         {
             note(&name, "temperature", m);
         }
+        // Previsão de falha do SMART: aviso em vermelho (não é falha da fonte, é do disco).
+        match disk_temp(st, &d).map(|t| &t.health) {
+            Some(Ok(true)) => note(
+                &name,
+                "SMART",
+                &Missing::Fail("the drive predicts a failure, back up its data".into()),
+            ),
+            Some(Err(m @ Missing::Fail(_))) => note(&name, "SMART health", m),
+            _ => {}
+        }
     }
     out
 }
@@ -2579,7 +2604,15 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // Sem largura para tudo (o conhost abre com 120 colunas), saem primeiro barramento, tipo e
     // resposta (as falhas deles continuam nas notas); leitura, escrita e temperatura ficam.
     let compact = inner.width < 12 + 24 + 41;
-    let (left_w, info_full): (u16, u16) = if compact { (13, 33) } else { (24, 41) };
+    // Com folga (nome inteiro e a atividade), IOPS e fila entram depois da escrita.
+    let wide = inner.width >= 26 + 24 + 52 + 12;
+    let (left_w, info_full): (u16, u16) = if compact {
+        (13, 33)
+    } else if wide {
+        (24, 52)
+    } else {
+        (24, 41)
+    };
     // O nome encolhe antes de tudo (até 12 colunas); a atividade fica com a sobra. As colunas
     // nunca se sobrepõem: sem largura, o lado direito é que perde as últimas colunas.
     let name_w = inner
@@ -2622,6 +2655,11 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         frame,
         vec![label(&if compact {
             format!("{:>5}{:>9}{:>9}  temp", "act", "read", "write")
+        } else if wide {
+            format!(
+                "{:>5}{:>8}{:>9}{:>9}{:>7}{:>4}  temp",
+                "act", "resp", "read", "write", "iops", "q"
+            )
         } else {
             format!("{:>5}{:>8}{:>9}{:>9}  temp", "act", "resp", "read", "write")
         })],
@@ -2741,18 +2779,22 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         };
         // As quatro vêm do mesmo IOCTL: falhando juntas, "! failed" (causa nas notas) e a
         // temperatura continua no lugar dela.
+        // Largura das colunas de I/O (para o "! failed" ocupar o lugar delas).
+        let io_w = if compact {
+            23
+        } else if wide {
+            42
+        } else {
+            31
+        };
         let info = match (&d.active, &d.response, &d.read, &d.write) {
             (Err(e), Err(_), Err(_), Err(_)) => vec![
                 match e {
                     Missing::Fail(_) => Span::styled(
-                        format!("{:<w$}", "! failed", w = if compact { 23 } else { 31 }),
+                        format!("{:<w$}", "! failed", w = io_w),
                         Style::new().fg(th().fail),
                     ),
-                    Missing::Neutral(n) => label(&format!(
-                        "{:<w$}",
-                        printable(n),
-                        w = if compact { 23 } else { 31 }
-                    )),
+                    Missing::Neutral(n) => label(&format!("{:<w$}", printable(n), w = io_w)),
                 },
                 Span::raw("  "),
                 t,
@@ -2770,6 +2812,16 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 metric(&d.write, |v| {
                     format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
                 }),
+                if wide {
+                    metric(&d.iops, |v| format!(" {:>6}", num(*v, 0)))
+                } else {
+                    Span::raw("")
+                },
+                if wide {
+                    metric(&d.queue, |v| format!(" {v:>3}"))
+                } else {
+                    Span::raw("")
+                },
                 Span::raw("  "),
                 t,
             ],

@@ -67,9 +67,11 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Tempo ativo (%) | `IOCTL_DISK_PERFORMANCE` (handle sem acesso; não acorda o disco): `100 - Δidle/ΔQueryTime`, limitado a 0-100. Mesma fonte do PDH `\PhysicalDisk`, sem os ~54 MB que o provedor do PDH reserva | | | E1 (= PDH na mesma janela) |
 | Leitura / escrita (B/s) | `IOCTL_DISK_PERFORMANCE`: Δ`BytesRead` / Δ`BytesWritten` por segundo | | | E1 (= PDH) |
 | Tempo médio de resposta | `IOCTL_DISK_PERFORMANCE`: Δ(`ReadTime` + `WriteTime`) / Δ(`ReadCount` + `WriteCount`) | | | E1 (= PDH) |
+| IOPS e fila | `IOCTL_DISK_PERFORMANCE`: Δ(`ReadCount` + `WriteCount`) por segundo; `QueueDepth` do instante (colunas só com tela larga; sempre no `--check`) | | | 1.1 |
 | Temperatura NVMe (e alguns SATA) | `StorageDeviceTemperatureProperty` (52), primeira entrada diferente de "não reportado"; a cada 10 s | A | | E2 (= `Get-StorageReliabilityCounter`) |
 | Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190), a cada 60 s | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido) | E2 (= `Get-StorageReliabilityCounter`; repouso real ainda não testado) |
 | Temperatura do Storage Space | máximo dos membros | A | "vários pools: associação pendente"; "em repouso" (todos os membros parados) | E2 |
+| Previsão de falha (SMART) | `PredictFailure` de `IOCTL_STORAGE_PREDICT_FAILURE`, a cada 60 s, só com o disco acordado; falha prevista = aviso em vermelho | A | "not reported by the drive" (NVMe sem SMART pelo IOCTL); "see the member disks" (Storage Space) | 1.1 |
 
 ## Rede (uma linha por interface física)
 
@@ -78,6 +80,7 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Nome (alias) e descrição | `GetIfTable2` (`MIB_IF_ROW2.Alias`, `Description`) | | | E1 |
 | Velocidade do link | `MIB_IF_ROW2.ReceiveLinkSpeed` | | "desconectada" | E1 |
 | Envio / recebimento (bit/s) | delta de `OutOctets` / `InOctets`; filtro: `HardwareInterface`, tipo Ethernet/802.11, não `FilterInterface` | | | E1 |
+| Erros de pacote (entrada, saída) | `MIB_IF_ROW2.InErrors` / `OutErrors` (desde que a interface subiu; só aparece quando há algum) | | | 1.1 |
 
 ## GPU (adaptador)
 

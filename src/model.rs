@@ -154,6 +154,9 @@ pub struct Disk {
     pub write: Metric<f64>,
     /// Tempo médio de resposta, em segundos.
     pub response: Metric<f64>,
+    /// Transferências por segundo (leituras + gravações) e pedidos na fila agora.
+    pub iops: Metric<f64>,
+    pub queue: Metric<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +168,8 @@ pub struct Nic {
     /// bit/s.
     pub send: Metric<f64>,
     pub recv: Metric<f64>,
+    /// Pacotes com erro desde que a interface subiu: (entrada, saída).
+    pub errors: Metric<(u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -336,6 +341,8 @@ pub struct DiskTemp {
     pub celsius: Metric<i16>,
     /// De onde veio: "native", "SMART 194", "SMART 190", "pool members".
     pub source: &'static str,
+    /// Previsão de falha do SMART: `Ok(true)` = o disco prevê falha próxima.
+    pub health: Metric<bool>,
 }
 
 /// Jogo acompanhado pelo RTSS.

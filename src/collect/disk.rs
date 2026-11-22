@@ -177,6 +177,7 @@ const P_WRITE_TIME: usize = 24;
 const P_IDLE_TIME: usize = 32;
 const P_READ_COUNT: usize = 40;
 const P_WRITE_COUNT: usize = 44;
+const P_QUEUE_DEPTH: usize = 48;
 const P_QUERY_TIME: usize = 56;
 const PERF_SIZE: usize = 88;
 // VOLUME_DISK_EXTENTS: contagem u32, extensões a partir do byte 8 (DISK_EXTENT de 24 bytes,
@@ -203,6 +204,8 @@ struct PerfSample {
     idle_time: u64,
     reads: u32,
     writes: u32,
+    /// Pedidos na fila agora (não é contador: o valor do instante da leitura).
+    queue: u32,
     query_time: u64,
 }
 
@@ -221,6 +224,7 @@ fn parse_perf(b: &[u8]) -> Option<PerfSample> {
         idle_time: u64_at(b, P_IDLE_TIME)?,
         reads: u32_at(b, P_READ_COUNT)?,
         writes: u32_at(b, P_WRITE_COUNT)?,
+        queue: u32_at(b, P_QUEUE_DEPTH)?,
         query_time: u64_at(b, P_QUERY_TIME)?,
     })
 }
@@ -252,6 +256,18 @@ fn activity(prev: &PerfSample, now: &PerfSample) -> Option<(f64, f64, f64, f64)>
         busy as f64 / 1e7 / transfers as f64
     };
     Some((active, read as f64 / secs, written as f64 / secs, response))
+}
+
+/// Transferências (leituras + gravações) por segundo entre duas amostras; contagens de 32 bits
+/// dão a volta em uptime longo (como em `activity`).
+fn iops(prev: &PerfSample, now: &PerfSample) -> f64 {
+    let secs = now.query_time.saturating_sub(prev.query_time) as f64 / 1e7;
+    if secs <= 0.0 {
+        return 0.0;
+    }
+    let n = u64::from(now.reads.wrapping_sub(prev.reads))
+        + u64::from(now.writes.wrapping_sub(prev.writes));
+    n as f64 / secs
 }
 
 /// Discos de um `VOLUME_DISK_EXTENTS`.
@@ -431,7 +447,8 @@ impl Inventory {
 
     /// Atividade desde a última leitura. Não acorda o disco: os contadores são do driver.
     /// Disco perdido não é reaberto: o mesmo número pode ser outro disco (redescoberta).
-    fn activity(&mut self) -> Metric<(f64, f64, f64, f64)> {
+    /// (ativo %, leitura B/s, escrita B/s, resposta s), IOPS e fila atual.
+    fn activity(&mut self) -> Metric<((f64, f64, f64, f64), f64, u32)> {
         if self.lost {
             return fail("disk removed");
         }
@@ -462,6 +479,7 @@ impl Inventory {
         match self.last.replace(now) {
             None => fail("waiting for a second sample"),
             Some(prev) => activity(&prev, &now)
+                .map(|a| (a, iops(&prev, &now), now.queue))
                 .map_or_else(|| fail("counters went backwards (disk reset)"), Ok),
         }
     }
@@ -642,7 +660,9 @@ impl DiskCollector {
             // Leu ou gravou: o disco está girando. Capacidade e layout na hora, sem esperar o
             // RETRY_ASLEEP (e sem acordar um disco parado: só depois de tráfego real).
             if inv.asleep_since.is_some()
-                && act.as_ref().is_ok_and(|(_, r, w, _)| *r > 0.0 || *w > 0.0)
+                && act
+                    .as_ref()
+                    .is_ok_and(|((_, r, w, _), _, _)| *r > 0.0 || *w > 0.0)
                 && let Some(meta) = Handle::open(inv.number, 0)
             {
                 inv.read_details(&meta);
@@ -666,10 +686,12 @@ impl DiskCollector {
                 system: self.system_drive.is_some_and(|c| has(&letters, c)),
                 pagefile: self.pagefile_drives.iter().any(|&c| has(&letters, c)),
                 letters,
-                active: act.clone().map(|a| a.0),
-                read: act.clone().map(|a| a.1),
-                write: act.clone().map(|a| a.2),
-                response: act.map(|a| a.3),
+                active: act.clone().map(|a| a.0.0),
+                read: act.clone().map(|a| a.0.1),
+                write: act.clone().map(|a| a.0.2),
+                response: act.clone().map(|a| a.0.3),
+                iops: act.clone().map(|a| a.1),
+                queue: act.map(|a| a.2),
             });
         }
         Ok(out)

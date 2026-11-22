@@ -77,6 +77,9 @@ struct State {
     source: &'static str,
     /// Falhas seguidas do SMART desde a última leitura boa.
     smart_fails: u8,
+    /// Previsão de falha do SMART (`PredictFailure`): `Ok(true)` = o disco prevê falha.
+    health: Metric<bool>,
+    health_at: Option<Instant>,
 }
 
 impl State {
@@ -87,6 +90,8 @@ impl State {
             value: fail("not read yet"),
             source: "",
             smart_fails: 0,
+            health: neutral("not read yet"),
+            health_at: None,
         }
     }
 
@@ -193,6 +198,7 @@ impl DiskTempCollector {
                         model: d.model.as_ref().ok().cloned(),
                         celsius: pool_temp(pools, &members, unknown_asleep),
                         source: "pool members",
+                        health: neutral("see the member disks"),
                     }
                 } else {
                     DiskTemp {
@@ -200,6 +206,7 @@ impl DiskTempCollector {
                         model: d.model.as_ref().ok().cloned(),
                         celsius: st.value.clone(),
                         source: st.source,
+                        health: st.health.clone(),
                     }
                 }
             })
@@ -254,12 +261,36 @@ fn read_one(d: &mut Inventory, st: &mut State) {
 }
 
 fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
-    // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura.
+    // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura (nem a
+    // previsão de falha, que fica com a última leitura).
     if d.ssd == Ok(false) && meta.awake() == Some(false) {
         st.smart_fails = 0;
         st.value = neutral("asleep");
         return;
     }
+    read_temp(d, st, meta);
+    if !d.lost && st.health_at.is_none_or(|t| t.elapsed() >= SMART_EVERY) {
+        st.health_at = Some(Instant::now());
+        st.health = predict_failure(d.number);
+    }
+}
+
+/// `PredictFailure` do `IOCTL_STORAGE_PREDICT_FAILURE` (o mesmo do SMART): o disco prevê uma
+/// falha próxima. Sem suporte do disco ou do driver: estado neutro.
+fn predict_failure(number: u32) -> Metric<bool> {
+    let Some(rw) = Handle::open(number, GENERIC_READ.0 | GENERIC_WRITE.0) else {
+        return fail("no read/write access (not elevated?)");
+    };
+    match rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE) {
+        Ok(b) => b
+            .get(..4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]) != 0)
+            .map_or_else(|| fail("response too short"), Ok),
+        Err(_) => neutral("not reported by the drive"),
+    }
+}
+
+fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
     // Acordou depois de ter sido visto em repouso: relê o layout (membro do pool) agora.
     d.reread_if_was_asleep(meta);
     if st.method != Method::Smart {

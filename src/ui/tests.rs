@@ -58,6 +58,8 @@ fn disk(n: u32, model: &str, letters: &[&str], bus: Bus, ssd: bool, member: bool
         read: Ok(f64::from(n) * 1_000_000.0),
         write: Ok(512_000.0),
         response: Ok(0.0004),
+        iops: Ok(f64::from(n) * 40.0),
+        queue: Ok(n % 3),
     }
 }
 
@@ -141,6 +143,7 @@ pub(super) fn fast(step: u32) -> Fast {
                 link: neutral("disconnected"),
                 send: Ok(0.0),
                 recv: Ok(0.0),
+                errors: Ok((0, 0)),
             },
             Nic {
                 alias: "X540-AT2 NET".into(),
@@ -148,6 +151,7 @@ pub(super) fn fast(step: u32) -> Fast {
                 link: Ok(1_000_000_000),
                 send: Ok(f64::from(step) * 1000.0),
                 recv: Ok(f64::from(step) * 50_000.0),
+                errors: Ok((0, 0)),
             },
         ]),
         gpus: Ok(vec![g]),
@@ -172,6 +176,7 @@ fn slow() -> Slow {
         model: Some(model(n).to_string()),
         celsius: c,
         source: s,
+        health: Ok(false),
     };
     Slow {
         gpus: Ok(vec![GpuSlow {
@@ -930,6 +935,8 @@ fn injections() -> Vec<(&'static str, Inject)> {
                 d.read = f(t);
                 d.write = f(t);
                 d.response = f(t);
+                d.iops = f(t);
+                d.queue = f(t);
             }),
         ),
         (
@@ -945,6 +952,14 @@ fn injections() -> Vec<(&'static str, Inject)> {
             Box::new(|fa, _, _, t| {
                 if let Ok(l) = &mut fa.nics {
                     l[0].link = f(t);
+                }
+            }),
+        ),
+        (
+            "nic.errors",
+            Box::new(|fa, _, _, t| {
+                if let Ok(l) = &mut fa.nics {
+                    l[1].errors = f(t);
                 }
             }),
         ),
@@ -1006,6 +1021,14 @@ fn injections() -> Vec<(&'static str, Inject)> {
             Box::new(|_, sl, _, t| {
                 if let Ok(l) = &mut sl.disk_temps {
                     l[0].celsius = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.diskhealth",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.disk_temps {
+                    l[0].health = f(t);
                 }
             }),
         ),
@@ -1155,4 +1178,27 @@ fn ajuda_e_pausa_aparecem() {
         out.lines().next().is_some_and(|l| l.contains("PAUSED")),
         "{out}"
     );
+}
+
+#[test]
+fn discos_com_iops_e_fila_em_tela_larga() {
+    let mut st = filled();
+    let out = render(&mut st, 320, 80);
+    assert!(out.contains("iops") && out.contains("  q  temp"), "{out}");
+    // Em 160 colunas, sem IOPS e fila (o resto não encolhe por causa deles).
+    let out = render(&mut st, 160, 48);
+    assert!(!out.contains("iops"), "{out}");
+}
+
+#[test]
+fn falha_prevista_do_smart_aparece_em_vermelho() {
+    let mut st = filled();
+    if let Some(Ok(l)) = st.slow.as_mut().map(|s| &mut s.disk_temps) {
+        l[0].health = Ok(true);
+    }
+    let out = render(&mut st, 200, 60);
+    assert!(out.contains("the drive predicts a failure"), "{out}");
+    st.set_tab(view::Tab::Sensors);
+    let out = render(&mut st, 200, 60);
+    assert!(out.contains("FAILURE PREDICTED"), "{out}");
 }

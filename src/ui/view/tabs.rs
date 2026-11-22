@@ -1059,6 +1059,17 @@ pub(super) fn sensor_rows(st: &State) -> Vec<SensorRow> {
                     t.celsius.clone().map(f64::from)
                 };
                 out.push(num_row(disks, &name, value, "°C", 0));
+                out.push(text_row(
+                    disks,
+                    &format!("{name} SMART"),
+                    t.health.clone().map(|p| {
+                        if p {
+                            "FAILURE PREDICTED".to_string()
+                        } else {
+                            "OK".to_string()
+                        }
+                    }),
+                ));
             }
         }
         Some(Err(e)) => out.push(text_row(disks, "Temperature", Err(e.clone()))),

@@ -224,6 +224,8 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 r.line("  Average response time", &d.response, |v| {
                     format!("{} ms", num(v * 1000.0, 2))
                 });
+                r.line("  IOPS", &d.iops, |v| num(*v, 0));
+                r.line("  Queue depth", &d.queue, ToString::to_string);
             }
         }
     }
@@ -237,6 +239,9 @@ fn fast_report(r: &mut Report, f: &Fast) {
                 r.line("  Link", &n.link, |v| bits(*v as f64));
                 r.line("  Send", &n.send, |v| bits(*v));
                 r.line("  Receive", &n.recv, |v| bits(*v));
+                r.line("  Packet errors", &n.errors, |(rx, tx)| {
+                    format!("in {rx}, out {tx}")
+                });
             }
         }
     }
@@ -375,6 +380,13 @@ fn slow_report(r: &mut Report, s: &Slow) {
                 let source = t.source;
                 r.line(&format!("Disk {} temperature", t.number), &t.celsius, |c| {
                     format!("{c} °C ({source})")
+                });
+                r.line(&format!("Disk {} SMART health", t.number), &t.health, |p| {
+                    if *p {
+                        "FAILURE PREDICTED".into()
+                    } else {
+                        "OK".into()
+                    }
                 });
             }
         }
