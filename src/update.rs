@@ -62,12 +62,7 @@ pub fn mode() -> Mode {
         return Mode::Undecided(PathBuf::new());
     };
     let dir = me.parent().map_or_else(PathBuf::new, crate::win::long_path);
-    let canon = |p: &Path| {
-        std::fs::canonicalize(p).map_or_else(
-            |_| p.to_string_lossy().to_lowercase(),
-            |c| c.to_string_lossy().to_lowercase(),
-        )
-    };
+    let canon = crate::install::canon;
     if let Ok(inst) = crate::install::install_dir()
         && canon(&dir) == canon(&inst)
     {
@@ -226,6 +221,14 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
                 body: Vec::new(),
             });
         }
+        // Erro (404 de um `.sig` ausente, 5xx): o corpo não interessa nem é baixado.
+        if status != 200 {
+            return Ok(Response {
+                status,
+                location: None,
+                body: Vec::new(),
+            });
+        }
         let mut body = Vec::new();
         let mut chunk = vec![0u8; 64 << 10];
         loop {
@@ -319,7 +322,7 @@ pub struct Package {
 }
 
 /// Arquivos de `modules\` que a atualização leva (os mesmos da instalação).
-const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
+use crate::install::MODULE_FILES;
 
 /// Confere a assinatura ed25519 (`verify_strict`) de `data` com `key`.
 pub fn verify(data: &[u8], sig: &[u8], key: &[u8; 32]) -> Result<(), String> {
@@ -449,31 +452,97 @@ pub fn download(version: &str) -> Result<Package, String> {
     unpack(&zip, version)
 }
 
+/// Pasta portátil e o exe novo travados entre a troca e o reinício (`relaunch`): a pasta é do
+/// usuário, e sem a trava um processo sem elevação trocaria o exe que o wintop elevado reabre.
+static HELD: std::sync::Mutex<Option<(crate::userfile::UserDir, crate::userfile::Held)>> =
+    std::sync::Mutex::new(None);
+
 /// Troca a cópia portátil em `dir` (pasta do usuário: tudo pelo `userfile`, sem seguir links).
+/// O exe novo é gravado inteiro como `.new` antes de mexer no atual: a pasta nunca fica sem
+/// `wintop.exe` além do instante entre os dois renames.
 fn apply_portable(dir: &Path, pkg: &Package) -> Result<(), String> {
     let dir = &crate::win::long_path(dir);
-    let base = dir.parent().ok_or("executable folder has no parent")?;
-    let name = dir
-        .file_name()
-        .ok_or("executable folder has no name")?
-        .to_string_lossy()
-        .to_string();
+    let d = crate::userfile::UserDir::open_exe_dir(dir)?;
     if !pkg.modules.is_empty() {
-        let m = crate::userfile::UserDir::create(dir, "modules")?;
+        let m = d
+            .sub("modules", true)?
+            .ok_or("modules folder not created")?;
         for (f, data) in &pkg.modules {
             m.write_bytes(f, data)?;
         }
     }
-    let d =
-        crate::userfile::UserDir::open(base, &name, false)?.ok_or("executable folder not found")?;
-    // O .old de uma troca anterior (ainda em uso, fica).
-    let _ = d.remove("wintop.exe.old");
-    d.rename("wintop.exe", "wintop.exe.old")?;
-    if let Err(e) = d.write_bytes("wintop.exe", &pkg.exe) {
-        let _ = d.rename("wintop.exe.old", "wintop.exe");
+    d.write_bytes("wintop.exe.new", &pkg.exe)?;
+    let r = (|| {
+        free_old(&d)?;
+        d.rename("wintop.exe", "wintop.exe.old")?;
+        if let Err(e) = d.rename("wintop.exe.new", "wintop.exe") {
+            let _ = d.rename("wintop.exe.old", "wintop.exe");
+            return Err(e);
+        }
+        Ok(())
+    })();
+    if let Err(e) = r {
+        let _ = d.remove("wintop.exe.new");
         return Err(e);
     }
+    // Apagado se ninguém o usa (o exe em execução fica até a próxima abertura).
+    let _ = d.remove("wintop.exe.old");
+    let held = d.hold("wintop.exe", &pkg.exe)?;
+    *HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((d, held));
     Ok(())
+}
+
+/// Tira o `wintop.exe.old` do caminho (ver `install::free_old`): apagado, ou renomeado para um
+/// nome único se ainda estiver em uso.
+fn free_old(d: &crate::userfile::UserDir) -> Result<(), String> {
+    if d.remove("wintop.exe.old").is_ok() {
+        return Ok(());
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.as_nanos());
+    d.rename(
+        "wintop.exe.old",
+        &format!("wintop.exe.{}.{n}.old", std::process::id()),
+    )
+    .map(|_| ())
+}
+
+/// Na partida: apaga (melhor esforço) as sobras `.old` de trocas anteriores que ninguém usa.
+pub fn remove_stale_old(mode: &Mode) {
+    match mode {
+        Mode::Installed => crate::install::remove_stale_old(),
+        Mode::Portable(d) | Mode::Undecided(d) => {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                return;
+            };
+            let old: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| crate::install::is_old_exe(n))
+                .collect();
+            if old.is_empty() {
+                return;
+            }
+            if let Ok(dir) = crate::userfile::UserDir::open_exe_dir(&crate::win::long_path(d)) {
+                for n in old {
+                    let _ = dir.remove(&n);
+                }
+            }
+        }
+    }
+}
+
+/// Reabre a versão nova no mesmo console e espera por ela. Na cópia portátil o exe segue
+/// travado (e conferido) até o processo filho existir.
+pub fn relaunch(exe: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let child = std::process::Command::new(exe).spawn();
+    HELD.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    child?.wait()
 }
 
 /// Baixa, confere e aplica `version` na cópia em uso.
@@ -687,27 +756,16 @@ mod tests {
         }
     }
 
-    /// Troca portátil com o exe em execução (uma cópia do ping.exe rodando como wintop.exe):
-    /// o atual vira `.old`, o novo assume o nome e os módulos são gravados.
+    /// Troca portátil com o exe em execução (uma cópia do ping.exe rodando como wintop.exe), na
+    /// pasta criada por este processo (elevado na CI: dono Administradores, aceito na pasta do
+    /// exe): o atual vira `.old`, o novo assume o nome travado contra troca até o reinício, os
+    /// módulos são gravados; uma segunda troca com o `.old` ainda em uso o põe de lado com nome
+    /// único, e a limpeza da partida apaga as sobras.
     #[test]
     fn troca_portatil_com_exe_aberto() {
         let tmp = std::env::temp_dir().join(format!("wintop-upd-{}", std::process::id()));
         let dir = tmp.join("wintop-port");
         std::fs::create_dir_all(&dir).unwrap();
-        // Como a pasta extraída pelo Explorer: dono = o usuário (num processo elevado, como a
-        // CI, o dono padrão seria Administradores, recusado fora das bases padrão).
-        let sid = crate::win::user_sid().unwrap();
-        for p in [&tmp, &dir] {
-            let ok =
-                std::process::Command::new(crate::win::system_dir().unwrap().join("icacls.exe"))
-                    .arg(p)
-                    .args(["/setowner", &format!("*{sid}"), "/q"])
-                    .stdout(std::process::Stdio::null())
-                    .status()
-                    .unwrap()
-                    .success();
-            assert!(ok, "icacls /setowner {}", p.display());
-        }
         let ping = crate::win::system_dir().unwrap().join("PING.EXE");
         std::fs::copy(&ping, dir.join("wintop.exe")).unwrap();
         let mut child = std::process::Command::new(dir.join("wintop.exe"))
@@ -719,9 +777,11 @@ mod tests {
             exe: b"MZnew".to_vec(),
             modules: vec![("AMDFamily17.bin".into(), b"mod".to_vec())],
         };
+        let release = || HELD.lock().unwrap().take();
         let r = apply_portable(&dir, &pkg);
-        let _ = child.kill();
-        let _ = child.wait();
+        if r.is_err() {
+            let _ = child.kill();
+        }
         r.unwrap();
         assert_eq!(std::fs::read(dir.join("wintop.exe")).unwrap(), b"MZnew");
         assert!(dir.join("wintop.exe.old").is_file());
@@ -729,15 +789,86 @@ mod tests {
             std::fs::read(dir.join("modules").join("AMDFamily17.bin")).unwrap(),
             b"mod"
         );
-        // Segunda troca (o .old já solto): sem sobras de temporários.
-        apply_portable(&dir, &pkg).unwrap();
-        let left: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
+        // Travado até o reinício: nem gravar nem renomear o exe novo.
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("wintop.exe"))
+                .is_err()
+        );
+        assert!(std::fs::rename(dir.join("wintop.exe"), dir.join("x.exe")).is_err());
+        release();
+        // Segunda troca com o .old ainda em execução.
+        let pkg2 = Package {
+            exe: b"MZnew2".to_vec(),
+            modules: Vec::new(),
+        };
+        let r = apply_portable(&dir, &pkg2);
+        release();
+        let _ = child.kill();
+        let _ = child.wait();
+        r.unwrap();
+        assert_eq!(std::fs::read(dir.join("wintop.exe")).unwrap(), b"MZnew2");
+        let names = || -> Vec<String> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect()
+        };
+        let n = names();
+        assert!(
+            n.iter()
+                .any(|x| x != "wintop.exe.old" && crate::install::is_old_exe(x)),
+            "{n:?}"
+        );
+        assert!(
+            !n.iter()
+                .any(|x| x.ends_with(".tmp") || x.ends_with(".new") || x.ends_with(".pin")),
+            "{n:?}"
+        );
+        // Partida seguinte: sobras apagadas.
+        remove_stale_old(&Mode::Portable(dir.clone()));
+        let n = names();
+        assert!(!n.iter().any(|x| crate::install::is_old_exe(x)), "{n:?}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// O exe travado pelo `hold` (sem compartilhar escrita nem exclusão) ainda abre como processo:
+    /// o `relaunch` cria o filho com a trava posta.
+    #[test]
+    fn exe_travado_ainda_executa() {
+        let dir = std::env::temp_dir().join(format!("wintop-hold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ping = crate::win::system_dir().unwrap().join("PING.EXE");
+        let bytes = std::fs::read(&ping).unwrap();
+        std::fs::write(dir.join("wintop.exe"), &bytes).unwrap();
+        let d = crate::userfile::UserDir::open_exe_dir(&dir).unwrap();
+        assert!(
+            d.hold("wintop.exe", b"outro").is_err(),
+            "conteúdo diferente aceito"
+        );
+        let held = d.hold("wintop.exe", &bytes).unwrap();
+        let st = std::process::Command::new(dir.join("wintop.exe"))
+            .args(["-n", "1", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .status();
+        drop(held);
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(st.unwrap().success());
+    }
+
+    #[test]
+    fn nomes_das_sobras_old() {
+        use crate::install::is_old_exe;
+        assert!(is_old_exe("wintop.exe.old"));
+        assert!(is_old_exe("WINTOP.EXE.12.345.old"));
+        assert!(!is_old_exe("wintop.exe"));
+        assert!(!is_old_exe("wintop.exe.new"));
+        assert!(!is_old_exe("config.old"));
+        assert!(!is_old_exe("wintop.exe.1.old"));
+        assert!(!is_old_exe("wintop.exe.a.b.old"));
+        assert!(!is_old_exe("wintop.exe..1.old"));
     }
 
     /// A chave com que a release.yml confere o `.sig` é a embutida aqui.

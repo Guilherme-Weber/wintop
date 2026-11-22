@@ -118,25 +118,8 @@ fn main() {
         };
         std::process::exit(check::run(json));
     }
-    // Primeira abertura de uma cópia que não está instalada nem marcada como portátil: pergunta
-    // (só com um console de verdade; com a entrada redirecionada, segue como antes, com o config
-    // em %APPDATA%).
-    let mode = match mode {
-        update::Mode::Undecided(dir) if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
-            match update::ask_first_run(&dir) {
-                update::Choice::Quit => return,
-                update::Choice::Install => {
-                    first_install();
-                    return;
-                }
-                update::Choice::Portable => {
-                    config::set_portable(dir.clone());
-                    update::Mode::Portable(dir)
-                }
-            }
-        }
-        m => m,
-    };
+    // Instância única antes da pergunta da primeira abertura: com outro wintop aberto, nada é
+    // perguntado (a escolha se perderia, e a instalação abriria uma cópia que fecharia na hora).
     let instance = match instance::acquire() {
         Ok(guard) => guard,
         Err(instance::Error::AlreadyRunning) => {
@@ -148,6 +131,29 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Primeira abertura de uma cópia que não está instalada nem marcada como portátil: pergunta
+    // (só com um console de verdade; com a entrada redirecionada, segue como antes, com o config
+    // em %APPDATA%).
+    let mode = match mode {
+        update::Mode::Undecided(dir) if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            match update::ask_first_run(&dir) {
+                update::Choice::Quit => return,
+                update::Choice::Install => {
+                    // A cópia instalada abre pela tarefa e precisa da instância livre.
+                    drop(instance);
+                    first_install();
+                    return;
+                }
+                update::Choice::Portable => {
+                    config::set_portable(dir.clone());
+                    update::Mode::Portable(dir)
+                }
+            }
+        }
+        m => m,
+    };
+    // Sobras de uma troca anterior (o exe antigo, que estava em uso).
+    update::remove_stale_old(&mode);
 
     if run_ui(&mode) == ui::Outcome::Restart {
         // Versão nova no lugar: a instância é liberada e o exe novo abre neste mesmo console
@@ -157,7 +163,7 @@ fn main() {
         let Some(exe) = update::exe_of(&mode) else {
             std::process::exit(1);
         };
-        match std::process::Command::new(&exe).status() {
+        match update::relaunch(&exe) {
             Ok(s) => std::process::exit(s.code().unwrap_or(0)),
             Err(e) => {
                 eprintln!("wintop: could not start {}: {e}", exe.display());

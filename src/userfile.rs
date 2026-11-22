@@ -291,7 +291,8 @@ fn pin_file(dir: &Path) -> Result<Checked, String> {
 
 /// Pastas abertas e conferidas para uma operação em `<base>\<dir>`.
 pub struct UserDir {
-    _base: Checked,
+    /// A pasta acima (não há na pasta do exe aberta direto: `open_exe_dir`).
+    _base: Option<Checked>,
     dir: Checked,
     /// Âncora: arquivo aberto dentro da pasta enquanto ela está aberta (apagado ao fechar).
     _pin: Checked,
@@ -316,6 +317,37 @@ impl UserDir {
                 base.display()
             ));
         }
+        Self::open_in(b, base, name, create)
+    }
+
+    /// Pasta do próprio exe (modo portátil), aberta e conferida direto, sem a pasta acima (que
+    /// pode ser a raiz do disco) e sem conferir o dono: o caminho vem da imagem em execução, não
+    /// de um valor que o usuário redirecione (HKCU), e quem grava nela já troca o próprio exe.
+    /// Continua valendo o resto: sem reparse point, caminho final igual, âncora dentro.
+    pub fn open_exe_dir(dir: &Path) -> Result<Self, String> {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let d =
+            open(dir, GENERIC_READ.0, share, OPEN_EXISTING, true, true).map_err(String::from)?;
+        let pin = pin_file(dir)?;
+        Ok(Self {
+            _base: None,
+            dir: d,
+            _pin: pin,
+            path: dir.to_path_buf(),
+        })
+    }
+
+    /// Subpasta `name` desta pasta (já conferida), como em `open`.
+    pub fn sub(&self, name: &str, create: bool) -> Result<Option<Self>, String> {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let b = open(&self.path, GENERIC_READ.0, share, OPEN_EXISTING, true, true)
+            .map_err(String::from)?;
+        Self::open_in(b, &self.path, name, create)
+    }
+
+    /// Segunda metade de `open`: `b` é a base já aberta e conferida.
+    fn open_in(b: Checked, base: &Path, name: &str, create: bool) -> Result<Option<Self>, String> {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         // A base também ancorada antes de criar a subpasta: um AppData redirecionado para uma
         // pasta vazia do usuário poderia virar junction e o CreateDirectoryW criaria a pasta no
         // alvo. Solta quando a subpasta estiver aberta e ancorada (ela prende a base).
@@ -339,14 +371,15 @@ impl UserDir {
         let pin = pin_file(&path)?;
         drop(base_pin);
         Ok(Some(Self {
-            _base: b,
+            _base: Some(b),
             dir,
             _pin: pin,
             path,
         }))
     }
 
-    /// Como `open`, criando a subpasta se faltar.
+    /// Como `open`, criando a subpasta se faltar (o código usa `open(.., true)` pelo config).
+    #[cfg(test)]
     pub fn create(base: &Path, name: &str) -> Result<Self, String> {
         Self::open(base, name, true)?.ok_or_else(|| "folder not created".into())
     }
@@ -432,6 +465,33 @@ impl UserDir {
         Ok(true)
     }
 
+    /// Abre `name` só para leitura sem compartilhar escrita nem exclusão (ninguém troca, renomeia
+    /// ou apaga enquanto o `Held` existir) e confere que o conteúdo é `expect`.
+    pub fn hold(&self, name: &str, expect: &[u8]) -> Result<Held, String> {
+        let p = self.file(name);
+        let c = open(
+            &p,
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            false,
+            true,
+        )
+        .map_err(String::from)?;
+        // SAFETY: handle conferido e só nosso; o File não o fecha (ManuallyDrop).
+        let mut f =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(c.handle.as_raw_handle()) });
+        let mut got = Vec::with_capacity(expect.len());
+        (&mut *f)
+            .take(expect.len() as u64 + 1)
+            .read_to_end(&mut got)
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        if got != expect {
+            return Err(format!("{} changed after it was written", p.display()));
+        }
+        Ok(Held { _file: c })
+    }
+
     pub fn write_bytes(&self, name: &str, data: &[u8]) -> Result<(), String> {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -461,6 +521,11 @@ impl UserDir {
         }
         r
     }
+}
+
+/// Arquivo aberto por `UserDir::hold`: travado contra escrita, troca e exclusão até o drop.
+pub struct Held {
+    _file: Checked,
 }
 
 /// Troca o arquivo de `h` pelo destino `to` (substituindo), pelo handle.
@@ -561,6 +626,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target);
         assert!(r.is_err(), "junction seguida");
         assert!(empty, "nada gravado no alvo");
+    }
+
+    /// Pasta do exe (portátil): sem conferir o dono, mas junction e subpasta-junction recusadas,
+    /// e a âncora some ao fechar.
+    #[test]
+    fn pasta_do_exe_sem_dono_mas_sem_links() {
+        let root = std::env::temp_dir().join(name("exe"));
+        let target = std::env::temp_dir().join(name("exe_alvo"));
+        std::fs::create_dir_all(&root).expect("pasta");
+        std::fs::create_dir_all(&target).expect("alvo");
+        let junction = |from: &Path| {
+            let st = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(from)
+                .arg(&target)
+                .output()
+                .expect("mklink");
+            assert!(
+                st.status.success(),
+                "{}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        };
+        let d = UserDir::open_exe_dir(&root).expect("pasta do exe");
+        d.write("config.toml", "a = 1\n").expect("gravação");
+        junction(&root.join("modules"));
+        assert!(d.sub("modules", true).is_err(), "subpasta junction seguida");
+        let _ = std::fs::remove_dir(root.join("modules"));
+        assert!(d.sub("modules", true).expect("subpasta").is_some());
+        drop(d);
+        let j = std::env::temp_dir().join(name("exe_j"));
+        junction(&j);
+        let r = UserDir::open_exe_dir(&j);
+        let _ = std::fs::remove_dir(&j);
+        let empty = std::fs::read_dir(&target).expect("alvo").next().is_none();
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .expect("lista")
+            .map(|e| e.expect("item").file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+        assert!(r.is_err(), "pasta do exe junction seguida");
+        assert!(empty, "nada gravado no alvo");
+        assert_eq!(left.len(), 2, "{left:?}");
     }
 
     #[test]

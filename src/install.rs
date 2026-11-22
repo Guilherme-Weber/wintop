@@ -67,6 +67,14 @@ fn programs() -> Result<(PathBuf, String), String> {
 
 const LNK: &str = "wintop.lnk";
 
+/// Caminho para comparar: sem diferenciar maiúsculas e com links resolvidos (como o Windows).
+pub fn canon(p: &Path) -> String {
+    std::fs::canonicalize(p).map_or_else(
+        |_| p.to_string_lossy().to_lowercase(),
+        |c| c.to_string_lossy().to_lowercase(),
+    )
+}
+
 /// `path` é um link (junction, symlink): o instalador não segue links.
 fn is_link(path: &Path) -> bool {
     use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW};
@@ -164,9 +172,12 @@ fn secure(path: &Path, dacl: bool) -> Result<(), String> {
     set
 }
 
-/// Cria `path` novo (exclusivo) já com dono Administradores e acesso só de SYSTEM e
+/// Cria `path` novo (exclusivo) já com dono Administradores e controle total só de SYSTEM e
 /// Administradores: não existe instante em que o usuário seja dono (e possa mudar a ACL).
-fn create_protected(path: &Path, data: &[u8]) -> Result<(), String> {
+/// `users_read`: Usuários leem e executam, como no que a instalação copia (o exe e os módulos:
+/// o Explorer lê o ícone e `--version` roda sem elevação); sem ele, só SYSTEM e Administradores
+/// (o XML da tarefa).
+fn create_protected(path: &Path, data: &[u8], users_read: bool) -> Result<(), String> {
     use std::io::Write;
     use std::os::windows::io::FromRawHandle;
     use windows::Win32::Security::Authorization::{
@@ -176,7 +187,11 @@ fn create_protected(path: &Path, data: &[u8]) -> Result<(), String> {
     use windows::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
     };
-    let sddl = wide("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)");
+    let sddl = wide(if users_read {
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+    } else {
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+    });
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
     unsafe {
@@ -435,21 +450,73 @@ fn installed_version(exe: &Path) -> Option<String> {
 /// apagado antes (se ainda estiver em uso, fica para a próxima).
 fn replace_exe(from: &Path, exe: &Path) -> Result<(), String> {
     let new = exe.with_extension("exe.new");
-    let old = exe.with_extension("exe.old");
-    for p in [&new, &old] {
-        if is_link(p) {
-            return Err(format!("{} is a link (refused)", p.display()));
-        }
-        let _ = std::fs::remove_file(p);
+    if is_link(&new) {
+        return Err(format!("{} is a link (refused)", new.display()));
     }
+    let _ = std::fs::remove_file(&new);
     std::fs::copy(from, &new).map_err(|e| format!("copy to {}: {e}", new.display()))?;
     swap_in(&new, exe)
 }
 
+/// Tira o `exe.old` do caminho: apagado se ninguém o usa; em uso (o processo que reabriu a
+/// versão nova espera por ela rodando do `.old`), renomeado para um nome único (o Windows deixa
+/// renomear um exe em execução), limpo depois por `remove_stale_old`.
+fn free_old(old: &Path) -> Result<(), String> {
+    if is_link(old) {
+        return Err(format!("{} is a link (refused)", old.display()));
+    }
+    if !old.exists() || std::fs::remove_file(old).is_ok() {
+        return Ok(());
+    }
+    let unique = old.with_extension(format!("{}.{}.old", std::process::id(), stamp()));
+    std::fs::rename(old, &unique).map_err(|e| format!("{}: {e}", old.display()))
+}
+
+/// Marca de tempo para nomes únicos.
+fn stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// `wintop.exe.old` e `wintop.exe.<pid>.<marca>.old` (sobras de trocas com o exe em uso).
+pub fn is_old_exe(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "wintop.exe.old"
+        || n.strip_prefix("wintop.exe.")
+            .and_then(|r| r.strip_suffix(".old"))
+            .is_some_and(|mid| {
+                mid.split('.').count() == 2
+                    && mid
+                        .split('.')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+}
+
+/// Apaga (melhor esforço) as sobras `.old` da pasta instalada que ninguém usa mais.
+pub fn remove_stale_old() {
+    let Ok(dir) = install_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if is_old_exe(&e.file_name().to_string_lossy()) && !is_link(&p) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// `exe.new` (já gravado) assume o lugar de `exe`; o atual vira `exe.old` (apagado se não estiver
-/// em uso).
+/// em uso). Em erro, o `.new` não fica para trás.
 fn swap_in(new: &Path, exe: &Path) -> Result<(), String> {
     let old = exe.with_extension("exe.old");
+    if let Err(e) = free_old(&old) {
+        let _ = std::fs::remove_file(new);
+        return Err(e);
+    }
     if exe.exists() {
         if let Err(e) = std::fs::rename(exe, &old) {
             let _ = std::fs::remove_file(new);
@@ -462,6 +529,7 @@ fn swap_in(new: &Path, exe: &Path) -> Result<(), String> {
     if let Err(e) = std::fs::rename(new, exe) {
         // Sem o exe novo no lugar: o antigo volta (melhor esforço).
         let _ = std::fs::rename(&old, exe);
+        let _ = std::fs::remove_file(new);
         return Err(format!("{}: {e}", exe.display()));
     }
     let _ = std::fs::remove_file(&old);
@@ -480,10 +548,6 @@ pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Resu
     check_tree(&dir)?;
     let exe = dir.join("wintop.exe");
     let new = exe.with_extension("exe.new");
-    if new.exists() || is_link(&new) {
-        std::fs::remove_file(&new).map_err(|e| format!("{}: {e}", new.display()))?;
-    }
-    create_protected(&new, exe_bytes)?;
     let mdir = dir.join("modules");
     if is_link(&mdir) {
         return Err(format!("{} is a link (refused)", mdir.display()));
@@ -500,12 +564,21 @@ pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Resu
         if tmp.exists() || is_link(&tmp) {
             std::fs::remove_file(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
         }
-        create_protected(&tmp, data)?;
-        if is_link(&dst) {
-            return Err(format!("{} is a link (refused)", dst.display()));
+        create_protected(&tmp, data, true)?;
+        let r = if is_link(&dst) {
+            Err(format!("{} is a link (refused)", dst.display()))
+        } else {
+            std::fs::rename(&tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))
+        };
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        r?;
     }
+    if new.exists() || is_link(&new) {
+        std::fs::remove_file(&new).map_err(|e| format!("{}: {e}", new.display()))?;
+    }
+    create_protected(&new, exe_bytes, true)?;
     swap_in(&new, &exe)?;
     secure_owner_tree(&dir)?;
     check_tree(&dir)
@@ -540,7 +613,7 @@ fn check_modules(from: &Path) -> Result<(), String> {
 }
 
 /// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
-const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
+pub const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
 
 /// Copia só a lista fechada de `modules\`, sem seguir links: a pasta de origem (ex.: o zip
 /// extraído em Downloads) é do usuário, e uma junction nela faria o instalador elevado copiar
@@ -663,7 +736,7 @@ pub fn install() -> Result<(), String> {
     if xml.exists() || is_link(&xml) {
         std::fs::remove_file(&xml).map_err(|e| format!("{}: {e}", xml.display()))?;
     }
-    create_protected(&xml, &utf16)?;
+    create_protected(&xml, &utf16, false)?;
     check_tree(&xml)?;
     let r = schtasks(&["/create", "/tn", TASK, "/xml", &xml.to_string_lossy(), "/f"]);
     let _ = std::fs::remove_file(&xml);
@@ -706,13 +779,6 @@ pub fn uninstall() -> Result<(), String> {
     }
     let dir = install_dir()?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    // Comparação sem diferenciar maiúsculas e com links resolvidos (como o Windows).
-    let canon = |p: &Path| {
-        std::fs::canonicalize(p).map_or_else(
-            |_| p.to_string_lossy().to_lowercase(),
-            |c| c.to_string_lossy().to_lowercase(),
-        )
-    };
     // Por componentes (`wintop2` não está dentro de `wintop`).
     if Path::new(&canon(&me)).starts_with(Path::new(&canon(&dir))) {
         println!(

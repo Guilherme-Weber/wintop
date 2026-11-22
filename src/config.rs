@@ -222,6 +222,19 @@ fn home() -> Option<(PathBuf, String)> {
     Some((roaming()?, DIR.to_string()))
 }
 
+/// Abre `<base>\<name>`: a pasta do exe no modo portátil é aberta direto (pode estar na raiz
+/// de um disco ou ter outro dono; ver `UserDir::open_exe_dir`), o resto pelo `UserDir::open`.
+fn open_dir(
+    base: &std::path::Path,
+    name: &str,
+    create: bool,
+) -> Result<Option<crate::userfile::UserDir>, String> {
+    match PORTABLE.get() {
+        Some(d) if base.join(name) == *d => crate::userfile::UserDir::open_exe_dir(d).map(Some),
+        _ => crate::userfile::UserDir::open(base, name, create),
+    }
+}
+
 /// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml` (ou o portátil).
 pub fn default_path() -> Option<PathBuf> {
     home().map(|(b, d)| b.join(d).join(FILE))
@@ -256,7 +269,7 @@ fn load_in(base: Option<PathBuf>, dir_name: &str, create: bool) -> Loaded {
             .push("config: no AppData folder (defaults, not saved)".into());
         return l;
     };
-    let dir = match crate::userfile::UserDir::open(&base, dir_name, create) {
+    let dir = match open_dir(&base, dir_name, create) {
         Ok(Some(d)) => d,
         // Sem a pasta no modo só leitura (a base passou nas checagens): padrões, sem aviso.
         Ok(None) => return l,
@@ -442,7 +455,9 @@ impl Loaded {
             .get_or_insert_with(|| template(c).parse().unwrap_or_default());
         update_doc(doc, c);
         let text = doc.to_string();
-        crate::userfile::UserDir::create(&base, &self.dir)?.write(FILE, &text)?;
+        open_dir(&base, &self.dir, true)?
+            .ok_or("config folder not created")?
+            .write(FILE, &text)?;
         self.config = c.clone();
         Ok(())
     }

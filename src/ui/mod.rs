@@ -196,16 +196,28 @@ fn event_loop(
     let mut last_second = (u16::MAX, 0, 0);
     let mut applying: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     while !stop.load(Ordering::SeqCst) {
-        // Versão nova: a resposta da consulta abre a pergunta (uma vez por abertura).
+        // Versão nova: a resposta da consulta abre a pergunta (uma vez por abertura), mas só
+        // quando nada mais captura o teclado (filtro, ajuda, confirmação de encerrar processo):
+        // senão o `y` de outra pergunta aceitaria a atualização.
         if let Some(u) = updates
+            && st.update.is_none()
+            && !st.filtering
+            && !st.help
+            && st.confirm_end.is_none()
             && let Ok(v) = u.rx.try_recv()
         {
             st.update = Some(view::UpdateUi::Offer(v));
             dirty = true;
         }
-        if let Some(rx) = &applying
-            && let Ok(r) = rx.try_recv()
-        {
+        let done = applying.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            // A thread não chegou a rodar (ou morreu sem responder).
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err("update thread did not start".into()))
+            }
+        });
+        if let Some(r) = done {
             applying = None;
             match r {
                 Ok(()) => return Ok(Outcome::Restart),
