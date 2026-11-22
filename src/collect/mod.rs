@@ -6,6 +6,7 @@ mod disk;
 mod disk_temp;
 mod gpu;
 mod gpu_engine;
+pub use gpu_engine::{is_decode, is_encode};
 mod memory;
 pub mod modules;
 mod net;

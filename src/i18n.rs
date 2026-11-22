@@ -81,13 +81,26 @@ fn tr_core(core: &str) -> Option<String> {
     if let Some(t) = table.get(core) {
         return Some((*t).to_string());
     }
-    // Partes separadas por " · " (títulos e linhas montadas).
+    // Partes separadas por " · " (títulos e linhas montadas). Uma chave que também tem " · "
+    // ("session min · max (r resets)") vale inteira: a sequência mais longa da tabela primeiro.
     if core.contains(" · ") {
-        let parts: Vec<String> = core
-            .split(" · ")
-            .map(|p| tr_core(p.trim()).unwrap_or_else(|| p.to_string()))
-            .collect();
-        let joined = parts.join(" · ");
+        let parts: Vec<&str> = core.split(" · ").collect();
+        let mut out: Vec<String> = Vec::with_capacity(parts.len());
+        let mut i = 0;
+        while i < parts.len() {
+            let whole = (i + 2..=parts.len())
+                .rev()
+                .find_map(|j| table.get(parts[i..j].join(" · ").as_str()).map(|t| (j, t)));
+            if let Some((j, t)) = whole {
+                out.push((*t).to_string());
+                i = j;
+            } else {
+                let p = parts[i];
+                out.push(tr_core(p.trim()).unwrap_or_else(|| p.to_string()));
+                i += 1;
+            }
+        }
+        let joined = out.join(" · ");
         return (joined != core).then_some(joined);
     }
     for (en, pt) in PREFIXES {
@@ -102,6 +115,7 @@ fn tr_core(core: &str) -> Option<String> {
     }
     for (en, pt) in SUFFIXES {
         if let Some(head) = core.strip_suffix(en) {
+            let head = tr_core(head).unwrap_or_else(|| head.to_string());
             return Some(format!("{head}{pt}"));
         }
     }
@@ -117,6 +131,9 @@ fn table() -> &'static HashMap<&'static str, &'static str> {
 const PREFIXES: &[(&str, &str)] = &[
     ("skipped: ", "pulado: "),
     ("this tab needs ", "esta aba precisa de "),
+    ("; the terminal is ", "; o terminal tem "),
+    ("min ", "mín "),
+    ("max ", "máx "),
     ("gpu processes", "processos da gpu"),
     ("zoom: ", "zoom: "),
     ("collection ", "coleta "),
@@ -130,7 +147,6 @@ const PREFIXES: &[(&str, &str)] = &[
     ("disconnected: ", "desconectadas: "),
     ("peak ", "pico "),
     ("(max ", "(máx "),
-    ("(base ", "(base "),
     ("Disk ", "Disco "),
 ];
 
@@ -138,6 +154,7 @@ const PREFIXES: &[(&str, &str)] = &[
 const SUFFIXES: &[(&str, &str)] = &[
     (" processes", " processos"),
     (" members)", " membros)"),
+    (" sources failing", " fontes com falha"),
     (" used", " em uso"),
     (" free", " livre"),
     (" reserved", " reservada"),
@@ -146,7 +163,6 @@ const SUFFIXES: &[(&str, &str)] = &[
     (" more (taller terminal)", " a mais (terminal mais alto)"),
     (" more", " a mais"),
     (" ms tick", " ms"),
-    (" (cont.)", " (cont.)"),
     (" logical", " lógicos"),
     (" speed", " velocidade"),
     ("[d] fold pool", "[d] recolher pool"),
@@ -181,8 +197,6 @@ const PT_BR: &[(&str, &str)] = &[
     ("theme", "tema"),
     ("fold pool", "recolher pool"),
     ("expand pool", "expandir pool"),
-    ("[d] fold pool", "[d] recolher pool"),
-    ("[d] expand pool", "[d] expandir pool"),
     ("next gpu", "próxima gpu"),
     ("pause", "pausar"),
     ("quit", "sair"),
@@ -192,13 +206,19 @@ const PT_BR: &[(&str, &str)] = &[
     ("filter", "filtrar"),
     ("clear filter", "limpar filtro"),
     ("tree", "árvore"),
-    ("runtimes", "runtimes"),
     ("scroll", "rolar"),
     ("type", "digite"),
     ("to filter", "para filtrar"),
     ("keep", "manter"),
     ("clear", "limpar"),
     ("cancel", "cancelar"),
+    ("End", "Encerrar"),
+    (
+        "? Unsaved work in it is lost.",
+        "? O trabalho não salvo nele será perdido.",
+    ),
+    ("of", "de"),
+    ("filter:", "filtro:"),
     ("all OK", "tudo OK"),
     ("sources: all OK", "fontes: tudo OK"),
     ("! failed", "! falhou"),
@@ -353,7 +373,6 @@ const PT_BR: &[(&str, &str)] = &[
     // Rótulos.
     ("in use", "em uso"),
     ("modified", "modificada"),
-    ("standby", "standby"),
     ("free", "livre"),
     ("kernel pools", "pools do kernel"),
     ("paged", "paginado"),
@@ -366,7 +385,6 @@ const PT_BR: &[(&str, &str)] = &[
     ("Value", "Valor"),
     ("Min", "Mín"),
     ("Max", "Máx"),
-    ("Sensor", "Sensor"),
     ("Temperature", "Temperatura"),
     ("Slowdown limit", "Limite de slowdown"),
     ("Power", "Potência"),
@@ -376,10 +394,8 @@ const PT_BR: &[(&str, &str)] = &[
     ("SM clock", "Clock SM"),
     ("Memory clock", "Clock da memória"),
     ("Video clock", "Clock de vídeo"),
-    ("Fans", "Fans"),
     ("Throttle", "Throttling"),
     ("PCIe link", "Link PCIe"),
-    ("Clock", "Clock"),
     ("Disks", "Discos"),
     ("SMART health", "Saúde SMART"),
     ("NVML sensors", "Sensores do NVML"),
@@ -390,6 +406,12 @@ const PT_BR: &[(&str, &str)] = &[
     ("Write", "Escrita"),
     ("drive / model", "unidade / modelo"),
     ("drive", "unidade"),
+    ("temperature", "temperatura"),
+    ("bus", "barramento"),
+    ("media type", "tipo de mídia"),
+    ("capacity", "capacidade"),
+    ("I/O counters", "contadores de E/S"),
+    ("(below)", "(abaixo)"),
     ("model", "modelo"),
     // Causas (neutras e falhas) escritas pelo wintop.
     ("no 3D game in focus", "nenhum jogo 3D em foco"),
@@ -555,7 +577,27 @@ mod tests {
         assert_eq!(tr("NVML: Unknown Error"), "NVML: Unknown Error");
         assert_eq!(tr("   "), "   ");
         assert_eq!(decimal("1.5 GB".into()), "1,5 GB");
+        // Chave com " · " dentro de um título montado vale inteira.
+        assert_eq!(
+            tr("from row 5 · session min · max (r resets)"),
+            "a partir da linha 5 · sessão mín · máx (r zera)"
+        );
+        assert_eq!(tr("min 0% · max 99%"), "mín 0% · máx 99%");
+        assert_eq!(tr("! 3 sources failing "), "! 3 fontes com falha ");
+        assert_eq!(tr("F: Pool (5 members)"), "F: Pool (5 membros)");
         set(Lang::EnUs);
+    }
+
+    /// Entrada que não muda nada só custaria uma alocação por quadro.
+    #[test]
+    fn sem_entradas_identicas() {
+        for (en, pt) in PT_BR.iter().chain(SUFFIXES) {
+            assert_ne!(en, pt);
+        }
+        // Prefixos idênticos só para traduzir o resto ("zoom: disks").
+        for (en, pt) in PREFIXES {
+            assert!(en != pt || *en == "zoom: ", "{en}");
+        }
     }
 
     /// Toda chave aparece uma vez (uma repetida esconderia a outra tradução).

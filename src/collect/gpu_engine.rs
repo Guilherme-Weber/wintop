@@ -58,15 +58,25 @@ pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
     for (engtype, sum) in per.into_values() {
         let v = sum.min(100.0);
         out.usage = out.usage.max(v);
-        // A AMD expõe encode e decode numa engine só ("VideoCodec"): vale para os dois.
-        if engtype.contains("Encode") || engtype.contains("Codec") {
+        if is_encode(engtype) {
             max(&mut out.encode, v);
         }
-        if engtype.contains("Decode") || engtype.contains("Codec") {
+        if is_decode(engtype) {
             max(&mut out.decode, v);
         }
     }
     out
+}
+
+/// Engine de codificação de vídeo. A AMD expõe encode e decode numa engine só
+/// ("VideoCodec"): vale para os dois.
+pub fn is_encode(engtype: &str) -> bool {
+    engtype.contains("Encode") || engtype.contains("Codec")
+}
+
+/// Engine de decodificação de vídeo (ver `is_encode`).
+pub fn is_decode(engtype: &str) -> bool {
+    engtype.contains("Decode") || engtype.contains("Codec")
 }
 
 /// PID → (tipo de engine → uso %), só das instâncias do adaptador `luid`.

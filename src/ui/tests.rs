@@ -1453,8 +1453,14 @@ fn geral_segunda_gpu_sem_nvml() {
 fn aba_gpu_segunda_gpu() {
     let mut st = two_gpus(view::Tab::Gpu);
     st.next_gpu();
-    // A lista espera a próxima coleta lenta (a anterior era da outra GPU).
-    assert!(st.gpu_procs.is_none());
+    // A última coleta lenta já trouxe a lista de todas as GPUs: a da nova aparece na hora.
+    let expected = st
+        .slow
+        .as_ref()
+        .and_then(|s| s.gpus.as_ref().ok())
+        .and_then(|l| l.get(1))
+        .and_then(|g| g.procs.clone());
+    assert_eq!(st.gpu_procs, expected);
     let mut s = st.slow.clone().expect("coleta lenta");
     s.procs = Some(Ok(proc_list()));
     st.push_slow(s);

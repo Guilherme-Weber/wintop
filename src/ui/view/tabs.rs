@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use super::{State, bar_sep, boxed, empty_box, label, metric, missing, put, text, vram_bar};
+use crate::collect::{is_decode, is_encode};
 use crate::fmt::{bytes, num};
 use crate::i18n::tr;
 use crate::model::{GpuProc, Metric, Missing, Proc};
@@ -527,9 +528,11 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
     );
     if !st.filter.is_empty() || st.filtering {
         right = format!(
-            "{} of {} · filter: {}{}",
+            "{} {} {} · {} {}{}",
             rows.len(),
+            tr("of"),
             list.len(),
+            tr("filter:"),
             printable(&st.filter),
             if st.filtering { "_" } else { "" }
         );
@@ -701,8 +704,8 @@ impl GpuSort {
             Self::Gpu => gpu_pct(p).unwrap_or(0.0),
             Self::ThreeD => e(|k| k == "3D"),
             Self::Copy => e(|k| k.starts_with("Copy")),
-            Self::Encode => e(|k| k.starts_with("VideoEncode")),
-            Self::Decode => e(|k| k.starts_with("VideoDecode")),
+            Self::Encode => e(is_encode),
+            Self::Decode => e(is_decode),
             Self::Compute => e(|k| k.starts_with("Compute") || k.starts_with("Cuda")),
             Self::Vram => p.local as f64,
             Self::Shared => p.non_local as f64,
@@ -769,9 +772,11 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mut right = format!("{} processes", list.len());
     if !st.filter.is_empty() || st.filtering {
         right = format!(
-            "{} of {} · filter: {}{}",
+            "{} {} {} · {} {}{}",
             rows.len(),
+            tr("of"),
             list.len(),
+            tr("filter:"),
             printable(&st.filter),
             if st.filtering { "_" } else { "" }
         );
@@ -789,7 +794,8 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .slow
         .as_ref()
         .and_then(|s| s.gpus.as_ref().ok())
-        .and_then(|l| l.get(sel))
+        // Pela lista lenta, como a tabela (`push_slow`): a rápida pode ter falhado no ciclo.
+        .and_then(|l| l.get(st.gpu_index(l.len())))
         .map(|g| g.vram.clone());
     let r0 = Rect::new(inner.x, inner.y, inner.width, 1);
     let fast_gpu_err = st
@@ -908,8 +914,8 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 e(gpu_pct(p)),
                 e(engine(p, |k| k == "3D")),
                 e(engine(p, |k| k.starts_with("Copy"))),
-                e(engine(p, |k| k.starts_with("VideoEncode"))),
-                e(engine(p, |k| k.starts_with("VideoDecode"))),
+                e(engine(p, is_encode)),
+                e(engine(p, is_decode)),
                 e(engine(p, |k| {
                     k.starts_with("Compute") || k.starts_with("Cuda")
                 })),

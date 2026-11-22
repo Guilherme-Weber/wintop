@@ -396,6 +396,11 @@ impl GpuCollector {
     }
 
     pub fn read(&mut self) -> Metric<Vec<Gpu>> {
+        // Lista vazia (GPU fora do DXGI no meio de um reset, eGPU ainda não conectada): procura
+        // de novo, no mesmo ritmo da nova associação.
+        if self.gpus.is_empty() && self.rematched.elapsed() >= REMATCH_EVERY {
+            self.rematch();
+        }
         if self.gpus.is_empty() {
             return match self.nvml.as_ref() {
                 Err(e) => fail(e.clone()),
@@ -438,9 +443,14 @@ impl GpuCollector {
                         .map_or_else(|| fail(NO_PDH_INSTANCE), Ok)
                 };
                 let shared_total = s.adapter.as_ref().map_or(0, |a| a.1);
+                let used_vram = vram(&dedicated);
                 let mut g = match (&s.source, self.nvml.as_ref()) {
                     (Source::Nvml(i), Ok(n)) => read_device(n, *i),
                     (Source::Nvml(i), Err(e)) => failed_gpu(*i, e),
+                    // LUID trocado (reset): sem instância do prefixo, as engines dariam 0% falso.
+                    (Source::Dxgi(_, why), _) if lost_adapter(&used_vram) => {
+                        dxgi_gpu(why, &fail(NO_PDH_INSTANCE))
+                    }
                     (Source::Dxgi(_, why), _) => {
                         let used = s.adapter.as_ref().map_err(Clone::clone).and_then(|(p, _)| {
                             Ok(adapter_use(engines.as_ref().map_err(Clone::clone)?, p))
@@ -452,7 +462,7 @@ impl GpuCollector {
                 g.name.clone_from(&s.name);
                 g.vbios.clone_from(&s.vbios);
                 g.driver.clone_from(&s.driver);
-                g.dedicated = vram(&dedicated).and_then(|u| Ok((u, s.total.clone()?)));
+                g.dedicated = used_vram.and_then(|u| Ok((u, s.total.clone()?)));
                 g.shared = vram(&shared).map(|u| (u, shared_total));
                 g
             })
@@ -618,6 +628,10 @@ fn vram_and_procs(
     };
     let procs = engine_rows.map(|rows| {
         let l = luid.clone()?;
+        // LUID trocado (reset): a lista vazia esconderia a causa.
+        if lost_adapter(&breakdown) {
+            return fail(NO_PDH_INSTANCE);
+        }
         collected.clone().or_else(fail)?;
         let mem = vram.per_process_detail(&l).or_else(fail)?;
         if names.is_none() {
@@ -668,6 +682,12 @@ impl GpuSlowCollector {
         detail: bool,
         names: Option<&HashMap<u32, String>>,
     ) -> Metric<Vec<GpuSlow>> {
+        // Como no coletor rápido: lista vazia procura de novo.
+        if self.gpus.is_empty() && self.rematched.elapsed() >= REMATCH_EVERY {
+            self.rematched = Instant::now();
+            self.gpus = slow_list(self.nvml.as_ref());
+            self.pcie.clear();
+        }
         if self.gpus.is_empty() {
             return match self.nvml.as_ref() {
                 Err(e) => fail(e.clone()),

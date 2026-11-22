@@ -247,6 +247,26 @@ impl State {
             return;
         }
         self.gpu_sel = (self.gpu_index(n) + 1) % n;
+        self.reset_gpu_session();
+        // A última coleta lenta da aba GPU já trouxe a lista de todas as GPUs (ou a falha).
+        self.gpu_procs = None;
+        if self.tab == Tab::Gpu {
+            match self.slow.as_ref().map(|s| &s.gpus) {
+                Some(Ok(list)) => {
+                    self.gpu_procs = list
+                        .get(self.gpu_index(list.len()))
+                        .and_then(|g| g.procs.clone());
+                }
+                Some(Err(e)) => self.gpu_procs = Some(Err(e.clone())),
+                None => {}
+            }
+        }
+        self.gpu_cursor = Cursor::default();
+        self.runtimes.clear();
+    }
+
+    /// Extremos da sessão da GPU exibida (zerados ao trocar de GPU).
+    fn reset_gpu_session(&mut self) {
         for m in [
             &mut self.session.gpu,
             &mut self.session.gpu_temp,
@@ -256,9 +276,6 @@ impl State {
         ] {
             *m = MinMax::default();
         }
-        self.gpu_procs = None;
-        self.gpu_cursor = Cursor::default();
-        self.runtimes.clear();
     }
 
     /// Zera os extremos da sessão (tecla `r`).
@@ -451,6 +468,15 @@ impl State {
                 let any = [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok());
                 s.push(if any { f64::from(v) / 100.0 } else { f64::NAN });
             }
+        }
+        // A GPU selecionada sumiu (eGPU desconectada): volta para a primeira, com os extremos
+        // zerados (senão os da antiga recebem os valores da nova).
+        if let Ok(list) = &f.gpus
+            && !list.is_empty()
+            && self.gpu_sel >= list.len()
+        {
+            self.gpu_sel = 0;
+            self.reset_gpu_session();
         }
         if let Ok(list) = &f.gpus
             && let Some(g) = list.get(self.gpu_index(list.len()))
@@ -677,8 +703,13 @@ fn brief<T>(m: &Metric<T>, f: impl FnOnce(&T) -> String) -> Span<'static> {
     match m {
         Ok(v) => text(f(v)),
         Err(Missing::Neutral(_)) => label("-"),
-        Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(th().fail)),
+        Err(Missing::Fail(_)) => failed_span(),
     }
+}
+
+/// "! failed", no idioma da interface (mesma largura em pt-BR: "! falhou").
+fn failed_span() -> Span<'static> {
+    Span::styled(tr("! failed").into_owned(), Style::new().fg(th().fail))
 }
 
 fn put(frame: &mut Frame<'_>, p: Paragraph<'static>, r: Rect, bound: Rect) {
@@ -732,13 +763,13 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     if a.width < min_w || a.height < min_h {
         let msg = vec![
             Line::from(Span::styled(
-                "terminal too small",
+                tr("terminal too small").into_owned(),
                 Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             )),
-            Line::from(label(&format!(
-                "this tab needs {min_w}x{min_h}; the terminal is {}x{}",
-                a.width, a.height
-            ))),
+            Line::from(vec![
+                label(&format!("this tab needs {min_w}x{min_h}")),
+                label(&format!("; the terminal is {}x{}", a.width, a.height)),
+            ]),
             Line::from(label("resize the window, or press q to quit")),
         ];
         let h = (msg.len() as u16).min(a.height);
@@ -770,7 +801,7 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
         };
         notice.extend(wrap(
             vec![Span::styled(
-                format!("{mark}{}", printable(msg)),
+                format!("{mark}{}", printable(&tr(msg))),
                 Style::new().fg(color),
             )],
             frame.area().width,
@@ -1086,7 +1117,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let width = |v: &[Span<'static>]| v.iter().map(Span::width).sum::<usize>();
     let key = |k: &str| {
         Span::styled(
-            k.to_string(),
+            tr(k).into_owned(),
             Style::new().fg(th().title).add_modifier(Modifier::BOLD),
         )
     };
@@ -1149,7 +1180,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let key = |k: &str| {
         Span::styled(
-            k.to_string(),
+            tr(k).into_owned(),
             Style::new().fg(th().title).add_modifier(Modifier::BOLD),
         )
     };
@@ -1279,9 +1310,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         right.push(match failing {
             0 if narrow => label("all OK "),
             0 => label("sources: all OK "),
-            1 => Span::styled("! 1 source failing ", Style::new().fg(th().fail)),
+            1 => Span::styled(
+                tr("! 1 source failing ").into_owned(),
+                Style::new().fg(th().fail),
+            ),
             n => Span::styled(
-                format!("! {n} sources failing "),
+                tr(&format!("! {n} sources failing ")).into_owned(),
                 Style::new().fg(th().fail),
             ),
         });
@@ -1348,6 +1382,16 @@ fn source_failed<T>(m: &Metric<T>, inner: impl FnOnce(&T) -> bool) -> bool {
     }
 }
 
+/// GPUs que a tela mostra: a selecionada (tecla `g`), ou todas na aba Sensores.
+fn shown_gpus<'a, T>(st: &State, l: &'a [T]) -> impl Iterator<Item = &'a T> {
+    let (skip, take) = if st.tab == Tab::Sensors {
+        (0, l.len())
+    } else {
+        (st.gpu_index(l.len()), 1)
+    };
+    l.iter().skip(skip).take(take)
+}
+
 /// Fontes com alguma falha.
 pub(super) fn failing_sources(st: &State) -> usize {
     let mut n = 0;
@@ -1399,9 +1443,9 @@ pub(super) fn failing_sources(st: &State) -> usize {
             l.iter()
                 .any(|x| failed(&x.link) || failed(&x.send) || failed(&x.recv) || failed(&x.errors))
         }));
-        // Só a GPU exibida (tecla `g`); as outras aparecem na aba Sensores.
+        // Só a GPU exibida (tecla `g`); na aba Sensores, que mostra todas, todas.
         add(source_failed(&f.gpus, |l| {
-            l.iter().skip(st.gpu_index(l.len())).take(1).any(|g| {
+            shown_gpus(st, l).any(|g| {
                 failed(&g.name)
                     || failed(&g.driver)
                     || failed(&g.vbios)
@@ -1434,11 +1478,18 @@ pub(super) fn failing_sources(st: &State) -> usize {
     let mut slow_gpus_failed = false;
     if let Some(s) = &st.slow {
         slow_gpus_failed = s.gpus.is_err();
+        // GPU sem NVML: o PCIe repete a causa que a coleta rápida já conta (`no_nvml`).
+        let no_nvml = |i: u32| {
+            st.fast
+                .as_ref()
+                .and_then(|f| f.gpus.as_ref().ok())
+                .and_then(|l| l.iter().find(|g| g.index == i))
+                .is_some_and(|g| g.no_nvml.is_some())
+        };
         add(source_failed(&s.gpus, |l| {
-            l.iter()
-                .skip(st.gpu_index(l.len()))
-                .take(1)
-                .any(|g| failed(&g.pcie_tx) || failed(&g.pcie_rx) || failed(&g.vram))
+            shown_gpus(st, l).any(|g| {
+                failed(&g.vram) || (!no_nvml(g.index) && (failed(&g.pcie_tx) || failed(&g.pcie_rx)))
+            })
         }));
         // Só dos discos exibidos (um disco removido ou trocado no mesmo número não aparece em
         // aba nenhuma; a lista lenta o tira na coleta seguinte).
@@ -1485,7 +1536,7 @@ pub(super) fn failing_sources(st: &State) -> usize {
 fn waiting(frame: &mut Frame<'_>, area: Rect, block: Block<'static>) {
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "waiting for the first collection",
+            tr("waiting for the first collection").into_owned(),
             Style::new().fg(th().neutral),
         ))
         .block(block),
@@ -1832,13 +1883,21 @@ fn draw_core_grid(
 /// máximo dos engines. O Copy não existe no NVML.
 fn busiest_engine(g: &Gpu) -> (&'static str, u32) {
     let get = |m: &Metric<u32>| m.as_ref().copied().unwrap_or(0);
-    let mut best = ("3D", get(&g.usage));
+    let mut best = (usage_name(g), get(&g.usage));
     for (name, m) in [("encode", &g.encoder), ("decode", &g.decoder)] {
-        if get(m) > best.1 {
+        // Sem NVML o uso geral já é o máximo de todas as engines: no empate, a de vídeo é a
+        // mais usada (com NVML a regra fica a mesma).
+        if get(m) > best.1 || (get(m) > 0 && get(m) == best.1) {
             best = (name, get(m));
         }
     }
     best
+}
+
+/// Nome do uso geral: "3D" no NVML; sem NVML é o máximo de todas as engines (cópia, vídeo,
+/// compute), não só o 3D.
+fn usage_name(g: &Gpu) -> &'static str {
+    if g.no_nvml.is_some() { "util" } else { "3D" }
 }
 
 fn engine_color(name: &str) -> Color {
@@ -1904,11 +1963,18 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 Some(f64::from(*v)),
             )],
             Err(e) => {
+                // Só a falha leva o "!" (como em `metric`); o estado neutro não.
+                let mark = if matches!(e, Missing::Fail(_)) {
+                    "! "
+                } else {
+                    ""
+                };
+                let cause = tr(&e.to_string()).into_owned();
                 let words: Vec<Span<'static>> =
                     std::iter::once(Span::styled(format!("{name:<8}"), style))
-                        .chain(e.to_string().split(' ').enumerate().map(|(i, w)| {
+                        .chain(cause.split(' ').enumerate().map(|(i, w)| {
                             let w = if i == 0 {
-                                format!("! {}", printable(w))
+                                format!("{mark}{}", printable(w))
                             } else {
                                 format!(" {}", printable(w))
                             };
@@ -1947,7 +2013,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     // motivo fica numa linha embaixo): só o que existe.
     let nvml = g.no_nvml.is_none();
     let mut engines = vec![
-        eng("3D", &g.usage),
+        eng(usage_name(&g), &g.usage),
         eng("encode", &g.encoder),
         eng("decode", &g.decoder),
     ];
@@ -3021,8 +3087,8 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
             ""
         };
         let spans = vec![
-            Span::styled(format!("{mark}{name} {what}: "), style),
-            Span::styled(printable(&m.to_string()), style),
+            Span::styled(format!("{mark}{} {}: ", tr(name), tr(what)), style),
+            Span::styled(printable(&tr(&m.to_string())), style),
         ];
         out.extend(wrap(spans, width, 0, 4));
     };
@@ -3041,7 +3107,7 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         let fails: [(&str, Option<&Missing>); 5] = [
             ("model", d.model.as_ref().err()),
             ("bus", d.bus.as_ref().err()),
-            ("type", d.ssd.as_ref().err()),
+            ("media type", d.ssd.as_ref().err()),
             ("capacity", d.capacity.as_ref().err()),
             ("pool", d.pool_member.as_ref().err()),
         ];
@@ -3062,7 +3128,7 @@ fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         }
         if let Some(t) = disk_temp(st, &d)
             && let Err(m) = &t.celsius
-            && (matches!(m, Missing::Fail(_)) || m.to_string().chars().count() > DISK_TEMP_W)
+            && (matches!(m, Missing::Fail(_)) || tr(&m.to_string()).chars().count() > DISK_TEMP_W)
         {
             note(&name, "temperature", m);
         }
@@ -3135,7 +3201,13 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .min(info_full);
     let nw = usize::from(name_w);
     // Cabeçalho nas mesmas posições das colunas de cada linha.
-    let head = if nw > 14 { "drive / model" } else { "drive" };
+    // Pela largura do texto traduzido ("unidade / modelo" tem 16 colunas).
+    let full = tr("drive / model");
+    let head = if nw > full.chars().count() + 1 {
+        full
+    } else {
+        tr("drive")
+    };
     let left_head = if tiny {
         format!("{:>6}  ", "cap")
     } else if compact {
@@ -3228,7 +3300,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 .is_ok_and(|b| matches!(b, crate::model::Bus::Spaces))
             && members > 0
         {
-            name = format!("{letters} {model} ({members} members)");
+            name = tr(&format!("{letters} {model} ({members} members)")).into_owned();
         }
         // Pela largura no terminal (nome do PnP com caracteres largos não empurra as colunas).
         let name = format!("{} ", tabs::cell(&name, name_w.saturating_sub(1), false));
@@ -3282,8 +3354,8 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         // A causa não cabe na coluna: vai inteira para as notas embaixo da tabela.
         let t = match disk_temp(st, d).map(|t| &t.celsius) {
-            Some(Err(Missing::Fail(_))) => Span::styled("! failed", Style::new().fg(th().fail)),
-            Some(Err(m)) if m.to_string().chars().count() > DISK_TEMP_W => label("(below)"),
+            Some(Err(Missing::Fail(_))) => failed_span(),
+            Some(Err(m)) if tr(&m.to_string()).chars().count() > DISK_TEMP_W => label("(below)"),
             Some(c) => metric(c, |c| format!("{c} °C")),
             // Há leitura deste número, mas de outro modelo (disco trocado): espera a releitura.
             None if st
@@ -3310,7 +3382,7 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             (Err(e), Err(_), Err(_), Err(_)) => vec![
                 match e {
                     Missing::Fail(_) => Span::styled(
-                        format!("{:<w$}", "! failed", w = io_w),
+                        format!("{:<w$}", tr("! failed"), w = io_w),
                         Style::new().fg(th().fail),
                     ),
                     Missing::Neutral(n) => label(&format!("{:<w$}", printable(n), w = io_w)),
@@ -3509,7 +3581,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             g.map_or_else(idle, |g| match &g.fps {
                 Ok(v) => text(num(*v, 0)).add_modifier(Modifier::BOLD),
                 Err(Missing::Neutral(_)) => label("-"),
-                Err(Missing::Fail(_)) => Span::styled("! failed", Style::new().fg(th().fail)),
+                Err(Missing::Fail(_)) => failed_span(),
             }),
         ],
         minmax(st.session.fps, |v| num(v, 0)),
@@ -3606,7 +3678,7 @@ fn game_lines(g: &crate::model::Game, interval_ms: u64) -> Vec<Line<'static>> {
             Line::from(vec![
                 label("1% low "),
                 metric(&g.lows, |(a, _)| num(*a, 0)),
-                label("   0.1% low "),
+                label(&format!("   {}% low ", num(0.1, 1))),
                 metric(&g.lows, |(_, b)| num(*b, 0)),
                 bar_sep(),
                 label("frametime "),
