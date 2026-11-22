@@ -1100,19 +1100,15 @@ impl RtssCollector {
             r.prune(now);
         }
         let chosen = select_game(&apps, fg, &self.ignored_names);
-        let target = match chosen {
-            Some(g) => {
-                self.last_game = Some((g.pid, now));
-                Some(g.pid)
-            }
-            None => self
-                .last_game
-                .filter(|(pid, t)| {
-                    now.duration_since(*t) < ETW_HOLD && apps.iter().any(|a| a.pid == *pid)
-                })
-                .map(|(pid, _)| pid),
-        };
-        self.retarget(target);
+        if let Some(g) = chosen {
+            self.last_game = Some((g.pid, now));
+        } else {
+            // Só um app 3D ainda acompanhado (fora dos ignorados); expirado ou sumido, esquece.
+            self.last_game = self.last_game.filter(|(pid, t)| {
+                now.duration_since(*t) < ETW_HOLD && ok.iter().any(|a| a.pid == *pid && a.api != 0)
+            });
+        }
+        self.retarget(self.last_game.map(|(pid, _)| pid));
         self.ingest();
         let game = match chosen {
             None => neutral("no 3D game in focus"),
