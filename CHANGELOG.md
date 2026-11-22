@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.0.0] - 2026-11-21
+
 Primeira versão.
 
 ### Adicionado

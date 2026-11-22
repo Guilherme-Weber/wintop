@@ -8,7 +8,7 @@ de jogos.
 
 ## Estado
 
-Funcional e em validação final antes da primeira versão (0.1.0). O histórico está em
+Versão 1.0.0, a primeira publicada. O histórico está em
 [CHANGELOG.md](CHANGELOG.md), o inventário completo de métricas em
 [docs/metricas.md](docs/metricas.md), as diferenças conhecidas em relação ao Gerenciador de
 Tarefas em [docs/divergencias.md](docs/divergencias.md) e as provas de viabilidade de cada fonte
