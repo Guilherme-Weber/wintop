@@ -379,8 +379,9 @@ fn probe_frame_gen_4x() {
     );
     assert_eq!(g.source, crate::model::FrameSource::Etw);
     assert!((avg - want).abs() < want * 0.03, "FPS {avg} × {want}");
+    // Aquecimento: o frame gen só aparece com 1 s completo de eventos (~1,25 s = 5-6 amostras).
     assert!(
-        fg.len() + 4 >= games.len(),
+        fg.len() + 6 >= games.len(),
         "frame gen não detectado sempre"
     );
     assert!(fg.iter().all(|f| f.multiplier == Some(4)), "{fg:?}");

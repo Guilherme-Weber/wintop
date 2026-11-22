@@ -318,11 +318,13 @@ impl Ring {
             .is_some_and(|(t, _)| now.duration_since(*t) <= within)
     }
 
-    /// Frametimes do último segundo.
+    /// Frametimes do segundo que termina em `now` (frames depois de `now` ficam de fora: pelo
+    /// ETW, `now` é "agora" menos o atraso da entrega).
     fn last_second(&self, now: Instant) -> impl Iterator<Item = u32> + '_ {
         self.frames
             .iter()
             .rev()
+            .skip_while(move |(t, _)| *t > now)
             .take_while(move |(t, _)| now.duration_since(*t) <= Duration::from_secs(1))
             .map(|(_, us)| *us)
     }
@@ -341,10 +343,13 @@ struct Chain {
 #[derive(Default)]
 struct EtwFrames {
     pid: Option<u32>,
+    /// Desde quando os providers estão ligados para `pid`: antes de 1 s completo de eventos, a
+    /// contagem de frames reais ainda não vale.
+    since: Option<Instant>,
     chains: HashMap<u64, Chain>,
     /// Início de cada frame real (Reflex `SIMULATION_START`).
     real: VecDeque<Instant>,
-    /// Último multiplicador do frame gen informado.
+    /// Último multiplicador informado (1 = frame gen desligado).
     mult: Option<(Instant, u32)>,
     scratch: Vec<etw::Event>,
 }
@@ -353,6 +358,7 @@ impl EtwFrames {
     fn retarget(&mut self, pid: Option<u32>) {
         if self.pid != pid {
             self.pid = pid;
+            self.since = pid.map(|_| Instant::now());
             self.chains.clear();
             self.real.clear();
             self.mult = None;
@@ -373,6 +379,8 @@ impl EtwFrames {
             let at = now
                 .checked_sub(Duration::from_micros(age_us(ev.qpc)))
                 .unwrap_or(now);
+            // Fila em ordem de tempo (prune, recent e last_second dependem disso).
+            let after = |last: Option<Instant>| last.map_or(at, |l| at.max(l));
             match ev.kind {
                 etw::Kind::Present { swapchain } => {
                     if !self.chains.contains_key(&swapchain) && self.chains.len() >= MAX_CHAINS {
@@ -390,9 +398,10 @@ impl EtwFrames {
                         // Fora de ordem (buffers de CPUs diferentes): ignorado.
                         Some(last) if ev.qpc <= last => {}
                         Some(last) => {
-                            let us = etw::ticks_us(ev.qpc - last, freq);
+                            let us = etw::ticks_us(ev.qpc.saturating_sub(last), freq);
                             if us > 0 && us <= MAX_FRAME_US {
                                 let us = us as u32;
+                                let at = after(c.ring.frames.back().map(|f| f.0));
                                 c.ring.push(at, us);
                                 c.peak = Some(c.peak.map_or(us, |p| p.max(us)));
                             }
@@ -405,6 +414,7 @@ impl EtwFrames {
                     if self.real.len() >= MAX_REAL {
                         self.real.pop_front();
                     }
+                    let at = after(self.real.back().copied());
                     self.real.push_back(at);
                 }
                 etw::Kind::Multiplier(v) => self.mult = Some((at, v)),
@@ -436,21 +446,26 @@ impl EtwFrames {
             .map(|(k, _)| *k)
     }
 
-    /// Frame gen ativo: multiplicador ≥ 2 recente, ou apresentados/reais ≥ `FG_RATIO`.
-    fn framegen(&self, t: Instant, now: Instant, total: Option<f64>) -> Option<FrameGen> {
-        let real = self
-            .real
-            .iter()
-            .filter(|a| **a <= t && t.duration_since(**a) <= Duration::from_secs(1))
-            .count() as f64;
+    /// Frame gen no segundo que termina em `t`: `presented` = frames apresentados nessa mesma
+    /// janela. Ativo com multiplicador >= 2 recente; com 1 informado, desligado; sem
+    /// multiplicador, apresentados/reais >= `FG_RATIO`. Só com a janela inteira coberta desde
+    /// a troca de jogo (no aquecimento a contagem de reais sairia baixa).
+    fn framegen(&self, t: Instant, now: Instant, presented: usize) -> Option<FrameGen> {
+        let start = t.checked_sub(Duration::from_secs(1))?;
+        if self.since.is_none_or(|s| s > start) {
+            return None;
+        }
+        let real = self.real.iter().filter(|a| **a > start && **a <= t).count();
         let mult = self
             .mult
             .filter(|(a, _)| now.saturating_duration_since(*a) <= MULT_FRESH)
-            .map(|m| m.1)
-            .filter(|m| *m >= 2);
-        let ratio = real >= 5.0 && total.is_some_and(|f| f / real >= FG_RATIO);
-        (real > 0.0 && (mult.is_some() || ratio)).then_some(FrameGen {
-            real_fps: real,
+            .map(|m| m.1);
+        let active = match mult {
+            Some(m) => m >= 2,
+            None => real >= 5 && presented as f64 / real as f64 >= FG_RATIO,
+        };
+        (real > 0 && active).then_some(FrameGen {
+            real_fps: real as f64,
             multiplier: mult,
         })
     }
@@ -1075,7 +1090,7 @@ impl RtssCollector {
         }
         let chosen = select_game(&apps, fg, &self.ignored_names);
         self.retarget(chosen.map(|g| g.pid));
-        self.ingest(now);
+        self.ingest();
         let game = match chosen {
             None => neutral("no 3D game in focus"),
             Some(g) => Ok(self.game(g, now)),
@@ -1109,15 +1124,16 @@ impl RtssCollector {
         self.frames.retarget(pid);
     }
 
-    fn ingest(&mut self, now: Instant) {
+    fn ingest(&mut self) {
         let Ok(s) = &self.etw else {
             return;
         };
         let mut events = std::mem::take(&mut self.frames.scratch);
         // Descartes (caixa cheia) só acontecem numa inundação: os frames que chegaram valem.
         let _ = s.drain(&mut events);
-        self.frames
-            .ingest(&mut events, etw::qpc_now(), s.freq(), now);
+        // Relógios lidos juntos: a idade de cada evento vira um `Instant` sem desvio.
+        let (now, qpc) = (Instant::now(), etw::qpc_now());
+        self.frames.ingest(&mut events, qpc, s.freq(), now);
         self.frames.scratch = events;
     }
 
@@ -1196,8 +1212,10 @@ impl RtssCollector {
             )
         };
         let lows = cached_lows(&mut self.lows, g.pid, source, now, ring);
+        // Reais e apresentados na mesma janela (a do ETW, que chega atrasada).
         let framegen = if self.frames.pid == Some(g.pid) {
-            self.frames.framegen(t_etw, now, fps.as_ref().ok().copied())
+            let presented = ring.map_or(0, |r| r.last_second(t_etw).count());
+            self.frames.framegen(t_etw, now, presented)
         } else {
             None
         };
@@ -1673,6 +1691,77 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    /// Eventos sintéticos: `fps` Present por segundo (um real a cada `fg`, multiplicador
+    /// `mult`) durante `secs`, terminando agora. QPC em µs (frequência 1 MHz).
+    fn etw_frames(fps: u32, fg: u32, mult: Option<u32>, secs: u32) -> (EtwFrames, Instant) {
+        let mut f = EtwFrames::default();
+        f.retarget(Some(7));
+        let now = Instant::now();
+        f.since = now.checked_sub(Duration::from_secs(u64::from(secs) + 1));
+        let n = fps * secs;
+        let step = 1_000_000 / i64::from(fps);
+        let now_qpc = 1_000_000_000i64;
+        let mut ev = Vec::new();
+        for i in 0..n {
+            let qpc = now_qpc - i64::from(n - i) * step;
+            let e = |kind| etw::Event { pid: 7, qpc, kind };
+            ev.push(e(etw::Kind::Present { swapchain: 1 }));
+            if i % fg == 0 {
+                ev.push(e(etw::Kind::SimStart));
+                if let Some(m) = mult {
+                    ev.push(e(etw::Kind::Multiplier(m)));
+                }
+            }
+        }
+        // Outro PID e um evento fora de ordem: ignorados.
+        ev.push(etw::Event {
+            pid: 8,
+            qpc: now_qpc,
+            kind: etw::Kind::SimStart,
+        });
+        ev.push(etw::Event {
+            pid: 7,
+            qpc: now_qpc - 3 * step * i64::from(n),
+            kind: etw::Kind::Present { swapchain: 1 },
+        });
+        f.ingest(&mut ev, now_qpc, 1_000_000, now);
+        (f, now)
+    }
+
+    #[test]
+    fn frame_gen_pela_contagem_na_mesma_janela() {
+        let t = |now: Instant| now - ETW_LAG;
+        let presented = |f: &EtwFrames, now: Instant| f.chains[&1].ring.last_second(t(now)).count();
+        // 4x informado: real = 1/4 dos apresentados.
+        let (f, now) = etw_frames(200, 4, Some(4), 3);
+        let p = presented(&f, now);
+        let fg = f.framegen(t(now), now, p).expect("frame gen 4x");
+        assert_eq!(fg.multiplier, Some(4));
+        assert!((fg.real_fps - 50.0).abs() <= 1.0, "{fg:?}");
+        assert!((199..=201).contains(&p), "{p}");
+        // Fila do ETW em ordem de tempo, mesmo com o evento fora de ordem.
+        let ring = &f.chains[&1].ring.frames;
+        assert!(
+            ring.iter()
+                .zip(ring.iter().skip(1))
+                .all(|(a, b)| a.0 <= b.0)
+        );
+        assert!(ring.iter().all(|&(_, us)| us == 5000));
+        // Reflex sem frame gen, com 1 informado: nada.
+        let (f, now) = etw_frames(100, 1, Some(1), 3);
+        assert_eq!(f.framegen(t(now), now, presented(&f, now)), None);
+        // Sem multiplicador: pela razão (2x sim; 1x não).
+        let (f, now) = etw_frames(120, 2, None, 3);
+        let fg = f.framegen(t(now), now, presented(&f, now));
+        assert!(fg.is_some_and(|g| g.multiplier.is_none() && (g.real_fps - 60.0).abs() <= 1.0));
+        let (f, now) = etw_frames(120, 1, None, 3);
+        assert_eq!(f.framegen(t(now), now, presented(&f, now)), None);
+        // Aquecimento (menos de 1 s completo desde a troca de jogo): ainda não diz nada.
+        let (mut f, now) = etw_frames(100, 1, None, 3);
+        f.since = Some(now - Duration::from_millis(500));
+        assert_eq!(f.framegen(t(now), now, 25), None);
     }
 
     fn defaults() -> Vec<String> {

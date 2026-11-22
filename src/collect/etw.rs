@@ -38,6 +38,8 @@ use crate::win::wide;
 pub const DXGI: GUID = GUID::from_u128(0xCA11C036_0102_4A2D_A6AD_F03CFED5D3C9);
 /// DXGI `Present_Start`.
 const DXGI_PRESENT_START: u16 = 42;
+/// `DXGI_PRESENT_TEST`: só testa a oclusão, sem apresentar.
+const DXGI_PRESENT_TEST: u32 = 0x1;
 /// `PCLStatsTraceLoggingProvider` (`pclstats.h` do Streamline da NVIDIA).
 pub const PCL: GUID = GUID::from_u128(0x0d216f06_82a6_4d49_bc4f_8f38ae56efab);
 /// `PCLSTATS_SIMULATION_START`: um por frame real.
@@ -192,11 +194,20 @@ fn classify(provider: &GUID, id: u16, ptr64: bool, data: &[u8], tl: Option<&[u8]
         if id != DXGI_PRESENT_START {
             return None;
         }
-        let swapchain = if ptr64 {
-            u64::from_le_bytes(data.get(..8)?.try_into().ok()?)
+        let (swapchain, rest) = if ptr64 {
+            (u64::from_le_bytes(data.get(..8)?.try_into().ok()?), 8)
         } else {
-            u64::from(u32::from_le_bytes(data.get(..4)?.try_into().ok()?))
+            (
+                u64::from(u32::from_le_bytes(data.get(..4)?.try_into().ok()?)),
+                4,
+            )
         };
+        // `Flags` depois do ponteiro: `DXGI_PRESENT_TEST` (0x1) não apresenta nada (teste de
+        // oclusão), como no PresentMon.
+        let flags = u32::from_le_bytes(data.get(rest..rest + 4)?.try_into().ok()?);
+        if flags & DXGI_PRESENT_TEST != 0 {
+            return None;
+        }
         return Some(Kind::Present { swapchain });
     }
     if *provider != PCL {
@@ -454,9 +465,10 @@ impl Session {
             return Ok(());
         }
         let e = self.enable(&DXGI, pid);
-        // O PCL só existe em jogos com Reflex: falha ao ligar não é erro da fonte.
-        let _ = self.enable(&PCL, pid);
         if e == ERROR_SUCCESS {
+            // O PCL só existe em jogos com Reflex: falha ao ligar não é erro da fonte. Ligado só
+            // com o DXGI (senão ficaria ligado sem alvo, com o jogo emitindo o ping à toa).
+            let _ = self.enable(&PCL, pid);
             Ok(())
         } else {
             self.target = None;
@@ -562,7 +574,11 @@ pub(crate) mod tests {
 
     #[test]
     fn present_do_dxgi() {
-        let d = 0x1234_5678_9ABC_u64.to_le_bytes();
+        // Ponteiro da swap chain (8 bytes) + Flags 0; em 32 bits, ponteiro de 4 + Flags 0.
+        let mut d = 0x1234_5678_9ABC_u64.to_le_bytes().to_vec();
+        d.extend(0u32.to_le_bytes());
+        let mut d32 = 0x5678_9ABC_u32.to_le_bytes().to_vec();
+        d32.extend(0u32.to_le_bytes());
         assert_eq!(
             classify(&DXGI, 42, true, &d, None),
             Some(Kind::Present {
@@ -570,13 +586,17 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(
-            classify(&DXGI, 42, false, &d, None),
+            classify(&DXGI, 42, false, &d32, None),
             Some(Kind::Present {
                 swapchain: 0x5678_9ABC
             })
         );
         assert_eq!(classify(&DXGI, 43, true, &d, None), None);
         assert_eq!(classify(&DXGI, 42, true, &d[..3], None), None);
+        assert_eq!(classify(&DXGI, 42, true, &d[..8], None), None);
+        // DXGI_PRESENT_TEST: não é frame.
+        d[8] = 1;
+        assert_eq!(classify(&DXGI, 42, true, &d, None), None);
     }
 
     #[test]
