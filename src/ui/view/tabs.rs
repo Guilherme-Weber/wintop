@@ -522,14 +522,100 @@ const GPU_COLS: [Col; 12] = [
     col("CPU% · RAM", 18, true, 2),
 ];
 
-/// Do mais ocupado para o menos; empate pela VRAM local.
-pub(super) fn sorted_gpu(list: &[GpuProc]) -> Vec<&GpuProc> {
-    let mut v: Vec<&GpuProc> = list.iter().collect();
+/// Coluna da ordem da aba GPU (←→ percorre na ordem da tabela; `CPU% · RAM` vem da lista de
+/// processos e não ordena).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuSort {
+    Pid,
+    Name,
+    #[default]
+    Gpu,
+    ThreeD,
+    Copy,
+    Encode,
+    Decode,
+    Compute,
+    Vram,
+    Shared,
+    Paged,
+}
+
+impl GpuSort {
+    const ALL: [Self; 11] = [
+        Self::Pid,
+        Self::Name,
+        Self::Gpu,
+        Self::ThreeD,
+        Self::Copy,
+        Self::Encode,
+        Self::Decode,
+        Self::Compute,
+        Self::Vram,
+        Self::Shared,
+        Self::Paged,
+    ];
+
+    /// Índice da coluna em `GPU_COLS` (as duas listas estão na mesma ordem).
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    fn natural_desc(self) -> bool {
+        !matches!(self, Self::Pid | Self::Name)
+    }
+
+    /// Valor numérico da coluna (engine sem taxa = 0).
+    fn key(self, p: &GpuProc) -> f64 {
+        let e = |pred: fn(&str) -> bool| engine(p, pred).unwrap_or(0.0);
+        match self {
+            Self::Pid | Self::Name => 0.0,
+            Self::Gpu => gpu_pct(p).unwrap_or(0.0),
+            Self::ThreeD => e(|k| k == "3D"),
+            Self::Copy => e(|k| k.starts_with("Copy")),
+            Self::Encode => e(|k| k.starts_with("VideoEncode")),
+            Self::Decode => e(|k| k.starts_with("VideoDecode")),
+            Self::Compute => e(|k| k.starts_with("Compute") || k.starts_with("Cuda")),
+            Self::Vram => p.local as f64,
+            Self::Shared => p.non_local as f64,
+            Self::Paged => p.paged() as f64,
+        }
+    }
+}
+
+/// Lista filtrada (nome ou PID, como na aba Processos) e ordenada pela coluna; empate pela
+/// VRAM local e depois pelo PID (a lista não pula entre coletas iguais).
+pub(in crate::ui) fn sorted_gpu<'a>(
+    list: &'a [GpuProc],
+    sort: GpuSort,
+    reverse: bool,
+    filter: &str,
+) -> Vec<&'a GpuProc> {
+    let f = filter.to_lowercase();
+    let mut v: Vec<&GpuProc> = list
+        .iter()
+        .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f) || p.pid.to_string() == f)
+        .collect();
+    let desc = sort.natural_desc() != reverse;
     v.sort_by(|a, b| {
-        let g = |p: &GpuProc| gpu_pct(p).unwrap_or(0.0);
-        g(b).total_cmp(&g(a))
-            .then(b.local.cmp(&a.local))
-            .then(a.pid.cmp(&b.pid))
+        let o = match sort {
+            GpuSort::Pid => a.pid.cmp(&b.pid),
+            GpuSort::Name => a
+                .name
+                .bytes()
+                .map(|c| c.to_ascii_lowercase())
+                .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase())),
+            s => s.key(a).total_cmp(&s.key(b)),
+        };
+        let o = if desc { o.reverse() } else { o };
+        o.then(b.local.cmp(&a.local)).then(a.pid.cmp(&b.pid))
     });
     v
 }
@@ -549,8 +635,19 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         empty_box(frame, area, &title, st.gpu_procs.as_ref());
         return;
     };
-    let rows = sorted_gpu(list);
-    let block = boxed(&title, &format!("{} processes", list.len()));
+    let rows = sorted_gpu(list, st.gpu_sort, st.gpu_reverse, &st.filter);
+    let desc = st.gpu_sort.natural_desc() != st.gpu_reverse;
+    let mut right = format!("{} processes", list.len());
+    if !st.filter.is_empty() || st.filtering {
+        right = format!(
+            "{} of {} · filter: {}{}",
+            rows.len(),
+            list.len(),
+            printable(&st.filter),
+            if st.filtering { "_" } else { "" }
+        );
+    }
+    let block = boxed(&title, &right);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // VRAM, adapter, folga, cabeçalho, 1 linha, divisória e 2 de detalhe.
@@ -619,7 +716,11 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let widths = fit(&GPU_COLS, inner.width);
     put(
         frame,
-        Paragraph::new(header(&GPU_COLS, &widths, None)),
+        Paragraph::new(header(
+            &GPU_COLS,
+            &widths,
+            Some((st.gpu_sort.index(), desc)),
+        )),
         Rect::new(inner.x, table_y, inner.width, 1),
         inner,
     );

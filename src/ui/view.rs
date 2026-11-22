@@ -24,7 +24,7 @@ use crate::model::{
 };
 use crate::win::printable;
 
-mod tabs;
+pub(super) mod tabs;
 
 pub use tabs::{Cursor, ProcSort};
 
@@ -171,6 +171,12 @@ pub struct State {
     /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
     pub gpu_cursor: Cursor,
+    pub gpu_sort: tabs::GpuSort,
+    pub gpu_reverse: bool,
+    /// Tela congelada (tecla `p` ou Espaço): as coletas continuam, mas não entram na tela.
+    pub paused: bool,
+    /// Janela de ajuda aberta (tecla `?`; qualquer tecla fecha).
+    pub help: bool,
     /// Tema atual (tecla `t`, gravado no config).
     pub theme_name: String,
     /// Aviso da configuração (arquivo com erro, gravação recusada), no rodapé.
@@ -284,7 +290,7 @@ impl State {
         let Some(Ok(list)) = &self.gpu_procs else {
             return None;
         };
-        let rows = tabs::sorted_gpu(list);
+        let rows = tabs::sorted_gpu(list, self.gpu_sort, self.gpu_reverse, &self.filter);
         let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
         let page = self.gpu_cursor.page();
         let (Some(i), _) = self.gpu_cursor.resolve(&pids, page) else {
@@ -648,11 +654,102 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     draw_tabs(frame, tabs, st);
     draw_footer(frame, footer, st);
     match st.tab {
-        Tab::Overview => {}
-        Tab::Processes => return tabs::draw_processes(frame, body, st),
-        Tab::Gpu => return tabs::draw_gpu_tab(frame, body, st),
-        Tab::Sensors => return tabs::draw_sensors(frame, body, st),
+        Tab::Overview => draw_overview(frame, body, st),
+        Tab::Processes => tabs::draw_processes(frame, body, st),
+        Tab::Gpu => tabs::draw_gpu_tab(frame, body, st),
+        Tab::Sensors => tabs::draw_sensors(frame, body, st),
     }
+    if st.help {
+        draw_help(frame, body);
+    }
+}
+
+/// Atalhos e siglas da interface (tecla `?`), numa janela por cima da aba.
+const HELP: &[(&str, &str)] = &[
+    ("1-4", "switch tabs (Overview, Processes, GPU, Sensors)"),
+    (
+        "+ / -",
+        "update interval (100 ms steps, saved to config.toml)",
+    ),
+    ("p, space", "pause the screen (collection keeps running)"),
+    ("r", "reset session min/max and the game history"),
+    (
+        "t",
+        "next color theme   d  fold/expand the Storage Space members",
+    ),
+    ("↑↓ j k", "select a row (PgUp/PgDn, Home/End)"),
+    ("←→  i", "sort column / invert order (Processes, GPU)"),
+    ("/  esc", "filter by name or PID / clear the filter"),
+    (
+        "enter",
+        "GPU tab: GPU runtimes of the selected process (on demand)",
+    ),
+    ("q, esc", "quit (Ctrl+C also works)"),
+    ("", ""),
+    (
+        "kern",
+        "kernel (privileged) share of the CPU time, darker in the graphs",
+    ),
+    (
+        "Tctl, CCD",
+        "AMD control and per-chiplet temperatures (PawnIO)",
+    ),
+    ("S  P", "disk with the system / with a page file"),
+    ("act, resp", "disk active time / average response time"),
+    (
+        "FT, lows",
+        "frametime; average FPS of the slowest 1% and 0.1% frames",
+    ),
+    (
+        "pipe: exact",
+        "per-frame times from RTSS; approx = shared-memory sampling",
+    ),
+    (
+        "red text",
+        "a failed source, with its cause; gray = expected state",
+    ),
+];
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+    let key_w = HELP
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line<'static>> = HELP
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:<key_w$}  "),
+                    Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+                ),
+                label(d),
+            ])
+        })
+        .collect();
+    let w = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(3)
+        .min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(ratatui::widgets::Clear, r);
+    frame.render_widget(
+        Paragraph::new(lines).block(boxed("help", "any key closes")),
+        r,
+    );
+}
+
+fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(body);
     let [cpu, gpu] =
@@ -701,7 +798,17 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
         .as_ref()
         .and_then(|f| f.cpu.as_ref().ok())
         .map(|c| c.uptime.as_secs());
-    let mut right = vec![label(&format!("interval {} ms", st.interval_ms))];
+    let mut right = Vec::new();
+    if st.paused {
+        right.extend([
+            Span::styled(
+                "PAUSED (p resumes)",
+                Style::new().fg(th().fail).add_modifier(Modifier::BOLD),
+            ),
+            bar_sep(),
+        ]);
+    }
+    right.push(label(&format!("interval {} ms", st.interval_ms)));
     if let Some(s) = up {
         right.extend([
             bar_sep(),
@@ -740,7 +847,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("d", " fold pool  "),
             ("t", " theme  "),
         ],
-        Tab::Processes if st.filtering => &[
+        Tab::Processes | Tab::Gpu if st.filtering => &[
             (" type", " to filter  "),
             ("enter", " keep  "),
             ("esc", " clear  "),
@@ -758,13 +865,28 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("i", " invert  "),
             ("/", " filter  "),
         ],
-        Tab::Gpu => &[("↑↓", " select  "), ("enter", " runtimes  ")],
+        Tab::Gpu if !st.filter.is_empty() => &[
+            ("↑↓", " select  "),
+            ("←→", " sort  "),
+            ("i", " invert  "),
+            ("/", " filter  "),
+            ("esc", " clear filter  "),
+            ("enter", " runtimes  "),
+        ],
+        Tab::Gpu => &[
+            ("↑↓", " select  "),
+            ("←→", " sort  "),
+            ("i", " invert  "),
+            ("/", " filter  "),
+            ("enter", " runtimes  "),
+        ],
         Tab::Sensors => &[("r", " reset min/max  ")],
     };
     for (k, l) in pairs {
         groups.push([key(k), label(l)]);
     }
     if !st.filtering {
+        groups.push([key("?"), label(" help  ")]);
         groups.push([
             key("+/-"),
             label(&format!(" interval {} ms  ", st.interval_ms)),

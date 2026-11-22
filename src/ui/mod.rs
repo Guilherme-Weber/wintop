@@ -76,6 +76,12 @@ fn event_loop(
         }
         let u = engine.updates(&mut seen);
         let overview = st.tab == view::Tab::Overview;
+        // Pausada, a tela fica como está: as coletas continuam, mas não entram no estado.
+        let u = if st.paused {
+            crate::engine::Updates::default()
+        } else {
+            u
+        };
         if let Some(f) = u.fast {
             st.push_fast(f);
             dirty = true;
@@ -129,11 +135,32 @@ fn event_loop(
                     }
                     dirty = true;
                 }
+                // Ajuda aberta: qualquer tecla fecha (Ctrl+C ainda sai).
+                Event::Key(k) if k.kind == KeyEventKind::Press && st.help => {
+                    if lower(k.code) == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        return Ok(());
+                    }
+                    st.help = false;
+                    dirty = true;
+                }
                 // Atalhos de letra valem com Caps Lock ligado (o filtro, acima, guarda o texto
                 // como digitado).
                 Event::Key(k) if k.kind == KeyEventKind::Press => match lower(k.code) {
+                    KeyCode::Char('?') => {
+                        st.help = true;
+                        dirty = true;
+                    }
+                    KeyCode::Char('p' | ' ') => {
+                        st.paused = !st.paused;
+                        dirty = true;
+                    }
                     // Esc com um filtro aplicado limpa o filtro (o segundo Esc sai).
-                    KeyCode::Esc if st.tab == view::Tab::Processes && !st.filter.is_empty() => {
+                    KeyCode::Esc
+                        if matches!(st.tab, view::Tab::Processes | view::Tab::Gpu)
+                            && !st.filter.is_empty() =>
+                    {
                         st.filter.clear();
                         dirty = true;
                     }
@@ -240,7 +267,13 @@ fn list_key(st: &mut view::State, code: KeyCode, jobs: &Sender<RuntimeResult>) -
         KeyCode::Char('i') if st.tab == view::Tab::Processes => {
             st.proc_reverse = !st.proc_reverse;
         }
-        KeyCode::Char('/') if st.tab == view::Tab::Processes => st.filtering = true,
+        KeyCode::Left if st.tab == view::Tab::Gpu => st.gpu_sort = st.gpu_sort.prev(),
+        KeyCode::Right if st.tab == view::Tab::Gpu => st.gpu_sort = st.gpu_sort.next(),
+        KeyCode::Char('i') if st.tab == view::Tab::Gpu => st.gpu_reverse = !st.gpu_reverse,
+        // O filtro (nome ou PID) vale para as listas das duas abas.
+        KeyCode::Char('/') if matches!(st.tab, view::Tab::Processes | view::Tab::Gpu) => {
+            st.filtering = true;
+        }
         // Sob demanda: abre o processo selecionado (nunca o jogo nem apps com o hook do RTSS,
         // recusados antes de abrir).
         KeyCode::Enter if st.tab == view::Tab::Gpu => {

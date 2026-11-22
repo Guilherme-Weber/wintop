@@ -1101,3 +1101,58 @@ fn aviso_do_config_aparece_inteiro_sem_esconder_o_estado() {
         assert!(footer.contains("sources: all OK"), "{w}\n{footer}");
     }
 }
+
+#[test]
+fn aba_gpu_ordena_por_coluna_e_filtra() {
+    use super::view::tabs::{GpuSort, sorted_gpu};
+    let list = gpu_list();
+    let pids = |v: Vec<&crate::model::GpuProc>| v.iter().map(|p| p.pid).collect::<Vec<_>>();
+    // Padrão: GPU% decrescente.
+    assert_eq!(
+        pids(sorted_gpu(&list, GpuSort::default(), false, "")),
+        [4242, 9120, 1784, 7000]
+    );
+    // VRAM decrescente; invertida, crescente.
+    assert_eq!(
+        pids(sorted_gpu(&list, GpuSort::Vram, false, "")),
+        [4242, 9120, 1784, 7000]
+    );
+    assert_eq!(
+        pids(sorted_gpu(&list, GpuSort::Vram, true, "")),
+        [7000, 1784, 9120, 4242]
+    );
+    // Nome crescente e filtro por nome ou PID.
+    assert_eq!(
+        pids(sorted_gpu(&list, GpuSort::Name, false, "")),
+        [4242, 1784, 9120, 7000]
+    );
+    assert_eq!(pids(sorted_gpu(&list, GpuSort::Gpu, false, "FIRE")), [9120]);
+    assert_eq!(pids(sorted_gpu(&list, GpuSort::Gpu, false, "1784")), [1784]);
+    // ←→ percorre todas as colunas e volta.
+    let mut s = GpuSort::default();
+    for _ in 0..11 {
+        s = s.next();
+    }
+    assert_eq!(s, GpuSort::default());
+}
+
+#[test]
+fn ajuda_e_pausa_aparecem() {
+    let mut st = filled();
+    st.help = true;
+    let out = render(&mut st, 160, 48);
+    assert!(
+        out.contains("any key closes") && out.contains("pause the screen"),
+        "{out}"
+    );
+    // A ajuda inteira cabe num terminal de 120x30 (o conhost do atalho).
+    let small = render(&mut st, 120, 30);
+    assert!(small.contains("gray = expected state"), "{small}");
+    st.help = false;
+    st.paused = true;
+    let out = render(&mut st, 160, 48);
+    assert!(
+        out.lines().next().is_some_and(|l| l.contains("PAUSED")),
+        "{out}"
+    );
+}
