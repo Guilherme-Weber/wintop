@@ -104,8 +104,15 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # Só para o spike de frame gen (ETW): não entra no binário.
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Time",
 ] }
 
 [[example]]
 name = "fps_probe"
 test = false
+
+[[example]]
+name = "spike_framegen"
+test = true
