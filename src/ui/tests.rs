@@ -1210,3 +1210,34 @@ fn falha_prevista_do_smart_aparece_em_vermelho() {
     let out = render(&mut st, 200, 60);
     assert!(out.contains("FAILURE PREDICTED"), "{out}");
 }
+
+#[test]
+fn confirmacao_de_encerrar_processo() {
+    let mut st = tab_state(view::Tab::Processes);
+    let _ = render(&mut st, 160, 48);
+    let p = st.selected_proc().expect("linha selecionada");
+    st.confirm_end = Some((p.pid, p.name.clone(), p.create));
+    let out = render(&mut st, 160, 48);
+    assert!(
+        out.contains(&format!("End {} (PID {})", p.name, p.pid)),
+        "{out}"
+    );
+    assert!(
+        out.contains("y end process") && out.contains("n / esc cancel"),
+        "{out}"
+    );
+    // A mensagem do resultado aparece e some sozinha.
+    st.confirm_end = None;
+    st.toast = Some((
+        "ended x.exe (PID 1)".into(),
+        false,
+        std::time::Instant::now(),
+    ));
+    assert!(render(&mut st, 160, 48).contains("ended x.exe (PID 1)"));
+    st.toast = Some((
+        "old".into(),
+        false,
+        std::time::Instant::now() - view::TOAST_FOR,
+    ));
+    assert!(!render(&mut st, 160, 48).contains("old"));
+}

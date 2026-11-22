@@ -176,6 +176,11 @@ pub struct State {
     pub paused: bool,
     /// Janela de ajuda aberta (tecla `?`; qualquer tecla fecha).
     pub help: bool,
+    /// Encerrar processo pedido (tecla Del na aba Processos): (PID, nome, criação), à espera
+    /// da confirmação.
+    pub confirm_end: Option<(u32, String, u64)>,
+    /// Mensagem curta de uma ação (fim de processo): texto, se é erro, quando apareceu.
+    pub toast: Option<(String, bool, std::time::Instant)>,
     /// Do config (valem na hora quando o arquivo muda).
     pub frametime_alert_ms: f64,
     pub net_bytes: bool,
@@ -340,6 +345,16 @@ impl State {
         if self.runtimes.get(&pid).is_some_and(|(n, _)| *n == name) {
             self.runtimes.insert(pid, (name, r));
         }
+    }
+
+    /// Processo da linha selecionada na aba Processos (na ordem e com o filtro da tela).
+    pub fn selected_proc(&self) -> Option<Proc> {
+        let Some(Ok(list)) = &self.procs else {
+            return None;
+        };
+        let rows = tabs::sorted_procs(list, self.proc_sort, self.proc_reverse, &self.filter);
+        let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
+        self.proc_cursor.peek(&pids).map(|i| rows[i].clone())
     }
 
     pub fn reset_session(&mut self) {
@@ -632,7 +647,7 @@ fn temp(m: &Metric<f64>) -> Span<'static> {
 pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     // Aviso do config (arquivo com erro, gravação recusada): linhas próprias acima do rodapé,
     // inteiras, sem disputar espaço com o estado das fontes.
-    let notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
+    let mut notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
         wrap(
             vec![Span::styled(
                 format!("! {}", printable(n)),
@@ -643,6 +658,25 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
             3,
         )
     });
+    // Resultado de uma ação (some depois de alguns segundos).
+    if let Some((msg, err, at)) = &st.toast
+        && at.elapsed() < TOAST_FOR
+    {
+        let (mark, color) = if *err {
+            ("! ", th().fail)
+        } else {
+            ("", th().title)
+        };
+        notice.extend(wrap(
+            vec![Span::styled(
+                format!("{mark}{}", printable(msg)),
+                Style::new().fg(color),
+            )],
+            frame.area().width,
+            1,
+            3,
+        ));
+    }
     let notice_h = (notice.len() as u16).min(frame.area().height.saturating_sub(10));
     let [tabs, body, notice_area, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -665,6 +699,48 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     if st.help {
         draw_help(frame, body);
     }
+    if let Some((pid, name, _)) = &st.confirm_end {
+        draw_confirm_end(frame, body, *pid, name);
+    }
+}
+
+/// Tempo em que a mensagem de uma ação fica na tela.
+pub const TOAST_FOR: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Confirmação de encerrar processo (por cima da aba).
+fn draw_confirm_end(frame: &mut Frame<'_>, area: Rect, pid: u32, name: &str) {
+    let lines = vec![
+        Line::from(vec![
+            label(" End "),
+            Span::styled(
+                format!("{} (PID {pid})", printable(name)),
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+            ),
+            label("? Unsaved work in it is lost. "),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " y",
+                Style::new().fg(th().fail).add_modifier(Modifier::BOLD),
+            ),
+            label(" end process    "),
+            Span::styled(
+                "n / esc",
+                Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+            ),
+            label(" cancel"),
+        ]),
+    ];
+    let w = (lines.iter().map(|l| l.width() as u16).max().unwrap_or(0) + 3).min(area.width);
+    let h = 4.min(area.height);
+    let r = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(ratatui::widgets::Clear, r);
+    frame.render_widget(Paragraph::new(lines).block(boxed("end process", "")), r);
 }
 
 /// Atalhos e siglas da interface (tecla `?`), numa janela por cima da aba.
@@ -686,6 +762,10 @@ const HELP: &[(&str, &str)] = &[
     (
         "enter",
         "GPU tab: GPU runtimes of the selected process (on demand)",
+    ),
+    (
+        "del",
+        "Processes tab: end the selected process (asks to confirm)",
     ),
     ("q, esc", "quit (Ctrl+C also works)"),
     ("", ""),
@@ -862,12 +942,14 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
             ("i", " invert  "),
             ("/", " filter  "),
             ("esc", " clear filter  "),
+            ("del", " end process  "),
         ],
         Tab::Processes => &[
             ("↑↓", " select  "),
             ("←→", " sort  "),
             ("i", " invert  "),
             ("/", " filter  "),
+            ("del", " end process  "),
         ],
         Tab::Gpu if !st.filter.is_empty() => &[
             ("↑↓", " select  "),

@@ -139,6 +139,47 @@ pub fn identity_of(pid: u32) -> Result<Option<(String, u64)>, String> {
     Ok(raw_of(pid)?.map(|r| (r.name, r.create)))
 }
 
+/// Processos do sistema cujo fim derruba o Windows (tela azul) ou a sessão: nunca encerrados.
+const CRITICAL: [&str; 8] = [
+    "csrss.exe",
+    "wininit.exe",
+    "smss.exe",
+    "lsass.exe",
+    "services.exe",
+    "winlogon.exe",
+    "system",
+    "registry",
+];
+
+/// Encerra o processo `pid` (aba Processos, depois da confirmação). Confere antes que ainda é
+/// o mesmo processo (nome e instante de criação: o PID pode ter sido reaproveitado), e recusa
+/// os críticos do sistema, o Idle/System e o próprio wintop. Abre só com `PROCESS_TERMINATE`.
+pub fn end_process(pid: u32, name: &str, create: u64) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    if pid <= 4 || CRITICAL.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(format!("{name} is a critical system process (not ended)"));
+    }
+    if pid == std::process::id() {
+        return Err("that is wintop itself (use q to quit)".into());
+    }
+    match identity_of(pid)? {
+        Some((n, c)) if n == name && c == create => {}
+        Some(_) => return Err(format!("PID {pid} is now another process (not ended)")),
+        None => return Err(format!("{name} (PID {pid}) already exited")),
+    }
+    // SAFETY: PID numérico; o handle é fechado logo abaixo.
+    let h = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
+        .map_err(|e| format!("open {name} (PID {pid}): {e}"))?;
+    // SAFETY: handle com PROCESS_TERMINATE aberto acima.
+    let r = unsafe { TerminateProcess(h, 1) };
+    // SAFETY: handle aberto acima, fechado uma vez.
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    r.map_err(|e| format!("end {name} (PID {pid}): {e}"))
+}
+
 /// Working set privado do processo `pid` (o do próprio wintop no Windows 10, onde o
 /// `PROCESS_MEMORY_COUNTERS_EX2` não existe).
 pub(super) fn private_ws_of(pid: u32) -> Result<u64, String> {
@@ -473,5 +514,39 @@ mod tests {
         assert!(p.threads >= 1 && p.mem > 0, "{p:?}");
         assert!(list.iter().any(|p| p.pid == 4), "System");
         assert!(list.iter().all(|p| p.pid != 0), "sem o Idle");
+    }
+
+    #[test]
+    fn encerrar_processo_recusa_os_perigosos() {
+        assert!(end_process(4, "System", 0).is_err());
+        assert!(end_process(900, "csrss.exe", 1).is_err());
+        assert!(end_process(901, "LSASS.EXE", 1).is_err());
+        let me = std::process::id();
+        assert!(
+            end_process(me, "wintop.exe", 1)
+                .unwrap_err()
+                .contains("wintop itself")
+        );
+    }
+
+    #[test]
+    fn encerrar_processo_confere_a_identidade_e_encerra() {
+        let ping = crate::win::system_dir().expect("System32").join("PING.EXE");
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("ping");
+        let pid = child.id();
+        let (name, create) = identity_of(pid).expect("lista").expect("ping na lista");
+        // Instante de criação diferente: é "outro processo" com o mesmo PID, não encerra.
+        assert!(
+            end_process(pid, &name, create + 1)
+                .unwrap_err()
+                .contains("another process")
+        );
+        end_process(pid, &name, create).expect("encerra");
+        let status = child.wait().expect("espera");
+        assert_eq!(status.code(), Some(1));
     }
 }

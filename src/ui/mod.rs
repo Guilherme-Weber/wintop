@@ -154,6 +154,26 @@ fn event_loop(
                     }
                     dirty = true;
                 }
+                // Confirmação de encerrar processo: só `y` encerra; qualquer outra tecla cancela
+                // (Ctrl+C ainda sai).
+                Event::Key(k) if k.kind == KeyEventKind::Press && st.confirm_end.is_some() => {
+                    let ctrl_c = lower(k.code) == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl_c {
+                        return Ok(());
+                    }
+                    if let Some((pid, name, create)) = st.confirm_end.take()
+                        && lower(k.code) == KeyCode::Char('y')
+                    {
+                        let r = crate::collect::procs::end_process(pid, &name, create);
+                        st.toast = Some(match r {
+                            Ok(()) => (format!("ended {name} (PID {pid})"), false),
+                            Err(e) => (e, true),
+                        })
+                        .map(|(m, e)| (m, e, std::time::Instant::now()));
+                    }
+                    dirty = true;
+                }
                 // Ajuda aberta: qualquer tecla fecha (Ctrl+C ainda sai).
                 Event::Key(k) if k.kind == KeyEventKind::Press && st.help => {
                     if lower(k.code) == KeyCode::Char('c')
@@ -167,6 +187,12 @@ fn event_loop(
                 // Atalhos de letra valem com Caps Lock ligado (o filtro, acima, guarda o texto
                 // como digitado).
                 Event::Key(k) if k.kind == KeyEventKind::Press => match lower(k.code) {
+                    KeyCode::Delete if st.tab == view::Tab::Processes => {
+                        if let Some(p) = st.selected_proc() {
+                            st.confirm_end = Some((p.pid, p.name, p.create));
+                            dirty = true;
+                        }
+                    }
                     KeyCode::Char('?') => {
                         st.help = true;
                         dirty = true;

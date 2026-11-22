@@ -72,7 +72,7 @@ impl Cursor {
     }
 
     /// O que `resolve` selecionaria, sem mudar nada (para montar o detalhe antes da tabela).
-    fn peek(&self, pids: &[u32]) -> Option<usize> {
+    pub(in crate::ui) fn peek(&self, pids: &[u32]) -> Option<usize> {
         let last = pids.len().checked_sub(1)?;
         // Seleção por posição: a linha fica parada e os processos mudam embaixo dela (seguir o
         // PID fazia a lista pular a cada reordenação por CPU).
