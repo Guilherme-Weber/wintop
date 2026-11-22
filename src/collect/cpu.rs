@@ -29,6 +29,10 @@ pub struct CpuCollector {
     virtualization: Metric<bool>,
     /// Último (idle, kernel, user) de `GetSystemTimes`.
     times: Option<(u64, u64, u64)>,
+    /// Últimos valores válidos por lógico (uso, kernel, desempenho): um lógico sem dado válido
+    /// numa coleta repete o anterior, sem sumir da lista (sumir desalinharia as três listas e
+    /// recriaria a grade de gráficos).
+    last: [Vec<f64>; 3],
 }
 
 impl CpuCollector {
@@ -62,6 +66,7 @@ impl CpuCollector {
             base_mhz,
             virtualization: Ok(virt),
             times: None,
+            last: Default::default(),
         }
     }
 
@@ -78,23 +83,28 @@ impl CpuCollector {
         // Um contador só: a instância `_Total` vem junto com as dos lógicos.
         let array = match &sampled {
             Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array(&self.query, &self.per).or_else(fail),
+            Ok(()) => pdh::read_array_all(&self.query, &self.per).or_else(fail),
         };
         let usage = array.as_ref().map_err(Clone::clone).and_then(|a| {
             a.iter()
                 .find(|(n, _)| n == "_Total")
-                .map(|(_, v)| v.clamp(0.0, 100.0))
+                .map(|(_, v)| *v)
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 100.0))
                 .map_or_else(|| fail("no _Total instance"), Ok)
         });
         // Antes de `per_logical` (a variável esconderia a função de mesmo nome).
         let kernel_per_logical = match &sampled {
             Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array(&self.query, &self.per_kernel)
+            Ok(()) => pdh::read_array_all(&self.query, &self.per_kernel)
                 .or_else(fail)
-                .and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok)),
+                .and_then(|a| {
+                    per_logical(&a, &mut self.last[1]).map_or_else(|| fail("no instances"), Ok)
+                }),
         };
-        let per_logical =
-            array.and_then(|a| per_logical(&a).map_or_else(|| fail("no instances"), Ok));
+        let per_logical = array.and_then(|a| {
+            per_logical(&a, &mut self.last[0]).map_or_else(|| fail("no instances"), Ok)
+        });
         let kernel_per_logical = match (&per_logical, kernel_per_logical) {
             (Ok(u), Ok(k)) if u.len() != k.len() => fail("kernel instances differ from usage"),
             (_, k) => k,
@@ -103,7 +113,7 @@ impl CpuCollector {
         // com o turbo.
         let perf = match &sampled {
             Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array(&self.query, &self.perf).or_else(fail),
+            Ok(()) => pdh::read_array_all(&self.query, &self.perf).or_else(fail),
         };
         let to_mhz = |p: f64| -> Metric<f64> {
             self.base_mhz
@@ -118,8 +128,9 @@ impl CpuCollector {
                 .filter(|v| v.is_finite())
                 .map_or_else(|| fail("no _Total instance"), to_mhz)
         });
+        let last_perf = &mut self.last[2];
         let freq_per_logical: Metric<Vec<f64>> = perf.and_then(|a| {
-            per_logical_raw(&a, PERF_MAX)
+            per_logical_raw(&a, PERF_MAX, last_perf)
                 .map_or_else(|| fail("no instances"), Ok)
                 .and_then(|v| v.into_iter().map(to_mhz).collect())
         });
@@ -184,33 +195,44 @@ fn kernel_share(prev: (u64, u64, u64), now: (u64, u64, u64)) -> Option<f64> {
 }
 
 /// Uso por processador lógico, ordenado por (grupo, número); ignora as instâncias `_Total`.
-fn per_logical(items: &[(String, f64)]) -> Option<Vec<f64>> {
-    per_logical_raw(items, 100.0)
+fn per_logical(items: &[(String, f64)], last: &mut Vec<f64>) -> Option<Vec<f64>> {
+    per_logical_raw(items, 100.0, last)
 }
 
 /// Teto do `% Processor Performance` (turbo passa de 100%; acima disto é contador corrompido).
 const PERF_MAX: f64 = 1000.0;
 
-/// Valores por lógico em 0..=`max`, ordenados por (grupo, número).
-fn per_logical_raw(items: &[(String, f64)], max: f64) -> Option<Vec<f64>> {
+/// Valores por lógico em 0..=`max`, ordenados por (grupo, número). Lógico sem dado válido
+/// (NaN) repete o valor de `last` na mesma posição (ou 0); `last` guarda o resultado.
+fn per_logical_raw(items: &[(String, f64)], max: f64, last: &mut Vec<f64>) -> Option<Vec<f64>> {
     let mut v: Vec<((u32, u32), f64)> = items
         .iter()
         .filter_map(|(name, val)| {
             let (g, n) = name.split_once(',')?;
-            // NaN passaria pelo `clamp`: vira 0.
-            let val = if val.is_nan() {
-                0.0
-            } else {
-                val.clamp(0.0, max)
-            };
-            Some(((g.parse().ok()?, n.parse().ok()?), val))
+            Some(((g.parse().ok()?, n.parse().ok()?), *val))
         })
         .collect();
     if v.is_empty() {
         return None;
     }
     v.sort_by_key(|(k, _)| *k);
-    Some(v.into_iter().map(|(_, x)| x).collect())
+    // Outra quantidade de lógicos (CPU ligada a quente): o histórico não vale mais.
+    if last.len() != v.len() {
+        last.clear();
+    }
+    let out: Vec<f64> = v
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, x))| {
+            if x.is_nan() {
+                last.get(i).copied().unwrap_or(0.0)
+            } else {
+                x.clamp(0.0, max)
+            }
+        })
+        .collect();
+    last.clone_from(&out);
+    Some(out)
 }
 
 /// Nome do processador pelo CPUID (folhas 0x80000002-4).
@@ -382,8 +404,42 @@ mod tests {
             ("1,0".to_string(), 7.0),
             ("0,_Total".to_string(), 3.0),
         ];
-        assert_eq!(per_logical(&items), Some(vec![100.0, 5.0, 7.0]));
-        assert_eq!(per_logical(&[]), None);
+        let mut last = Vec::new();
+        assert_eq!(per_logical(&items, &mut last), Some(vec![100.0, 5.0, 7.0]));
+        assert_eq!(per_logical(&[], &mut last), None);
+    }
+
+    /// Um lógico sem dado válido numa coleta (o PDH devolve NaN para ele) continua na lista, na
+    /// mesma posição, com o último valor: a lista não encolhe (o que desalinhava uso, kernel e
+    /// clock e recriava a grade de gráficos).
+    #[test]
+    fn logico_sem_dado_mantem_a_posicao() {
+        let items = |v: [f64; 3]| -> Vec<(String, f64)> {
+            ["0,0", "0,1", "0,2"]
+                .iter()
+                .zip(v)
+                .map(|(n, x)| (n.to_string(), x))
+                .collect()
+        };
+        let mut last = Vec::new();
+        assert_eq!(
+            per_logical(&items([10.0, 20.0, 30.0]), &mut last),
+            Some(vec![10.0, 20.0, 30.0])
+        );
+        assert_eq!(
+            per_logical(&items([11.0, f64::NAN, 31.0]), &mut last),
+            Some(vec![11.0, 20.0, 31.0])
+        );
+        assert_eq!(
+            per_logical(&items([12.0, 22.0, 32.0]), &mut last),
+            Some(vec![12.0, 22.0, 32.0])
+        );
+        // Sem valor anterior (1ª coleta): 0.
+        let mut fresh = Vec::new();
+        assert_eq!(
+            per_logical(&items([f64::NAN, 5.0, 6.0]), &mut fresh),
+            Some(vec![0.0, 5.0, 6.0])
+        );
     }
 
     #[test]
@@ -420,7 +476,7 @@ mod tests {
         crate::fuzz::run_text("uso_por_logico", &["0,15", "1,63", "_Total"], 64, |name| {
             for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 42.0] {
                 let items = [(name.to_string(), v), ("0,0".to_string(), v)];
-                let u = per_logical(&items).expect("0,0 é válido");
+                let u = per_logical(&items, &mut Vec::new()).expect("0,0 é válido");
                 assert!(u.iter().all(|x| (0.0..=100.0).contains(x)));
             }
         });

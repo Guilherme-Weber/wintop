@@ -126,6 +126,16 @@ impl Query {
     /// Valores de um contador com curinga (`(*)`): `(instância, valor)`, na ordem do PDH.
     /// Instâncias sem dado válido nesta coleta ficam de fora.
     pub fn array(&self, c: Counter) -> Result<Vec<(String, f64)>, String> {
+        self.array_with(c, false)
+    }
+
+    /// Como `array`, mas instâncias sem dado válido nesta coleta vêm com NaN (a lista mantém
+    /// as mesmas instâncias a cada coleta: quem indexa por posição não perde o alinhamento).
+    pub fn array_all(&self, c: Counter) -> Result<Vec<(String, f64)>, String> {
+        self.array_with(c, true)
+    }
+
+    fn array_with(&self, c: Counter, keep_invalid: bool) -> Result<Vec<(String, f64)>, String> {
         let h = self.counter(c)?;
         let mut size = 0u32;
         let mut count = 0u32;
@@ -161,13 +171,17 @@ impl Query {
                 Ok(v) => out.push((name, v)),
                 Err(e) => {
                     first_err.get_or_insert(e);
+                    if keep_invalid {
+                        out.push((name, f64::NAN));
+                    }
                 }
             }
         }
         // Instâncias existem, mas nenhuma com dado válido (ex.: reset do driver): o status real,
         // não uma lista vazia que pareceria "nenhuma instância".
+        let any_valid = out.iter().any(|(_, v)| !v.is_nan());
         match first_err {
-            Some(e) if out.is_empty() => Err(e),
+            Some(e) if !any_valid => Err(e),
             _ => Ok(out),
         }
     }
@@ -197,6 +211,14 @@ pub fn read(q: &Result<Query, String>, slot: &Slot) -> Result<f64, String> {
 /// Lê um contador com curinga guardado em `Slot`.
 pub fn read_array(q: &Result<Query, String>, slot: &Slot) -> Result<Vec<(String, f64)>, String> {
     q.as_ref().map_err(Clone::clone)?.array(slot.clone()?)
+}
+
+/// `Query::array_all` (instâncias sem dado válido com NaN).
+pub fn read_array_all(
+    q: &Result<Query, String>,
+    slot: &Slot,
+) -> Result<Vec<(String, f64)>, String> {
+    q.as_ref().map_err(Clone::clone)?.array_all(slot.clone()?)
 }
 
 #[cfg(test)]
