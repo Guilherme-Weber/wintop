@@ -495,7 +495,7 @@ fn sem_jogo_fica_idle_com_os_graficos() {
     st.push_fast(fast(200));
     let out = render(&mut st, 160, 48);
     assert!(out.contains("game · idle"), "{out}");
-    assert!(out.contains("FPS idle"), "{out}");
+    assert!(out.contains("FPS -"), "{out}");
     // O histórico continua: mínimo/máximo e o gráfico do último jogo.
     assert!(out.contains("min 144 · max 144"), "{out}");
     assert!(out.contains("no 3D game in focus"), "{out}");
@@ -1129,7 +1129,7 @@ fn aviso_do_config_aparece_inteiro_sem_esconder_o_estado() {
             .join(" ");
         assert!(flat.contains("defaults, not saved"), "{w}\n{out}");
         let footer = out.lines().last().expect("rodapé");
-        assert!(footer.contains("sources: all OK"), "{w}\n{footer}");
+        assert!(footer.contains("all OK"), "{w}\n{footer}");
     }
 }
 

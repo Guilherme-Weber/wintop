@@ -55,7 +55,8 @@ pub const DEFAULT: Theme = Theme {
     neutral: Color::Rgb(108, 112, 128),
     fail: Color::Rgb(235, 80, 80),
     selected: Color::Rgb(48, 54, 70),
-    dim: Color::Rgb(60, 60, 70),
+    // Trilha vazia dos medidores mais apagada que o topo do gradiente (cheio nunca parece vazio).
+    dim: Color::Rgb(42, 44, 54),
     net_send: Color::Rgb(200, 120, 200),
     net_recv: Color::Rgb(92, 184, 228),
     fps: Color::Rgb(80, 200, 120),

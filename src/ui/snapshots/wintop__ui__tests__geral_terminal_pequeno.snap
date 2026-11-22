@@ -2,8 +2,8 @@
 source: src/ui/tests.rs
 expression: "render(&mut filled(), 80, 24)"
 ---
-" [1 Overview]   2 Processes    3 GPU    4 Sensors  interval 1000 ms  │  up 0d 05"
-"╭ cpu · AMD Ryzen 7 57 total 38s · 16 logical ╮╭ gpu · NVIDIA G active: encode ╮"
+" [1 Overview]   2 Processes    3 GPU    4 Sensors  - 1000 ms +  │  up 0d 05:08:0"
+"╭ cpu · AMD Ryzen 7 57 total 38s · 16 logical ╮╭ gpu · NVIDIA GeForce RTX 5070 ╮"
 "│33% kern 6%         C0 0% 3.60  C1 6% 3.66   ││73% encode 3D        9%  ■■■■■■│"
 "│min 0 · max 99      C2 12% 3.72  C3 18% 3.78 ││⣀⣀⣀⣾⣀⣀⣀⣠⣇  encode   73%  ■■■■■■│"
 "│⣶⣿⣀⣀⣀⣤⣴⣶⣾⢀⣀⣀⣤⣴⣶⣾⣇⣀⣀ C4 24% 3.84  C5 30% 3.90 ││⣿⣿⣿⣿⣿⣿⣿⣿⣿  decode   10%  ■■■■■■│"
@@ -25,4 +25,4 @@ expression: "render(&mut filled(), 80, 24)"
 "│                         ││⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶                          │"
 "│disconnected: Ethernet   ││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿  ⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤│"
 "╰─────────────────────────╯╰───────────────────────────────────────────────────╯"
-"wintop 0.01% 25.0 MB (33.0 MB commit)  │  collection 1.8 ms  │  sources: all OK "
+" 1-4 tabs  t theme  p pause  ? help  q quit     wintop 0.01% 25.0 MB  │  all OK "

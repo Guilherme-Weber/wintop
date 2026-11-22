@@ -776,9 +776,10 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("p, space", "pause the screen (collection keeps running)"),
     ("r", "reset session min/max and the game history"),
+    ("t", "next color theme"),
     (
-        "t",
-        "next color theme   d  fold/expand the Storage Space members",
+        "d",
+        "fold or expand the Storage Space members in the disk box",
     ),
     ("↑↓ j k", "select a row (PgUp/PgDn, Home/End)"),
     ("←→  i", "sort column / invert order (Processes, GPU)"),
@@ -920,14 +921,29 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let mut right = Vec::new();
     if st.paused {
         right.extend([
+            // Destaque sem a cor de falha (vermelho é só para erro); os colchetes valem em
+            // monocromático.
             Span::styled(
-                "PAUSED (p resumes)",
-                Style::new().fg(th().fail).add_modifier(Modifier::BOLD),
+                "[PAUSED · p resumes]",
+                Style::new()
+                    .fg(th().frametime)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             ),
             bar_sep(),
         ]);
     }
-    right.push(label(&format!("interval {} ms", st.interval_ms)));
+    // Intervalo com as teclas que o mudam ao lado (como o btop); some do rodapé.
+    right.extend([
+        Span::styled(
+            "- ",
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        ),
+        label(&format!("{} ms", st.interval_ms)),
+        Span::styled(
+            " +",
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        ),
+    ]);
     if let Some(s) = up {
         right.extend([
             bar_sep(),
@@ -960,12 +976,21 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     } else {
         vec![[key(" 1-4"), label(" tabs  ")]]
     };
+    // `d` só com Storage Space na tela, dizendo o que a tecla vai fazer agora.
+    let disks = st.fast.as_ref().and_then(|f| f.disks.as_ref().ok());
+    let pool = disks.is_some_and(|l| l.iter().any(|d| d.pool_member == Ok(true)));
+    let fold = if pool_folded(st, disks.map_or(0, Vec::len)) {
+        " expand pool  "
+    } else {
+        " fold pool  "
+    };
+    let overview: Vec<(&str, &str)> = if pool {
+        vec![("r", " reset min/max  "), ("d", fold), ("t", " theme  ")]
+    } else {
+        vec![("r", " reset min/max  "), ("t", " theme  ")]
+    };
     let pairs: &[(&str, &str)] = match st.tab {
-        Tab::Overview => &[
-            ("r", " reset min/max  "),
-            ("d", " fold pool  "),
-            ("t", " theme  "),
-        ],
+        Tab::Overview => &overview,
         Tab::Processes | Tab::Gpu if st.filtering => &[
             (" type", " to filter  "),
             ("enter", " keep  "),
@@ -1009,40 +1034,49 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         groups.push([key(k), label(l)]);
     }
     if !st.filtering {
+        groups.push([key("p"), label(" pause  ")]);
         groups.push([key("?"), label(" help  ")]);
-        groups.push([
-            key("+/-"),
-            label(&format!(" interval {} ms  ", st.interval_ms)),
-        ]);
         groups.push([key("q"), label(" quit")]);
     }
+    // Terminal estreito (o conhost do atalho abre com 120 colunas): o estado fica mais curto
+    // para sobrar espaço às teclas; uma falha aparece sempre inteira.
+    let narrow = area.width < 130;
     let mut right = Vec::new();
     if let Some(f) = &st.fast {
         match &f.own {
-            Ok(o) => right.extend([
-                label("wintop "),
-                metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
-                Span::raw(" "),
-                metric(&o.private_ws, |v| bytes(*v)),
-                label(" ("),
-                metric(&o.commit, |v| format!("{} commit", bytes(*v))),
-                label(")"),
-            ]),
+            Ok(o) => {
+                right.extend([
+                    label("wintop "),
+                    metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
+                    Span::raw(" "),
+                    metric(&o.private_ws, |v| bytes(*v)),
+                ]);
+                if !narrow || o.commit.is_err() {
+                    right.extend([
+                        label(" ("),
+                        metric(&o.commit, |v| format!("{} commit", bytes(*v))),
+                        label(")"),
+                    ]);
+                }
+            }
             Err(e) => right.extend([label("wintop "), missing(e)]),
         }
-        right.extend([
-            bar_sep(),
-            label(&format!(
-                "collection {} ms",
-                num(f.took.as_secs_f64() * 1e3, 1)
-            )),
-        ]);
+        if !narrow {
+            right.extend([
+                bar_sep(),
+                label(&format!(
+                    "collection {} ms",
+                    num(f.took.as_secs_f64() * 1e3, 1)
+                )),
+            ]);
+        }
     }
     let failing = failing_sources(st);
     if !right.is_empty() {
         right.push(bar_sep());
     }
     right.push(match failing {
+        0 if narrow => label("all OK "),
         0 => label("sources: all OK "),
         1 => Span::styled("! 1 source failing ", Style::new().fg(th().fail)),
         n => Span::styled(
@@ -1054,17 +1088,15 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let right = Line::from(right);
     let rw = (right.width() as u16).min(area.width);
     let room = usize::from(area.width.saturating_sub(rw).saturating_sub(2));
-    // Prioridade na falta de espaço: abas, sair, os atalhos da aba e por último o intervalo
-    // (que já aparece no topo); digitando o filtro só há os atalhos dele, na ordem. A ordem na
-    // tela continua a natural.
+    // Prioridade na falta de espaço: abas, sair, ajuda, pausa e depois os atalhos da aba;
+    // digitando o filtro só há os atalhos dele, na ordem. A ordem na tela continua a natural.
     let n = groups.len();
-    let mut priority: Vec<usize> = if st.filtering || n < 3 {
+    let mut priority: Vec<usize> = if st.filtering || n < 4 {
         (0..n).collect()
     } else {
-        [0, n - 1]
+        [0, n - 1, n - 2, n - 3]
             .into_iter()
-            .chain(1..n - 2)
-            .chain([n - 2])
+            .chain(1..n - 3)
             .collect()
     };
     priority.dedup();
@@ -1596,7 +1628,8 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .as_ref()
         .map_or_else(|_| "gpu".to_string(), |n| format!("gpu · {n}"));
     let block = with_failure(
-        boxed(&name, &format!("active: {engine}")),
+        // A engine ativa já está no cabeçalho do gráfico e no painel (em negrito).
+        boxed(&name, ""),
         g.name.as_ref().err(),
     );
     let inner = block.inner(area);
@@ -1670,7 +1703,7 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     .flatten()
     .collect();
     let engine_rows = rows.len();
-    rows.push((vec![label("session (r resets)")], None));
+    rows.push((vec![label("session")], None));
     let n0 = |v: f64| num(v, 0);
     rows.push(row("util", mm(st.session.gpu, &n0, "%")));
     rows.push(row("temp", mm(st.session.gpu_temp, &n0, " °C")));
@@ -1704,9 +1737,8 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let head = if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
         vec![
             text(format!("{engine_v}% ")).add_modifier(Modifier::BOLD),
+            // Mínimo e máximo do uso ficam no painel da sessão (`util`), uma vez só.
             Span::styled(engine.to_string(), Style::new().fg(engine_color(engine))),
-            sep(),
-            minmax(st.session.gpu, |v| format!("{}%", num(v, 0))),
         ]
     } else {
         vec![metric(&g.usage, |v| format!("{v}%"))]
@@ -1834,14 +1866,18 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
     let rows: Vec<Vec<Span<'static>>> = vec![
         match &g.physical {
             Ok([u, f, r, t]) => vec![
+                // O total físico é o mesmo da barra da VRAM: só aparece se diferir.
                 label("phys  "),
                 text(format!("{} used", bytes(*u))),
                 sep(),
                 text(format!("{} free", bytes(*f))),
                 sep(),
                 text(format!("{} reserved", bytes(*r))),
-                sep(),
-                text(format!("{} total (NVML)", bytes(*t))),
+                label(&if g.dedicated.as_ref().is_ok_and(|(_, tot)| tot == t) {
+                    " (NVML)".to_string()
+                } else {
+                    format!("  {} total (NVML)", bytes(*t))
+                }),
             ],
             Err(e) => vec![label("phys  "), missing(e)],
         },
@@ -2738,7 +2774,11 @@ fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         "disks",
         &format!(
             "S=sys P=page{}",
-            if members > 0 { "  [d] fold pool" } else { "" }
+            match (members > 0, folded) {
+                (false, _) => "",
+                (true, true) => "  [d] expand pool",
+                (true, false) => "  [d] fold pool",
+            }
         ),
     );
     let inner = block.inner(area);
@@ -3041,7 +3081,7 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             Line::from(label("graphs keep the last game until r")),
         ],
         (None, Err(e)) => vec![
-            Line::from(vec![label("idle: "), missing(e)]),
+            Line::from(vec![missing(e)]),
             Line::from(vec![
                 label("RTSS "),
                 metric(&fps.rtss, Clone::clone),
@@ -3063,7 +3103,8 @@ fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .flat_map(|l| wrap(l.spans, inner.width, 0, 2))
         .collect();
     let info_h = lines.len() as u16;
-    let idle = || label(if rtss_failed { "-" } else { "idle" });
+    // Sem jogo: só o "idle" do título; os cabeçalhos ficam com "-".
+    let idle = || label("-");
     let [graphs, info] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(info_h)]).areas(inner);
     put(frame, Paragraph::new(lines), info, info);

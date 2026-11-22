@@ -312,7 +312,9 @@ fn pct_cell(v: f64) -> (String, Style) {
     if v < 0.05 {
         return dim("0.0".into());
     }
-    (num(v, 1), Style::new().fg(gradient(v / 100.0)))
+    // Texto só até o meio do gradiente: o topo (índigo escuro no tema padrão) sumiria no fundo
+    // e na linha selecionada.
+    (num(v, 1), Style::new().fg(gradient((v / 100.0).min(0.55))))
 }
 
 fn rate(v: f64) -> (String, Style) {
