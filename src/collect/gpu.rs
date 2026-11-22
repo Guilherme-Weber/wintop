@@ -278,8 +278,13 @@ impl GpuCollector {
                 g
             })
             .collect::<Vec<Gpu>>();
-        // LUID trocado (reset do driver): associa de novo para a próxima coleta.
-        if out.iter().any(|g| lost_adapter(&g.dedicated))
+        // LUID trocado (reset do driver), ou a associação anterior falhou (a GPU sumiu do DXGI
+        // no meio do reset): associa de novo para a próxima coleta. GPUs idênticas (neutro) não.
+        if (out.iter().any(|g| lost_adapter(&g.dedicated))
+            || self
+                .gpus
+                .iter()
+                .any(|s| matches!(s.adapter, Err(Missing::Fail(_)))))
             && self.rematched.elapsed() >= REMATCH_EVERY
         {
             let shared_nvml = self.nvml.clone();
@@ -521,8 +526,14 @@ impl GpuSlowCollector {
                 }
             });
         }
-        // LUID trocado (reset do driver): associa de novo para a próxima coleta.
-        if out.iter().any(|g| lost_adapter(&g.vram)) && self.rematched.elapsed() >= REMATCH_EVERY {
+        // Como no coletor rápido: LUID trocado ou associação anterior em falha.
+        if (out.iter().any(|g| lost_adapter(&g.vram))
+            || self
+                .luids
+                .iter()
+                .any(|l| matches!(l, Err(Missing::Fail(_)))))
+            && self.rematched.elapsed() >= REMATCH_EVERY
+        {
             self.rematched = Instant::now();
             self.luids = slow_luids(nvml);
         }

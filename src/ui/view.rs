@@ -221,13 +221,16 @@ impl State {
             // em vez de "waiting" (dado novo, se vier, substitui).
             // Só nas abas que mostram a lista: na Geral nada a limparia (a coleta para) e a
             // falha ficaria presa no rodapé.
+            // A lista da GPU herda a falha da coleta da GPU (não a dos processos).
             if matches!(t, Tab::Processes | Tab::Gpu)
                 && let Some(Some(Err(e))) = self.slow.as_ref().map(|s| &s.procs)
             {
                 self.procs = Some(Err(e.clone()));
-                if t == Tab::Gpu {
-                    self.gpu_procs = Some(Err(e.clone()));
-                }
+            }
+            if t == Tab::Gpu
+                && let Some(Err(e)) = self.slow.as_ref().map(|s| &s.gpus)
+            {
+                self.gpu_procs = Some(Err(e.clone()));
             }
         }
     }
@@ -807,11 +810,11 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let rw = (right.width() as u16).min(area.width);
     let room = usize::from(area.width.saturating_sub(rw).saturating_sub(2));
     // Prioridade na falta de espaço: abas, sair, os atalhos da aba e por último o intervalo
-    // (que já aparece no topo); digitando o filtro, os atalhos dele vêm antes de tudo. A ordem
-    // na tela continua a natural.
+    // (que já aparece no topo); digitando o filtro só há os atalhos dele, na ordem. A ordem na
+    // tela continua a natural.
     let n = groups.len();
-    let mut priority: Vec<usize> = if st.filtering {
-        (1..n - 2).chain([0, n - 1, n - 2]).collect()
+    let mut priority: Vec<usize> = if st.filtering || n < 3 {
+        (0..n).collect()
     } else {
         [0, n - 1]
             .into_iter()

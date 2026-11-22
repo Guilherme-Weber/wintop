@@ -232,15 +232,20 @@ fn secure_owner_tree(path: &Path) -> Result<(), String> {
 }
 
 /// Arquivo de outro programa que o wintop elevado executa ou carrega (RTSS.exe, PawnIOLib.dll):
-/// nem ele nem a pasta dele podem ser links ou alteráveis sem elevação (um RTSS instalado numa
-/// pasta do usuário viraria um jeito de rodar código como administrador pelo atalho sem UAC).
+/// nem ele nem as pastas acima dele podem ser links ou alteráveis sem elevação (um RTSS numa
+/// pasta do usuário, ou abaixo de uma que o usuário renomeia, viraria um jeito de rodar código
+/// como administrador pelo atalho sem UAC). A raiz do volume só não pode ser link: nela
+/// Usuários criam pastas, mas não renomeiam nem apagam as existentes.
 pub fn trusted_file(file: &Path) -> Result<(), String> {
-    let dir = file
-        .parent()
-        .ok_or_else(|| format!("{} has no folder", file.display()))?;
-    for p in [dir, file] {
+    if file.parent().is_none() {
+        return Err(format!("{} has no folder", file.display()));
+    }
+    for p in file.ancestors() {
         if is_link(p) {
             return Err(format!("{} is a link (refused)", p.display()));
+        }
+        if p.parent().is_none() {
+            break;
         }
         let problems = unsafe_acl(p)?;
         if !problems.is_empty() {
@@ -406,13 +411,9 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
-const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
-
-/// Copia só a lista fechada de `modules\`, sem seguir links: a pasta de origem (ex.: o zip
-/// extraído em Downloads) é do usuário, e uma junction nela faria o instalador elevado copiar
-/// arquivos protegidos para uma pasta que Usuários leem. O módulo é obrigatório.
-fn copy_modules(from: &Path, to: &Path) -> Result<(), String> {
+/// A pasta `modules\` de origem: não é link, tem o módulo, e cada arquivo da lista que existe
+/// é um arquivo comum.
+fn check_modules(from: &Path) -> Result<(), String> {
     if is_link(from) {
         return Err(format!("{} is a link (refused)", from.display()));
     }
@@ -422,14 +423,28 @@ fn copy_modules(from: &Path, to: &Path) -> Result<(), String> {
             from.join(MODULE_FILES[0]).display()
         ));
     }
+    for f in MODULE_FILES {
+        let src = from.join(f);
+        if src.exists() && (is_link(&src) || !src.is_file()) {
+            return Err(format!("{} is not a plain file (refused)", src.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
+const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
+
+/// Copia só a lista fechada de `modules\`, sem seguir links: a pasta de origem (ex.: o zip
+/// extraído em Downloads) é do usuário, e uma junction nela faria o instalador elevado copiar
+/// arquivos protegidos para uma pasta que Usuários leem. O módulo é obrigatório.
+fn copy_modules(from: &Path, to: &Path) -> Result<(), String> {
+    check_modules(from)?;
     std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
     for f in MODULE_FILES {
         let src = from.join(f);
         if !src.exists() {
             continue;
-        }
-        if is_link(&src) || !src.is_file() {
-            return Err(format!("{} is not a plain file (refused)", src.display()));
         }
         std::fs::copy(&src, to.join(f)).map_err(|e| format!("{}: {e}", src.display()))?;
     }
@@ -512,6 +527,9 @@ pub fn install() -> Result<(), String> {
     secure(&dir, true)?;
     check_tree(&dir)?;
     if !same_file(&me, &exe) {
+        // A origem é conferida antes de qualquer cópia: uma falha não deixa o exe novo pela
+        // metade da instalação.
+        check_modules(&here.join("modules"))?;
         std::fs::copy(&me, &exe).map_err(|e| format!("copy to {}: {e}", exe.display()))?;
         copy_modules(&here.join("modules"), &dir.join("modules"))?;
         println!("copied to {}", dir.display());

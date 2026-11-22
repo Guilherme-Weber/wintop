@@ -316,6 +316,10 @@ impl UserDir {
                 base.display()
             ));
         }
+        // A base também ancorada antes de criar a subpasta: um AppData redirecionado para uma
+        // pasta vazia do usuário poderia virar junction e o CreateDirectoryW criaria a pasta no
+        // alvo. Solta quando a subpasta estiver aberta e ancorada (ela prende a base).
+        let base_pin = pin_file(base)?;
         let path = base.join(name);
         if create {
             let w = wide(&path.to_string_lossy());
@@ -333,6 +337,7 @@ impl UserDir {
         // arquivo criado ou trocado nela não vai parar no alvo de uma junction posta depois da
         // conferência. A base também fica presa: a subpasta aberta não a deixa esvaziar.
         let pin = pin_file(&path)?;
+        drop(base_pin);
         Ok(Some(Self {
             _base: b,
             dir,

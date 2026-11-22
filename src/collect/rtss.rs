@@ -884,7 +884,8 @@ impl RtssCollector {
         // tabela do RTSS guarda apps fechados e, com uma Shared Memory falsa, até 256 entradas
         // (256 × 60 mil frames). Um jogo travado continua entre os mais recentes.
         let mut active: Vec<&App> = ok.iter().copied().filter(|a| a.api != 0).collect();
-        active.sort_by_key(|a| a.age_ms.unwrap_or(u32::MAX));
+        // O app em primeiro plano sempre entra (pausado, ele envelhece mais que os outros).
+        active.sort_by_key(|a| (Some(a.pid) != fg, a.age_ms.unwrap_or(u32::MAX)));
         active.truncate(MAX_KNOWN);
         self.known = active.iter().map(|a| a.index).collect();
         self.ignored = ign.iter().map(|a| a.index).collect();
