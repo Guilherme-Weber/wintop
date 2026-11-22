@@ -86,6 +86,8 @@ pub struct Config {
     pub net_bytes: bool,
     /// Mouse na interface (clique nas abas, nas linhas e no cabeçalho; rodinha nas listas).
     pub mouse: bool,
+    /// Maximizar a janela do console clássico ao abrir (o atalho abre o conhost com 120x30).
+    pub start_maximized: bool,
 }
 
 /// Faixa aceita do limite de alerta do frametime (ms).
@@ -106,6 +108,7 @@ impl Default for Config {
             frametime_alert_ms: DEFAULT_FRAMETIME_ALERT_MS,
             net_bytes: false,
             mouse: true,
+            start_maximized: true,
         }
     }
 }
@@ -140,6 +143,10 @@ fn template(c: &Config) -> String {
          # select text in the terminal with Shift+drag.\n\
          mouse = {}\n\
          \n\
+         # Maximize the classic console window on start (the no-UAC shortcut opens it at\n\
+         # 120x30). The Windows Terminal is not touched.\n\
+         start_maximized = {}\n\
+         \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
          ignored = [\n{}]\n\
@@ -153,6 +160,7 @@ fn template(c: &Config) -> String {
         c.frametime_alert_ms,
         if c.net_bytes { "bytes" } else { "bits" },
         c.mouse,
+        c.start_maximized,
         ignored.concat()
     )
 }
@@ -296,6 +304,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             Some("bits") => c.net_bytes = false,
             Some("bytes") => c.net_bytes = true,
             _ => warn.push("config: net_unit must be bits or bytes".into()),
+        }
+    }
+    if let Some(v) = doc.get("start_maximized") {
+        match v.as_bool() {
+            Some(b) => c.start_maximized = b,
+            None => warn.push("config: start_maximized must be true or false".into()),
         }
     }
     if let Some(v) = doc.get("mouse") {

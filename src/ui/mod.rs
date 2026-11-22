@@ -29,6 +29,14 @@ pub fn run(
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
+    // Antes da tela alternativa: o tamanho novo da janela já vale no primeiro desenho.
+    if cfg.config.start_maximized {
+        crate::win::maximize_classic_console();
+    }
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::SetTitle("wintop")
+    );
     let mut terminal = ratatui::try_init()?;
     // O hook do ratatui restaura o terminal em qualquer pânico, inclusive nos que os coletores
     // já capturam (catch_unwind) e mostram como falha: aí a TUI seguiria desenhando com o

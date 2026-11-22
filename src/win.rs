@@ -259,6 +259,29 @@ pub fn profile_dir() -> Option<PathBuf> {
     is_local_absolute(&p).then_some(p)
 }
 
+/// Maximiza a janela do console clássico (conhost, onde o atalho sem UAC abre o wintop com
+/// 120x30). No Windows Terminal a janela do console é um pseudoconsole oculto: nada muda.
+/// Devolve se maximizou.
+pub fn maximize_classic_console() -> bool {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_MAXIMIZE, ShowWindow};
+    // SAFETY: sem pré-condições; janela nula = sem console.
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let mut buf = [0u16; 64];
+    // SAFETY: janela válida e buffer local com o tamanho informado.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    if String::from_utf16_lossy(&buf[..n.min(buf.len())]) != "ConsoleWindowClass" {
+        return false;
+    }
+    // SAFETY: janela do console deste processo. O retorno diz se ela estava visível antes,
+    // não se deu certo.
+    let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    true
+}
+
 /// `FILETIME` em unidades de 100 ns.
 pub fn filetime(ft: FILETIME) -> u64 {
     (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
