@@ -37,15 +37,107 @@ pub fn run(
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
+            set_mouse(false);
             ratatui_hook(info);
         }
     }));
+    set_mouse(cfg.config.mouse);
     let engine = start();
     let result = event_loop(&mut terminal, &engine, stop, &mut cfg);
     // Threads paradas (handles fechados, PawnIO e NVML liberados) antes de restaurar.
     drop(engine);
+    set_mouse(false);
     ratatui::restore();
     result
+}
+
+/// Liga ou desliga a captura do mouse no terminal (sempre desligada ao sair, inclusive num
+/// pânico: senão o terminal fica sem seleção de texto).
+fn set_mouse(on: bool) {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use ratatui::crossterm::execute;
+    let mut out = std::io::stdout();
+    let _ = if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    };
+}
+
+/// Clique e rodinha: abas, linhas e cabeçalho das listas (o mesmo que as teclas fazem).
+/// Devolve (redesenhar, a aba mudou).
+fn on_mouse(st: &mut view::State, m: event::MouseEvent) -> (bool, bool) {
+    use event::{MouseButton, MouseEventKind};
+    let lists = matches!(st.tab, view::Tab::Processes | view::Tab::Gpu);
+    match m.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if lists => {
+            let cursor = if st.tab == view::Tab::Processes {
+                &mut st.proc_cursor
+            } else {
+                &mut st.gpu_cursor
+            };
+            if m.kind == MouseEventKind::ScrollDown {
+                cursor.down(3);
+            } else {
+                cursor.up(3);
+            }
+            (true, false)
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(&(_, _, t)) = st
+                .hits
+                .tabs
+                .iter()
+                .find(|(a, b, _)| m.row == 0 && (*a..*b).contains(&m.column))
+            {
+                st.set_tab(t);
+                return (true, true);
+            }
+            let Some(h) = &st.hits.list else {
+                return (false, false);
+            };
+            if m.row == h.header_y {
+                let Some(&(_, _, col)) =
+                    h.cols.iter().find(|(a, b, _)| (*a..*b).contains(&m.column))
+                else {
+                    return (false, false);
+                };
+                // Clique na coluna da ordem inverte; em outra, ordena por ela.
+                if st.tab == view::Tab::Processes {
+                    if let Some(s) = view::ProcSort::from_index(col) {
+                        if s == st.proc_sort {
+                            st.proc_reverse = !st.proc_reverse;
+                        } else {
+                            st.proc_sort = s;
+                            st.proc_reverse = false;
+                        }
+                    }
+                } else if let Some(s) = view::GpuSort::from_index(col) {
+                    if s == st.gpu_sort {
+                        st.gpu_reverse = !st.gpu_reverse;
+                    } else {
+                        st.gpu_sort = s;
+                        st.gpu_reverse = false;
+                    }
+                }
+                return (true, false);
+            }
+            let b = h.body;
+            if (b.y..b.y + b.height).contains(&m.row) && (b.x..b.x + b.width).contains(&m.column) {
+                let i = h.offset + usize::from(m.row - b.y);
+                if i < h.len {
+                    if st.tab == view::Tab::Processes {
+                        st.proc_cursor.select(i);
+                    } else {
+                        st.gpu_cursor.select(i);
+                    }
+                    return (true, false);
+                }
+            }
+            (false, false)
+        }
+        _ => (false, false),
+    }
 }
 
 /// Espera por tecla: metade do intervalo (entre 25 e 100 ms), para não perder coletas.
@@ -255,6 +347,13 @@ fn event_loop(
                     code => dirty |= list_key(&mut st, code, &jobs_tx),
                 },
                 Event::Resize(..) => dirty = true,
+                Event::Mouse(m) if !st.help && st.confirm_end.is_none() => {
+                    let (redraw, tab_changed) = on_mouse(&mut st, m);
+                    if tab_changed {
+                        engine.set_view(st.view());
+                    }
+                    dirty |= redraw;
+                }
                 _ => {}
             }
             if !event::poll(Duration::ZERO)? {
@@ -296,6 +395,7 @@ fn apply_config(st: &mut view::State, engine: &Engine, cfg: &crate::config::Load
     st.frametime_alert_ms = c.frametime_alert_ms;
     st.net_bytes = c.net_bytes;
     engine.set_rtss_ignored(c.rtss_ignored.clone());
+    set_mouse(c.mouse);
     st.notice = cfg.warnings.first().cloned();
 }
 

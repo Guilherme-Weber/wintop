@@ -26,7 +26,7 @@ use crate::win::printable;
 
 pub(super) mod tabs;
 
-pub use tabs::{Cursor, ProcSort};
+pub use tabs::{Cursor, GpuSort, ProcSort};
 
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
 const HISTORY: usize = 1000;
@@ -166,6 +166,8 @@ pub struct State {
     pub proc_reverse: bool,
     /// Árvore de processos (tecla `e`), sem filtro.
     pub proc_tree: bool,
+    /// Áreas clicáveis do último desenho (mouse).
+    pub hits: Hits,
     pub filter: String,
     /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
     pub filtering: bool,
@@ -647,6 +649,7 @@ fn temp(m: &Metric<f64>) -> Span<'static> {
 // --- Layout ---
 
 pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
+    st.hits = Hits::default();
     // Aviso do config (arquivo com erro, gravação recusada): linhas próprias acima do rodapé,
     // inteiras, sem disputar espaço com o estado das fontes.
     let mut notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
@@ -704,6 +707,25 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     if let Some((pid, name, _)) = &st.confirm_end {
         draw_confirm_end(frame, body, *pid, name);
     }
+}
+
+/// Onde cada coisa clicável ficou no último desenho (o mouse só acelera o que o teclado faz).
+#[derive(Default)]
+pub struct Hits {
+    /// Abas na barra do topo: (coluna inicial, coluna final exclusiva, aba).
+    pub tabs: Vec<(u16, u16, Tab)>,
+    /// Lista da aba Processos ou GPU.
+    pub list: Option<ListHit>,
+}
+
+pub struct ListHit {
+    /// Linha do cabeçalho e as colunas visíveis: (início, fim exclusivo, índice da coluna).
+    pub header_y: u16,
+    pub cols: Vec<(u16, u16, usize)>,
+    /// Linhas de dados visíveis e a primeira linha da lista que aparece nelas.
+    pub body: Rect,
+    pub offset: usize,
+    pub len: usize,
 }
 
 /// Tempo em que a mensagem de uma ação fica na tela.
@@ -860,7 +882,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     draw_game(frame, game, st);
 }
 
-fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
+fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let tab = |n: &str, name: &str, t: Tab| -> Span<'static> {
         if st.tab == t {
             Span::styled(
@@ -871,12 +893,22 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &State) {
             label(&format!("  {n} {name}  "))
         }
     };
-    let tabs = Line::from(vec![
+    let spans = vec![
         tab("1", "Overview", Tab::Overview),
         tab("2", "Processes", Tab::Processes),
         tab("3", "GPU", Tab::Gpu),
         tab("4", "Sensors", Tab::Sensors),
-    ]);
+    ];
+    let mut x = area.x;
+    for (sp, t) in spans
+        .iter()
+        .zip([Tab::Overview, Tab::Processes, Tab::Gpu, Tab::Sensors])
+    {
+        let w = sp.width() as u16;
+        st.hits.tabs.push((x, x + w, t));
+        x += w;
+    }
+    let tabs = Line::from(spans);
     let tw = (tabs.width() as u16).min(area.width);
     let [left, rest] = Layout::horizontal([Constraint::Length(tw), Constraint::Min(0)]).areas(area);
     frame.render_widget(Paragraph::new(tabs), left);

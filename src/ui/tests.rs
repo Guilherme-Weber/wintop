@@ -1278,3 +1278,57 @@ fn arvore_de_processos() {
         ]
     );
 }
+
+#[test]
+fn mouse_abas_cabecalho_linhas_e_rodinha() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let ev = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let click = |c, r| ev(MouseEventKind::Down(MouseButton::Left), c, r);
+    let mut st = tab_state(view::Tab::Processes);
+    let _ = render(&mut st, 160, 48);
+    // Clique na aba GPU (na barra do topo).
+    let (x0, _, _) = *st
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, _, t)| *t == view::Tab::Gpu)
+        .expect("aba GPU");
+    assert_eq!(super::on_mouse(&mut st, click(x0 + 1, 0)), (true, true));
+    assert_eq!(st.tab, view::Tab::Gpu);
+    // Volta à aba Processos com a lista já coletada.
+    let mut st = tab_state(view::Tab::Processes);
+    let _ = render(&mut st, 160, 48);
+    let h = st.hits.list.as_ref().expect("lista desenhada");
+    let (hy, body) = (h.header_y, h.body);
+    let (name_x, _, _) = *h
+        .cols
+        .iter()
+        .find(|(_, _, i)| *i == 1)
+        .expect("coluna Name");
+    // Cabeçalho: Name ordena; de novo, inverte.
+    let _ = super::on_mouse(&mut st, click(name_x, hy));
+    assert_eq!(st.proc_sort, view::ProcSort::from_index(1).expect("Name"));
+    let _ = super::on_mouse(&mut st, click(name_x, hy));
+    assert!(st.proc_reverse);
+    // Linha: a 3ª linha visível fica selecionada.
+    let _ = super::on_mouse(&mut st, click(body.x + 2, body.y + 2));
+    let _ = render(&mut st, 160, 48);
+    let sel = st.selected_proc().expect("selecionado");
+    let rows = super::view::tabs::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
+    assert_eq!(sel.pid, rows[2].0.pid);
+    // Rodinha: desce 3 linhas.
+    let _ = super::on_mouse(&mut st, ev(MouseEventKind::ScrollDown, 10, 10));
+    let _ = render(&mut st, 160, 48);
+    let after = st.selected_proc().expect("selecionado");
+    let rows = super::view::tabs::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
+    let pos = rows
+        .iter()
+        .position(|(p, _)| p.pid == after.pid)
+        .expect("na lista");
+    assert_eq!(pos, (2 + 3).min(rows.len() - 1));
+}

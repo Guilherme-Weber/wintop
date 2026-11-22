@@ -84,6 +84,8 @@ pub struct Config {
     pub frametime_alert_ms: f64,
     /// Unidade da rede: bits por segundo (como o Task Manager) ou bytes.
     pub net_bytes: bool,
+    /// Mouse na interface (clique nas abas, nas linhas e no cabeçalho; rodinha nas listas).
+    pub mouse: bool,
 }
 
 /// Faixa aceita do limite de alerta do frametime (ms).
@@ -103,6 +105,7 @@ impl Default for Config {
             colors: Vec::new(),
             frametime_alert_ms: DEFAULT_FRAMETIME_ALERT_MS,
             net_bytes: false,
+            mouse: true,
         }
     }
 }
@@ -133,6 +136,10 @@ fn template(c: &Config) -> String {
          # Network rates in \"bits\" per second (like Task Manager) or \"bytes\".\n\
          net_unit = \"{}\"\n\
          \n\
+         # Mouse: click tabs, rows and column headers, wheel scrolls the lists. With it on,\n\
+         # select text in the terminal with Shift+drag.\n\
+         mouse = {}\n\
+         \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
          ignored = [\n{}]\n\
@@ -145,6 +152,7 @@ fn template(c: &Config) -> String {
         c.fold_pool.name(),
         c.frametime_alert_ms,
         if c.net_bytes { "bytes" } else { "bits" },
+        c.mouse,
         ignored.concat()
     )
 }
@@ -288,6 +296,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             Some("bits") => c.net_bytes = false,
             Some("bytes") => c.net_bytes = true,
             _ => warn.push("config: net_unit must be bits or bytes".into()),
+        }
+    }
+    if let Some(v) = doc.get("mouse") {
+        match v.as_bool() {
+            Some(b) => c.mouse = b,
+            None => warn.push("config: mouse must be true or false".into()),
         }
     }
     if doc.get("rtss").is_some_and(|t| t.as_table_like().is_none()) {

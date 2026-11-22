@@ -67,6 +67,12 @@ impl Cursor {
         self.pending = isize::MAX / 2;
     }
 
+    /// Seleciona a linha `i` (clique do mouse).
+    pub fn select(&mut self, i: usize) {
+        self.index = i;
+        self.pending = 0;
+    }
+
     /// PID selecionado no último desenho.
     #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
@@ -278,6 +284,21 @@ fn header(cols: &[Col], widths: &[Option<u16>], sorted: Option<(usize, bool)>) -
     row(cols, widths, cells)
 }
 
+/// Colunas visíveis na tela: (início, fim exclusivo, índice da coluna), a partir de `x`.
+fn col_ranges(x: u16, widths: &[Option<u16>]) -> Vec<(u16, u16, usize)> {
+    let mut out = Vec::new();
+    let mut at = x;
+    for (i, w) in widths.iter().enumerate() {
+        let Some(w) = w else { continue };
+        if !out.is_empty() {
+            at += 1;
+        }
+        out.push((at, at + w, i));
+        at += w;
+    }
+    out
+}
+
 fn plain(s: String) -> (String, Style) {
     (s, Style::new().fg(th().text))
 }
@@ -339,6 +360,11 @@ impl ProcSort {
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    /// Coluna pelo índice em `PROC_COLS` (clique no cabeçalho).
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
     }
 
     pub fn next(self) -> Self {
@@ -518,6 +544,13 @@ pub(super) fn draw_processes(frame: &mut Frame<'_>, area: Rect, st: &mut State) 
     let body_h = usize::from(inner.height - 1);
     let pids: Vec<u32> = rows.iter().map(|(p, _)| p.pid).collect();
     let (sel, offset) = st.proc_cursor.resolve(&pids, body_h);
+    st.hits.list = Some(super::ListHit {
+        header_y: head.y,
+        cols: col_ranges(inner.x, &widths),
+        body: Rect::new(inner.x, inner.y + 1, inner.width, body_h as u16),
+        offset,
+        len: rows.len(),
+    });
     if rows.is_empty() {
         note(
             frame,
@@ -625,6 +658,11 @@ impl GpuSort {
         Self::Shared,
         Self::Paged,
     ];
+
+    /// Coluna pelo índice em `GPU_COLS` (clique no cabeçalho); `CPU% · RAM` não ordena.
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
 
     /// Índice da coluna em `GPU_COLS` (as duas listas estão na mesma ordem).
     fn index(self) -> usize {
@@ -797,6 +835,13 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     let body_h = usize::from(table_h.saturating_sub(1));
     let (sel, offset) = st.gpu_cursor.resolve(&pids, body_h);
+    st.hits.list = Some(super::ListHit {
+        header_y: table_y,
+        cols: col_ranges(inner.x, &widths),
+        body: Rect::new(inner.x, table_y + 1, inner.width, body_h as u16),
+        offset,
+        len: rows.len(),
+    });
     let procs: std::collections::HashMap<u32, &Proc> = match &st.procs {
         Some(Ok(l)) => l.iter().map(|p| (p.pid, p)).collect(),
         _ => std::collections::HashMap::new(),
