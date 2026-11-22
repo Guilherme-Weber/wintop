@@ -39,7 +39,7 @@ pub fn darker(c: Color) -> Color {
             let k = if top <= 0.0 {
                 0.5
             } else {
-                (64.0 / top).max(0.5).min(1.0)
+                (64.0 / top).clamp(0.5, 1.0)
             };
             let f = |c: u8| (f64::from(c) * k).round() as u8;
             Color::Rgb(f(r), f(g), f(b))
