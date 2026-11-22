@@ -29,11 +29,13 @@ const PREDICT_SIZE: usize = 516;
 const NATIVE_EVERY: Duration = Duration::from_secs(10);
 const SMART_EVERY: Duration = Duration::from_secs(60);
 const REDISCOVER: Duration = Duration::from_secs(60);
-/// Falha do SMART com leitura boa antes: mantém o último valor e tenta de novo mais cedo; só
-/// depois de `SMART_TOLERATED` falhas seguidas a métrica vira falha (SSD SATA em economia de
-/// energia recusa a consulta de vez em quando).
+/// Falha do SMART com leitura boa antes: mantém o último valor (SSD SATA em economia de energia
+/// recusa a consulta às vezes por minutos, e o disco está bem). As primeiras `SMART_QUICK`
+/// tentativas vêm a cada `SMART_RETRY`, depois no ritmo normal; só sem nenhuma leitura boa por
+/// `SMART_GRACE` a métrica vira falha.
 const SMART_RETRY: Duration = Duration::from_secs(10);
-const SMART_TOLERATED: u8 = 3;
+const SMART_QUICK: u8 = 3;
+const SMART_GRACE: Duration = Duration::from_secs(600);
 
 /// Primeira temperatura reportada (índice 0 = composta no NVMe), ignorando "não reportado".
 fn native_temp(b: &[u8]) -> Option<i16> {
@@ -77,6 +79,8 @@ struct State {
     source: &'static str,
     /// Falhas seguidas do SMART desde a última leitura boa.
     smart_fails: u8,
+    /// Última leitura boa do SMART.
+    smart_ok_at: Option<Instant>,
     /// Previsão de falha do SMART (`PredictFailure`): `Ok(true)` = o disco prevê falha.
     health: Metric<bool>,
     health_at: Option<Instant>,
@@ -90,6 +94,7 @@ impl State {
             value: fail("not read yet"),
             source: "",
             smart_fails: 0,
+            smart_ok_at: None,
             health: neutral("not read yet"),
             health_at: None,
         }
@@ -97,7 +102,7 @@ impl State {
 
     fn due(&self, now: Instant) -> bool {
         let every = match self.method {
-            Method::Smart if self.smart_fails > 0 => SMART_RETRY,
+            Method::Smart if (1..=SMART_QUICK).contains(&self.smart_fails) => SMART_RETRY,
             Method::Smart | Method::None => SMART_EVERY,
             Method::Unknown | Method::Native => NATIVE_EVERY,
         };
@@ -271,7 +276,12 @@ fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
     read_temp(d, st, meta);
     if !d.lost && st.health_at.is_none_or(|t| t.elapsed() >= SMART_EVERY) {
         st.health_at = Some(Instant::now());
-        st.health = predict_failure(d.number);
+        // Uma consulta recusada não apaga um "OK" já lido (o disco não ficou doente por isso);
+        // uma previsão de falha lida de verdade sempre aparece.
+        let h = predict_failure(d.number);
+        if h.is_ok() || st.health.is_err() {
+            st.health = h;
+        }
     }
 }
 
@@ -326,6 +336,7 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
         Ok((id, c)) => {
             st.method = Method::Smart;
             st.smart_fails = 0;
+            st.smart_ok_at = Some(Instant::now());
             st.value = Ok(i16::from(c));
             st.source = if id == 194 { "SMART 194" } else { "SMART 190" };
         }
@@ -338,11 +349,9 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
                 st.method = Method::None;
             }
             // Falha passageira depois de leituras boas: segura o último valor por enquanto.
-            if st.method == Method::Smart && st.value.is_ok() && !d.lost {
+            if smart_tolerated(st, d.lost, Instant::now()) {
                 st.smart_fails = st.smart_fails.saturating_add(1);
-                if st.smart_fails < SMART_TOLERATED {
-                    return;
-                }
+                return;
             }
             // Falha persistente: volta ao ritmo normal do SMART.
             st.smart_fails = 0;
@@ -351,9 +360,39 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
     }
 }
 
+/// Falha do SMART que não aparece: já houve leitura boa há menos de `SMART_GRACE` e o disco
+/// continua lá.
+fn smart_tolerated(st: &State, lost: bool, now: Instant) -> bool {
+    st.method == Method::Smart
+        && st.value.is_ok()
+        && !lost
+        && st
+            .smart_ok_at
+            .is_some_and(|t| now.duration_since(t) < SMART_GRACE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smart_recusado_por_minutos_nao_vira_falha() {
+        let mut st = State::new();
+        st.method = Method::Smart;
+        st.value = Ok(37);
+        let t0 = Instant::now();
+        st.smart_ok_at = Some(t0);
+        // Recusas por 9 minutos: o último valor fica.
+        assert!(smart_tolerated(&st, false, t0 + Duration::from_secs(540)));
+        // Passou do prazo, ou o disco sumiu: aparece.
+        assert!(!smart_tolerated(&st, false, t0 + SMART_GRACE));
+        assert!(!smart_tolerated(&st, true, t0));
+        // Depois das tentativas rápidas, volta ao ritmo normal (sem consultar a cada 10 s).
+        st.last = Some(t0);
+        st.smart_fails = SMART_QUICK + 1;
+        assert!(!st.due(t0 + SMART_RETRY));
+        assert!(st.due(t0 + SMART_EVERY));
+    }
 
     #[test]
     fn temperatura_nativa_ignora_nao_reportado() {

@@ -6,6 +6,15 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Corrigido
+
+- CPU: um processador lógico sem dado válido numa coleta do PDH saía da lista; uso, kernel e
+  clock por lógico ficavam com tamanhos diferentes (falha piscando) e a grade de gráficos da CPU
+  era recriada, perdendo o histórico. Agora ele mantém a posição com o último valor válido.
+- Temperatura e saúde de SSD SATA que recusa a consulta SMART em economia de energia: o último
+  valor bom fica por até 10 minutos (antes, ~30 s) e uma consulta recusada não apaga o "OK" da
+  saúde; só sem nenhuma leitura boa nesse prazo a falha aparece.
+
 ## [1.2.0] - 2026-11-22
 
 ### Adicionado
