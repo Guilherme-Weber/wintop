@@ -21,7 +21,7 @@ expression: "format!(\"{p}\\n{g}\\n{s}\")"
 
 "  1 Geral    2 Processos   [3 GPU]   4 Sensores                                                                                   - 1000 ms +  │  up 0d 05:08:00"
 "╭ processos da gpu · NVIDIA GeForce RTX 5070 Ti ────────────────────────────────────────────────────────────────────────────────────────────────── 4 processos ╮"
-"│VRAM   ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 11,0 GB / 15,9 GB (69%)│"
+"│VRAM   ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ 11,0 GB / 15,9 GB (69%)│"
 "│       ■ app 2,0G  ■ compositor 859M  ■ browser 638M  ■ system 105M  ■ kernel 4,0M  ■ livre 5,0G                                                              │"
 "│adapter  3D/compute 9%  │  encoder 73%  │  decoder 10%  │  memory activity 8%  │  outra engine copy 12%                                                       │"
 "│    PID Nome                                                         GPU%▼    3D  Copy   Enc   Dec  Comp       VRAM   Compart.   Paginada         CPU% · RAM  │"

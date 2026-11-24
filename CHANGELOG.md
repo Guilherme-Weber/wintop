@@ -6,6 +6,14 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Alterado
+
+- Barras horizontais (`RAM`, `commit`, `pagefile`, `VRAM` e `shared`) convertidas de blocos sólidos
+  (`■`) para braille (`⡇`/`⣿`, com trilha apagada em `dim`), alinhadas ao padrão visual dos
+  gráficos e dos termômetros verticais.
+- Caixa de rede invertida para mostrar download (`↓ receive`) na metade superior e upload
+  (`↑ send`) na metade inferior, mantendo a mesma ordem no cabeçalho e na linha de taxas.
+
 ## [1.3.0] - 2026-11-24
 
 ### Adicionado

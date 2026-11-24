@@ -1,5 +1,5 @@
-//! Widgets no estilo do btop: gráfico em braille preenchido (2 amostras por célula, 4 níveis
-//! por linha) e medidor de blocos com o gradiente do tema (baixo → meio → alto).
+//! Widgets no estilo do btop: gráfico e medidores em braille (2 amostras por célula, 4 níveis
+//! por linha) com o gradiente do tema (baixo → meio → alto).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -266,7 +266,8 @@ impl Widget for Graph<'_> {
     }
 }
 
-/// Medidor de blocos (`■`): parte cheia com o gradiente pela posição, resto apagado.
+/// Medidor horizontal em braille (`⡇`, `⣿`): parte cheia com o gradiente pela posição (resolução
+/// de 2 colunas de pontos por célula) e trilha apagada (`⣿` em `dim`).
 pub struct Meter {
     /// 0..=1.
     pub value: f64,
@@ -283,16 +284,29 @@ impl Widget for Meter {
         } else {
             0.0
         };
-        let filled = (v * w as f64).round() as usize;
+        let max_steps = w * 2;
+        let steps = if v <= 0.0 {
+            0
+        } else {
+            ((v * max_steps as f64).round() as usize).clamp(1, max_steps)
+        };
+        let dim = crate::ui::theme::th().dim;
         for i in 0..w {
-            let style = if i < filled {
-                Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64))
-            } else {
-                Style::new().fg(crate::ui::theme::th().dim)
+            let fill = steps.saturating_sub(i * 2).min(2);
+            let (sym, style) = match fill {
+                0 => ("⣿", Style::new().fg(dim)),
+                1 => (
+                    "⡇",
+                    Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64)),
+                ),
+                _ => (
+                    "⣿",
+                    Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64)),
+                ),
             };
             // Só dentro do buffer (área parcialmente fora da tela num terminal pequeno).
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
-                cell.set_symbol("■").set_style(style);
+                cell.set_symbol(sym).set_style(style);
             }
         }
     }
@@ -405,8 +419,16 @@ mod tests {
         let area = Rect::new(0, 0, 4, 1);
         let mut buf = Buffer::empty(area);
         Meter { value: 0.5 }.render(area, &mut buf);
+        assert_eq!(buf[(1, 0)].symbol(), "⣿");
         assert_eq!(buf[(1, 0)].fg, gradient(1.0 / 3.0));
+        assert_eq!(buf[(2, 0)].symbol(), "⣿");
         assert_eq!(buf[(2, 0)].fg, crate::ui::theme::th().dim);
+        // Valor pequeno positivo acende meia célula (`⡇`) na esquerda.
+        let mut buf = Buffer::empty(area);
+        Meter { value: 0.001 }.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "⡇");
+        assert_eq!(buf[(0, 0)].fg, gradient(0.0));
+        assert_eq!(buf[(1, 0)].fg, crate::ui::theme::th().dim);
     }
 
     #[test]
@@ -530,7 +552,7 @@ impl Widget for Segmented<'_> {
                 }
             }
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
-                cell.set_symbol("■").set_style(Style::new().fg(color));
+                cell.set_symbol("⣿").set_style(Style::new().fg(color));
             }
         }
     }
@@ -550,10 +572,12 @@ mod segmented_tests {
             total: 10,
         }
         .render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "⣿");
         assert_eq!(buf[(0, 0)].fg, a);
         assert_eq!(buf[(2, 0)].fg, a);
         assert_eq!(buf[(3, 0)].fg, b);
         assert_eq!(buf[(4, 0)].fg, b);
+        assert_eq!(buf[(5, 0)].symbol(), "⣿");
         assert_eq!(buf[(5, 0)].fg, crate::ui::theme::th().dim);
     }
 }

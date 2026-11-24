@@ -4,7 +4,7 @@ expression: "render(&mut st, 160, 20)"
 ---
 "  1 Overview    2 Processes   [3 GPU]   4 Sensors                                                                                 - 1000 ms +  │  up 0d 05:08:00"
 "╭ gpu processes · NVIDIA GeForce RTX 5070 Ti ───────────────────────────────────────────────────────────────────────────────────────────────────── 4 processes ╮"
-"│VRAM   ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ 11.0 GB / 15.9 GB (69%)│"
+"│VRAM   ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ 11.0 GB / 15.9 GB (69%)│"
 "│       ■ app 2.0G  ■ compositor 859M  ■ browser 638M  ■ system 105M  ■ kernel 4.0M  ■ free 5.0G                                                               │"
 "│adapter  3D/compute 9%  │  encoder 73%  │  decoder 10%  │  memory activity 8%  │  other engine copy 12%                                                       │"
 "│    PID Name                                                         GPU%▼    3D  Copy   Enc   Dec  Comp       VRAM     Shared      Paged         CPU% · RAM  │"

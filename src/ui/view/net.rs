@@ -32,8 +32,8 @@ fn net_rate(st: &State, bits_per_s: f64) -> String {
 }
 
 /// Rede compacta: por placa, 1 linha de identificação (nome, descrição, link, erros) e 1 de
-/// taxas (↑/↓ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
-/// sobrando. Placas desconectadas numa linha só.
+/// taxas (↓/↑ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
+/// sobrando (download em cima, upload embaixo). Placas desconectadas numa linha só.
 pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let nics = st.fast.as_ref().map(|f| &f.nics);
     let Some(Ok(list)) = nics else {
@@ -41,7 +41,7 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         return;
     };
     let list: Vec<Nic> = list.clone();
-    let block = boxed("net", "↑ send  ↓ receive");
+    let block = boxed("net", "↓ receive  ↑ send");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Só o estado neutro ("disconnected") vai para a linha de desconectadas; falha aparece.
@@ -50,18 +50,14 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     });
     // Linhas fixas por placa: identificação + taxas (que podem quebrar em duas, estreita).
     let rate_lines = |n: &Nic| -> Vec<Line<'static>> {
-        let n_samples = usize::from(inner.width) * 2;
-        let peak =
-            |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples));
-        let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
         let mut spans = Vec::new();
         for (arrow, m, color, mm) in [
-            ("↑ ", &n.send, th().net_send, st.session.send.get(&n.alias)),
+            ("↓ ", &n.recv, th().net_recv, st.session.recv.get(&n.alias)),
             (
-                "  ↓ ",
-                &n.recv,
-                th().net_recv,
-                st.session.recv.get(&n.alias),
+                "  ↑ ",
+                &n.send,
+                th().net_send,
+                st.session.send.get(&n.alias),
             ),
         ] {
             spans.push(Span::styled(arrow, Style::new().fg(color)));
@@ -70,8 +66,6 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 spans.push(label(&format!(" max {}", net_rate(st, hi))));
             }
         }
-        // A escala vai no canto do gráfico (como no jogo), não na linha das taxas.
-        let _ = scale;
         wrap(spans, inner.width, 0, 2)
     };
     let fixed: Vec<(usize, Vec<Line<'static>>)> = up.iter().map(|n| (1, rate_lines(n))).collect();
@@ -156,14 +150,14 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples))
             };
             let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
-            let up_h = graph_h.div_ceil(2);
+            let top_h = graph_h.div_ceil(2);
             for (series, color, top, h, inverted) in [
-                (st.send.get_mut(&n.alias), th().net_send, y, up_h, false),
+                (st.recv.get_mut(&n.alias), th().net_recv, y, top_h, false),
                 (
-                    st.recv.get_mut(&n.alias),
-                    th().net_recv,
-                    y + up_h,
-                    graph_h - up_h,
+                    st.send.get_mut(&n.alias),
+                    th().net_send,
+                    y + top_h,
+                    graph_h - top_h,
                     true,
                 ),
             ] {
@@ -180,8 +174,8 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 }
             }
             // Escala por cima do canto do gráfico, depois de desenhá-lo (com uma linha só ela
-            // cobriria o gráfico de envio inteiro).
-            if up_h >= 2 {
+            // cobriria o gráfico de download inteiro).
+            if top_h >= 2 {
                 put(
                     frame,
                     Paragraph::new(label(&format!("scale {} ", net_rate(st, scale))))

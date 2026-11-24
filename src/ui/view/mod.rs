@@ -1118,7 +1118,7 @@ fn text_room(t: &Span<'_>, missing: bool, width: u16, label_w: u16) -> u16 {
     }
 }
 
-/// Linha "rótulo ■■■■ usado/total" dentro de `area`, na linha `row`.
+/// Linha "rótulo ⣿⣿ usado/total" dentro de `area`, na linha `row`.
 fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<(u64, u64)>) {
     if row >= area.height {
         return;

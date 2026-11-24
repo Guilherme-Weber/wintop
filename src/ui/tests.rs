@@ -1719,3 +1719,42 @@ fn engines_da_gpu_tem_altura_e_passo_identicos() {
         bordas_intactas(&mut st, 210, h);
     }
 }
+
+#[test]
+fn rede_download_em_cima_e_upload_embaixo() {
+    let mut st = filled();
+    let mut t = Terminal::new(TestBackend::new(210, 52)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let buf = t.backend().buffer();
+    let th = super::theme::th();
+    let is_braille = |s: &str| {
+        s.chars()
+            .next()
+            .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+    };
+    // Na metade esquerda inferior (caixa `net`), pontos braille de download (`net_recv`) devem
+    // ficar em linhas acima dos pontos de upload (`net_send`).
+    let mut min_recv_y = u16::MAX;
+    let mut max_recv_y = 0u16;
+    let mut min_send_y = u16::MAX;
+    for y in 35..51u16 {
+        for x in 1..70u16 {
+            let cell = &buf[(x, y)];
+            if !is_braille(cell.symbol()) {
+                continue;
+            }
+            if cell.fg == th.net_recv {
+                min_recv_y = min_recv_y.min(y);
+                max_recv_y = max_recv_y.max(y);
+            } else if cell.fg == th.net_send {
+                min_send_y = min_send_y.min(y);
+            }
+        }
+    }
+    assert!(min_recv_y < u16::MAX, "sem pontos de download na rede");
+    assert!(min_send_y < u16::MAX, "sem pontos de upload na rede");
+    assert!(
+        max_recv_y < min_send_y,
+        "download ({min_recv_y}..={max_recv_y}) deveria ficar acima do upload ({min_send_y})"
+    );
+}
