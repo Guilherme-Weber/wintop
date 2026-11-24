@@ -92,6 +92,8 @@ pub struct Config {
     pub language: crate::i18n::Lang,
     /// Procurar versão nova no GitHub ao abrir (e oferecer a atualização).
     pub check_updates: bool,
+    /// Modo debug: registra todos os erros (inclusive transitórios) em `wintop-debug.log`.
+    pub debug: bool,
 }
 
 /// Faixa aceita do limite de alerta do frametime (ms).
@@ -115,6 +117,7 @@ impl Default for Config {
             start_maximized: true,
             language: crate::i18n::Lang::EnUs,
             check_updates: true,
+            debug: false,
         }
     }
 }
@@ -160,13 +163,17 @@ fn template(c: &Config) -> String {
          # download is checked against the wintop signing key before anything is replaced).\n\
          check_updates = {}\n\
          \n\
+         # Debug mode: log all errors (including transient/tolerated ones) to wintop-debug.log\n\
+         # next to this file, rotating at 2 MB.\n\
+         debug = {}\n\
+         \n\
          [rtss]\n\
          # Apps hooked by RTSS that are never treated as the game (lowercase executable names).\n\
          ignored = [\n{}]\n\
          \n\
          [colors]\n\
          # Override single theme colors with \"#rrggbb\", e.g. border = \"#4b5263\".\n\
-         # Names: border, title, text, label, neutral, fail, selected, dim.\n",
+         # Names: border, title, text, label, accent, ok, warn, neutral, fail, selected, dim.\n",
         c.interval_ms,
         c.theme,
         c.fold_pool.name(),
@@ -176,6 +183,7 @@ fn template(c: &Config) -> String {
         c.start_maximized,
         c.language.code(),
         c.check_updates,
+        c.debug,
         ignored.concat()
     )
 }
@@ -233,6 +241,15 @@ fn open_dir(
         Some(d) if base.join(name) == *d => crate::userfile::UserDir::open_exe_dir(d).map(Some),
         _ => crate::userfile::UserDir::open(base, name, create),
     }
+}
+
+/// Abre a pasta do config (`%APPDATA%\wintop` ou a pasta do exe no modo portátil) pelo
+/// `userfile`. Usada também pelo log de debug.
+pub fn open_home_dir(create: bool) -> Result<Option<crate::userfile::UserDir>, String> {
+    let Some((base, name)) = home() else {
+        return Err("no AppData folder".into());
+    };
+    open_dir(&base, &name, create)
 }
 
 /// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml` (ou o portátil).
@@ -376,6 +393,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
         match v.as_bool() {
             Some(b) => c.check_updates = b,
             None => warn.push("config: check_updates must be true or false".into()),
+        }
+    }
+    if let Some(v) = doc.get("debug") {
+        match v.as_bool() {
+            Some(b) => c.debug = b,
+            None => warn.push("config: debug must be true or false".into()),
         }
     }
     if let Some(v) = doc.get("mouse") {
@@ -691,5 +714,23 @@ mod tests_1_1 {
         let t = template(&Config::default());
         let back = from_doc(&t.parse().expect("modelo"), &mut Vec::new());
         assert_eq!(back, Config::default());
+    }
+
+    #[test]
+    fn modo_debug_no_config() {
+        let read = |s: &str| {
+            let doc: DocumentMut = s.parse().expect("toml");
+            let mut warn = Vec::new();
+            (from_doc(&doc, &mut warn).debug, warn.len())
+        };
+        assert_eq!(read(""), (false, 0));
+        assert_eq!(read("debug = true\n"), (true, 0));
+        assert_eq!(read("debug = false\n"), (false, 0));
+        assert_eq!(read("debug = 1\n"), (false, 1));
+        let c = Config {
+            debug: true,
+            ..Config::default()
+        };
+        assert_eq!(read(&template(&c)), (true, 0));
     }
 }

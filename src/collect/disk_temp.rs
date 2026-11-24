@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-use windows::Win32::System::Ioctl::IOCTL_STORAGE_PREDICT_FAILURE;
+use windows::Win32::System::Ioctl::{IOCTL_STORAGE_PREDICT_FAILURE, SMART_RCV_DRIVE_DATA};
 
 use super::disk::{Handle, Inventory, discover_all, refresh};
 use crate::model::{Bus, DiskTemp, Metric, Missing, fail, neutral};
@@ -25,6 +25,8 @@ const T_INFO_SIZE: usize = 16;
 const T_TEMP: usize = 2;
 /// STORAGE_PREDICT_FAILURE { ULONG PredictFailure; UCHAR VendorSpecific[512]; }.
 const PREDICT_SIZE: usize = 516;
+/// SENDCMDOUTPARAMS (#pragma pack(1)): 4 (cBufferSize) + 12 (DriverStatus) + 512 (bBuffer).
+const SMART_RCV_OUT_SIZE: usize = 528;
 
 const NATIVE_EVERY: Duration = Duration::from_secs(10);
 const SMART_EVERY: Duration = Duration::from_secs(60);
@@ -36,6 +38,39 @@ const REDISCOVER: Duration = Duration::from_secs(60);
 const SMART_RETRY: Duration = Duration::from_secs(10);
 const SMART_QUICK: u8 = 3;
 const SMART_GRACE: Duration = Duration::from_secs(600);
+
+/// `SENDCMDINPARAMS` (#pragma pack(1), 33 bytes) para `SMART_RCV_DRIVE_DATA` (`READ_ATTRIBUTES`).
+/// Reserva quando `IOCTL_STORAGE_PREDICT_FAILURE` (0x2D1100) devolve `ERROR_GEN_FAILURE` (0x1F)
+/// em controladoras/SSDs SATA (ele manda só `SMART READ DATA` 0xD0, sem `RETURN STATUS`).
+fn smart_rcv_params(number: u32) -> [u8; 33] {
+    let mut p = [0u8; 33];
+    p[..4].copy_from_slice(&512u32.to_le_bytes()); // cBufferSize = READ_ATTRIBUTE_BUFFER_SIZE
+    p[4] = 0xD0; // bFeaturesReg = READ_ATTRIBUTES
+    p[5] = 1; // bSectorCountReg
+    p[6] = 1; // bSectorNumberReg
+    p[7] = 0x4F; // bCylLowReg = SMART_CYL_LOW
+    p[8] = 0xC2; // bCylHighReg = SMART_CYL_HI
+    p[9] = 0xA0; // bDriveHeadReg
+    p[10] = 0xB0; // bCommandReg = SMART_CMD
+    p[12] = number as u8; // bDriveNumber
+    p
+}
+
+/// Temperatura do `SENDCMDOUTPARAMS` devolvido por `SMART_RCV_DRIVE_DATA`.
+fn parse_smart_rcv(b: &[u8]) -> Result<(u8, u8), String> {
+    let drv_err = *b
+        .get(4)
+        .ok_or_else(|| "SMART_RCV response too short".to_string())?;
+    if drv_err != 0 {
+        let ide_err = b.get(5).copied().unwrap_or(0);
+        return Err(format!(
+            "SMART_RCV driver error 0x{drv_err:X} (IDE 0x{ide_err:X})"
+        ));
+    }
+    b.get(16..)
+        .and_then(smart_temp)
+        .ok_or_else(|| "no temperature sensor (SMART_RCV 194/190)".to_string())
+}
 
 /// Primeira temperatura reportada (índice 0 = composta no NVMe), ignorando "não reportado".
 fn native_temp(b: &[u8]) -> Option<i16> {
@@ -102,7 +137,9 @@ impl State {
 
     fn due(&self, now: Instant) -> bool {
         let every = match self.method {
-            Method::Smart if (1..=SMART_QUICK).contains(&self.smart_fails) => SMART_RETRY,
+            Method::Smart | Method::None if (1..=SMART_QUICK).contains(&self.smart_fails) => {
+                SMART_RETRY
+            }
             Method::Smart | Method::None => SMART_EVERY,
             Method::Unknown | Method::Native => NATIVE_EVERY,
         };
@@ -266,15 +303,19 @@ fn read_one(d: &mut Inventory, st: &mut State) {
 }
 
 fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
-    // Repouso primeiro: um HDD parado não recebe nenhuma consulta de temperatura (nem a
-    // previsão de falha, que fica com a última leitura).
-    if d.ssd == Ok(false) && meta.awake() == Some(false) {
+    // Repouso primeiro: um HDD parado (ou SSD SATA em DevSleep/D3 informado pelo Windows) não
+    // recebe consulta de temperatura nem SMART.
+    let awake = meta.awake();
+    if awake == Some(false) {
         st.smart_fails = 0;
         st.value = neutral("asleep");
         return;
     }
-    read_temp(d, st, meta);
-    if !d.lost && st.health_at.is_none_or(|t| t.elapsed() >= SMART_EVERY) {
+    let health_done = read_temp(d, st, meta, awake);
+    // Discos SATA já leram `PredictFailure` dentro do mesmo `IOCTL_STORAGE_PREDICT_FAILURE` da
+    // temperatura (evita disparar o mesmo IOCTL duas vezes seguidas na controladora SATA). Só
+    // discos com temperatura nativa precisam desta consulta separada.
+    if !health_done && !d.lost && st.health_at.is_none_or(|t| t.elapsed() >= SMART_EVERY) {
         st.health_at = Some(Instant::now());
         // Uma consulta recusada não apaga um "OK" já lido (o disco não ficou doente por isso);
         // uma previsão de falha lida de verdade sempre aparece.
@@ -292,15 +333,27 @@ fn predict_failure(number: u32) -> Metric<bool> {
         return fail("no read/write access (not elevated?)");
     };
     match rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE) {
-        Ok(b) => b
-            .get(..4)
-            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]) != 0)
-            .map_or_else(|| fail("response too short"), Ok),
+        Ok(b) => parse_predict(&b),
         Err(_) => neutral("not reported by the drive"),
     }
 }
 
-fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
+fn parse_predict(b: &[u8]) -> Metric<bool> {
+    b.get(..4)
+        .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]) != 0)
+        .map_or_else(|| fail("response too short"), Ok)
+}
+
+/// Atualiza `st.health` sem apagar um "OK" já lido se a consulta falhou.
+fn update_health(st: &mut State, h: Metric<bool>) {
+    st.health_at = Some(Instant::now());
+    if h.is_ok() || st.health.is_err() {
+        st.health = h;
+    }
+}
+
+/// Lê a temperatura; devolve `true` se o SMART (`PredictFailure`) já foi consultado aqui.
+fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<bool>) -> bool {
     // Acordou depois de ter sido visto em repouso: relê o layout (membro do pool) agora.
     d.reread_if_was_asleep(meta);
     if st.method != Method::Smart {
@@ -310,28 +363,74 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
                 st.method = Method::Native;
                 st.value = Ok(t);
                 st.source = "native";
-                return;
+                return false;
             }
             // Disco com sensor nativo que falhou agora: não cai no SMART (handle de escrita).
             None if st.method == Method::Native => {
                 if Handle::open(d.number, 0).is_none() {
                     d.lost = true;
                 }
-                st.value = fail(native.err().unwrap_or_else(|| "no native reading".into()));
-                return;
+                let cause = native.err().unwrap_or_else(|| "no native reading".into());
+                crate::debug::log(
+                    "disk_temp",
+                    &format!("disk {} native temp failed: {cause}", d.number),
+                );
+                st.value = fail(cause);
+                return false;
             }
             None => {}
         }
     }
-    // Sem temperatura nativa: SMART (exige handle de leitura e escrita).
-    let smart = Handle::open(d.number, GENERIC_READ.0 | GENERIC_WRITE.0)
-        .ok_or_else(|| "no read/write access (not elevated?)".to_string())
-        .and_then(|rw| rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE))
-        .and_then(|b| {
-            b.get(4..)
-                .and_then(smart_temp)
-                .ok_or_else(|| "no temperature sensor (native or SMART 194/190)".to_string())
-        });
+    // Sem temperatura nativa: SMART (exige handle de leitura e escrita). Uma única chamada de
+    // `IOCTL_STORAGE_PREDICT_FAILURE` já traz tanto `PredictFailure` (bytes 0..4) quanto os
+    // atributos SMART (bytes 4..516). Se ela falhar (ex.: 0x1F em SSD SATA / controladora
+    // Marvell), tenta `SMART_RCV_DRIVE_DATA` (0x07C088) no mesmo handle.
+    let model = d.model.as_deref().unwrap_or("?");
+    let smart = match Handle::open(d.number, GENERIC_READ.0 | GENERIC_WRITE.0) {
+        None => {
+            update_health(st, fail("no read/write access (not elevated?)"));
+            Err("no read/write access (not elevated?)".to_string())
+        }
+        Some(rw) => match rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE) {
+            Ok(b) => {
+                update_health(st, parse_predict(&b));
+                b.get(4..)
+                    .and_then(smart_temp)
+                    .ok_or_else(|| "no temperature sensor (native or SMART 194/190)".to_string())
+            }
+            Err(e1) => {
+                update_health(st, neutral("not reported by the drive"));
+                let params = smart_rcv_params(d.number);
+                match rw
+                    .ioctl(SMART_RCV_DRIVE_DATA, Some(&params), SMART_RCV_OUT_SIZE)
+                    .and_then(|b| parse_smart_rcv(&b))
+                {
+                    Ok(t) => {
+                        crate::debug::log(
+                            "disk_temp",
+                            &format!(
+                                "disk {} ({model}) PREDICT_FAILURE failed ({e1}, awake={awake:?}); \
+                                 SMART_RCV_DRIVE_DATA fallback succeeded ({} °C)",
+                                d.number, t.1
+                            ),
+                        );
+                        Ok(t)
+                    }
+                    Err(e2) => {
+                        crate::debug::log(
+                            "disk_temp",
+                            &format!(
+                                "disk {} ({model}) SMART failed (awake={awake:?}): \
+                                 PREDICT_FAILURE=[{e1}], SMART_RCV=[{e2}]",
+                                d.number
+                            ),
+                        );
+                        Err(e1)
+                    }
+                }
+            }
+        },
+    };
     match smart {
         Ok((id, c)) => {
             st.method = Method::Smart;
@@ -349,15 +448,33 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle) {
                 st.method = Method::None;
             }
             // Falha passageira depois de leituras boas: segura o último valor por enquanto.
-            if smart_tolerated(st, d.lost, Instant::now()) {
+            let now = Instant::now();
+            if smart_tolerated(st, d.lost, now) {
                 st.smart_fails = st.smart_fails.saturating_add(1);
-                return;
+                let age = st
+                    .smart_ok_at
+                    .map_or(0, |t| now.duration_since(t).as_secs());
+                crate::debug::log(
+                    "disk_temp",
+                    &format!(
+                        "disk {} ({model}) SMART error tolerated (#{}, last ok {age}s ago, \
+                         awake={awake:?}): {e}",
+                        d.number, st.smart_fails
+                    ),
+                );
+                return true;
             }
-            // Falha persistente: volta ao ritmo normal do SMART.
-            st.smart_fails = 0;
+            // Na partida (sem leitura boa ainda), tenta mais cedo nas primeiras falhas em vez
+            // de esperar 60 s. Depois da janela de tolerância vencida, volta ao ritmo normal.
+            if st.method == Method::None && !d.lost && st.smart_fails < SMART_QUICK {
+                st.smart_fails = st.smart_fails.saturating_add(1);
+            } else {
+                st.smart_fails = 0;
+            }
             st.value = fail(format!("SMART: {e}"));
         }
     }
+    true
 }
 
 /// Falha do SMART que não aparece: já houve leitura boa há menos de `SMART_GRACE` e o disco
@@ -467,5 +584,26 @@ mod tests {
         // Todos os membros dormiam na descoberta: o layout não foi lido, o pool está em repouso.
         assert_eq!(pool_temp(1, &[], true), neutral("asleep"));
         assert!(matches!(pool_temp(1, &[], false), Err(Missing::Fail(_))));
+    }
+
+    #[test]
+    fn smart_rcv_parametros_e_leitura() {
+        let p = smart_rcv_params(2);
+        assert_eq!(u32::from_le_bytes(p[..4].try_into().unwrap()), 512);
+        assert_eq!(
+            (p[4], p[7], p[8], p[10], p[12]),
+            (0xD0, 0x4F, 0xC2, 0xB0, 2)
+        );
+        // Resposta válida com atributo 194 = 38 °C (offset 16 do bBuffer + 2 revisão + 5 raw).
+        let mut out = vec![0u8; SMART_RCV_OUT_SIZE];
+        out[16 + 2] = 194;
+        out[16 + 2 + 5] = 38;
+        assert_eq!(parse_smart_rcv(&out), Ok((194, 38)));
+        // Erro reportado pelo driver no DriverStatus (offset 4).
+        out[4] = 3;
+        out[5] = 0x51;
+        assert!(parse_smart_rcv(&out).unwrap_err().contains("0x3"));
+        // Buffer curto demais.
+        assert!(parse_smart_rcv(&[0u8; 3]).is_err());
     }
 }

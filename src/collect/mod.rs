@@ -46,13 +46,19 @@ fn guarded<T>(name: &str, f: impl FnOnce() -> Metric<T>) -> Metric<T> {
             .map(ToString::to_string)
             .or_else(|| p.downcast_ref::<String>().cloned())
             .unwrap_or_default();
-        fail(format!("{name} collector panicked: {msg}"))
+        let text = format!("{name} collector panicked: {msg}");
+        crate::debug::log("panic", &text);
+        fail(text)
     })
 }
 
 /// Cria um coletor; pânico na criação vira `Err` (a fonte fica marcada com falha).
 fn create<T>(name: &str, f: impl FnOnce() -> T) -> Result<T, String> {
-    catch_unwind(AssertUnwindSafe(f)).map_err(|_| format!("{name} collector panicked on startup"))
+    catch_unwind(AssertUnwindSafe(f)).map_err(|_| {
+        let text = format!("{name} collector panicked on startup");
+        crate::debug::log("panic", &text);
+        text
+    })
 }
 
 fn perf_info() -> Result<PERFORMANCE_INFORMATION, String> {
@@ -168,11 +174,13 @@ impl SlowCollectors {
     /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro).
     /// `view`: abas visíveis; processos e engines da GPU só são coletados com elas à vista
     /// (ao abrir, uma leitura de aquecimento e ~300 ms de espera: as taxas precisam de duas).
-    pub fn collect(&mut self, stop: &AtomicBool, view: View) -> Slow {
+    /// `game_pid`: PID do jogo em foco (0 = nenhum), para medir o working set privado dele na
+    /// barra da RAM sem abrir o processo.
+    pub fn collect(&mut self, stop: &AtomicBool, view: View, game_pid: u32) -> Slow {
         let start = Instant::now();
         let want_procs = view.procs || view.gpu;
         if !want_procs {
-            self.procs.reset();
+            self.procs.reset(game_pid != 0);
         }
         // Fora da aba GPU por um ciclo inteiro: a consulta fecha. Voltar antes disso não reabre
         // a consulta nem repete o aquecimento.
@@ -206,6 +214,7 @@ impl SlowCollectors {
                 gpus: fail("stopping"),
                 disk_temps: fail("stopping"),
                 procs: None,
+                game_ram: None,
                 took: start.elapsed(),
             };
         }
@@ -219,10 +228,22 @@ impl SlowCollectors {
                 gpus: fail("stopping"),
                 disk_temps: fail("stopping"),
                 procs: None,
+                game_ram: None,
                 took: start.elapsed(),
             };
         }
         let procs = want_procs.then(|| guarded("process", || self.procs.read()));
+        let game_ram = if game_pid == 0 {
+            None
+        } else if let Some(Ok(list)) = &procs {
+            list.iter()
+                .find(|p| p.pid == game_pid)
+                .map(|p| (game_pid, p.mem))
+        } else {
+            self.procs
+                .private_ws_cached(game_pid)
+                .map(|mem| (game_pid, mem))
+        };
         // Nomes dos processos: da lista recém-lida (aba aberta); senão o cache do coletor.
         let names: Option<std::collections::HashMap<u32, String>> = match &procs {
             Some(Ok(list)) => Some(list.iter().map(|p| (p.pid, p.name.clone())).collect()),
@@ -236,6 +257,7 @@ impl SlowCollectors {
             gpus,
             disk_temps,
             procs,
+            game_ram,
             took: start.elapsed(),
         }
     }

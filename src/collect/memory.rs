@@ -71,6 +71,17 @@ impl MemoryCollector {
                 Err(e) => fail(e.clone()),
             }
         };
+        let pf_total = match perf_info {
+            Ok(p) => Ok((p.CommitLimit.saturating_sub(p.PhysicalTotal) as u64)
+                .saturating_mul(p.PageSize as u64)),
+            Err(e) => fail(e.clone()),
+        };
+        let pagefile_usage = pdh_val(&self.pagefile).and_then(|pct| {
+            let total = pf_total?;
+            let pct = pct.clamp(0.0, 100.0);
+            let used = ((pct / 100.0) * total as f64).round() as u64;
+            Ok((used.min(total), total))
+        });
         Memory {
             total: status.clone().map(|s| s.0).or_else(fail),
             used: status.map(|(t, a)| t.saturating_sub(a)).or_else(fail),
@@ -80,7 +91,7 @@ impl MemoryCollector {
             modified,
             paged_pool: pages(|p| p.KernelPaged),
             nonpaged_pool: pages(|p| p.KernelNonpaged),
-            pagefile_usage: pdh_val(&self.pagefile).map(|v| v.clamp(0.0, 100.0)),
+            pagefile_usage,
         }
     }
 }

@@ -364,8 +364,8 @@ const PT_BR: &[(&str, &str)] = &[
         "nenhum dos runtimes de GPU conhecidos",
     ),
     (
-        "graphs keep the last game until r",
-        "os gráficos guardam o último jogo até o r",
+        "graphs scroll while idle · r resets",
+        "gráficos andam no ocioso · r zera",
     ),
     ("lows over 60 s", "lows dos últimos 60 s"),
     ("session min · max (r resets)", "sessão mín · máx (r zera)"),

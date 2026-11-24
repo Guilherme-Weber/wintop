@@ -12,7 +12,7 @@
 //! número de sequência; quem exibe só copia o que mudou. A parada é imediata: as esperas
 //! acordam pela `Condvar` (e pelo evento de parada, no pipe).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -65,6 +65,9 @@ struct Shared {
     view: AtomicU8,
     /// Uma aba acabou de entrar em vista: a thread lenta coleta já, sem esperar o período.
     kick: AtomicBool,
+    /// PID do jogo em foco (0 = nenhum), publicado pela thread do RTSS para a thread lenta
+    /// medir a RAM dele sem acoplar à UI.
+    game_pid: AtomicU32,
 }
 
 impl Shared {
@@ -181,6 +184,7 @@ impl Engine {
             stopping: AtomicBool::new(false),
             view: AtomicU8::new(0),
             kick: AtomicBool::new(false),
+            game_pid: AtomicU32::new(0),
         });
         // Um NVML para as duas threads (iniciado aqui, antes delas: sem nvmlInit simultâneo).
         let nvml = crate::collect::shared_nvml();
@@ -205,6 +209,7 @@ impl Engine {
                         let mut next = Instant::now();
                         loop {
                             let snap = c.collect();
+                            crate::debug::log_fast(&snap);
                             {
                                 let mut st = sh.lock();
                                 st.fast = Some(snap);
@@ -218,6 +223,7 @@ impl Engine {
                     }));
                     // Pânico fora dos coletores: a falha aparece (a tela não congela no último dado).
                     if r.is_err() {
+                        crate::debug::log("panic", "fast collection thread panicked");
                         let mut st = sh.lock();
                         st.fast = Some(Fast::failed("fast collection thread panicked"));
                         st.fast_seq += 1;
@@ -256,7 +262,9 @@ impl Engine {
                                 return;
                             }
                             let view = view_from_bits(sh.view.load(Ordering::Relaxed));
-                            let snap = c.collect(&sh.stopping, view);
+                            let game_pid = sh.game_pid.load(Ordering::Relaxed);
+                            let snap = c.collect(&sh.stopping, view, game_pid);
+                            crate::debug::log_slow(&snap);
                             {
                                 let mut st = sh.lock();
                                 st.slow = Some(snap);
@@ -270,6 +278,7 @@ impl Engine {
                     }));
                     // Pânico fora dos coletores: a falha aparece (a tela não congela no último dado).
                     if r.is_err() {
+                        crate::debug::log("panic", "slow collection thread panicked");
                         let mut st = sh.lock();
                         st.slow = Some(Slow::failed("slow collection thread panicked"));
                         st.slow_seq += 1;
@@ -379,6 +388,9 @@ impl Drop for Engine {
 /// publica a falha (a interface não fica parada no último valor) e encerra a thread.
 fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
     let publish = |mut snap: Fps| {
+        crate::debug::log_fps(&snap);
+        sh.game_pid
+            .store(snap.game.as_ref().map_or(0, |g| g.pid), Ordering::Relaxed);
         let mut st = sh.lock();
         // A interface não leu a publicação anterior (tela ocupada mais de 250 ms): o pior frame
         // dela não se perde, entra no desta (o gráfico de frametime mostra o pior do tick).
@@ -396,6 +408,7 @@ fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
     let Ok(mut c) = catch_unwind(AssertUnwindSafe(|| {
         RtssCollector::new(true, true).with_ignored(ignored)
     })) else {
+        crate::debug::log("panic", "RTSS collector panicked on startup");
         publish(rtss::failed("RTSS collector panicked on startup"));
         return;
     };
@@ -502,6 +515,7 @@ mod tests {
             stopping: AtomicBool::new(false),
             view: AtomicU8::new(0),
             kick: AtomicBool::new(false),
+            game_pid: AtomicU32::new(0),
         })
     }
 

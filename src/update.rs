@@ -300,12 +300,12 @@ pub fn spawn_check() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("wintop-update-check".into())
-        .spawn(move || {
-            if let Ok(v) = latest_version()
-                && is_newer(&v, &current())
-            {
+        .spawn(move || match latest_version() {
+            Ok(v) if is_newer(&v, &current()) => {
                 let _ = tx.send(v);
             }
+            Ok(_) => {}
+            Err(e) => crate::debug::log("update", &format!("check failed: {e}")),
         });
     rx
 }

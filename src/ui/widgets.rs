@@ -88,6 +88,8 @@ pub struct Graph<'a> {
     /// Amostras zeradas acendem o ponto da base nesta cor (eixo da rede espelhada visível com
     /// a placa parada).
     pub baseline: Option<Color>,
+    /// Escala das amostras (padrão 1.0): divide cada amostra sob demanda sem alocar `Vec`.
+    pub scale: f64,
 }
 
 impl<'a> Graph<'a> {
@@ -98,6 +100,7 @@ impl<'a> Graph<'a> {
             invert: false,
             under: None,
             baseline: None,
+            scale: 1.0,
         }
     }
 
@@ -108,6 +111,11 @@ impl<'a> Graph<'a> {
 
     pub fn with_baseline(mut self, c: Color) -> Self {
         self.baseline = Some(c);
+        self
+    }
+
+    pub fn with_scale(mut self, scale: f64) -> Self {
+        self.scale = scale;
         self
     }
 
@@ -134,6 +142,15 @@ impl Widget for Graph<'_> {
         let w = usize::from(area.width);
         let h = usize::from(area.height);
         let max = h * 4;
+        let norm = |v: f64| -> f64 {
+            if self.scale == 1.0 {
+                v
+            } else if self.scale > 0.0 {
+                v / self.scale
+            } else {
+                0.0
+            }
+        };
         // As últimas 2·w amostras, alinhadas à direita.
         let take = (w * 2).min(self.samples.len());
         let tail = &self.samples[self.samples.len() - take..];
@@ -141,8 +158,7 @@ impl Widget for Graph<'_> {
         let sample = |i: usize| -> f64 {
             i.checked_sub(offset)
                 .and_then(|k| tail.get(k))
-                .copied()
-                .unwrap_or(0.0)
+                .map_or(0.0, |&v| norm(v))
         };
         // A série de baixo, alinhada à direita do mesmo jeito.
         let under = self.under.map(|u| &u[u.len() - (w * 2).min(u.len())..]);
@@ -151,7 +167,7 @@ impl Widget for Graph<'_> {
                 let off = w * 2 - u.len();
                 i.checked_sub(off)
                     .and_then(|k| u.get(k))
-                    .map_or(0, |&v| dots(v, max))
+                    .map_or(0, |&v| dots(norm(v), max))
             })
         };
         for col in 0..w {
@@ -392,6 +408,47 @@ mod tests {
         assert_eq!(buf[(1, 0)].fg, gradient(1.0 / 3.0));
         assert_eq!(buf[(2, 0)].fg, crate::ui::theme::th().dim);
     }
+
+    #[test]
+    fn barra_vertical_preenche_de_baixo_para_cima() {
+        let area = Rect::new(0, 0, 2, 4);
+        let mut buf = Buffer::empty(area);
+        VerticalBar { value: 0.5 }.render(area, &mut buf);
+        // Metade de 4 linhas = 2 linhas cheias embaixo (`⣿`), 2 apagadas em cima (`⣿` em `dim`).
+        assert_eq!(buf[(0, 3)].symbol(), "⣿");
+        assert_eq!(buf[(1, 2)].symbol(), "⣿");
+        assert_eq!(buf[(0, 1)].symbol(), "⣿");
+        assert_eq!(buf[(1, 0)].symbol(), "⣿");
+        assert_eq!(buf[(0, 0)].fg, crate::ui::theme::th().dim);
+        assert_eq!(buf[(0, 3)].fg, gradient(0.0));
+        // NaN e zero: tudo na trilha apagada.
+        let mut buf = Buffer::empty(area);
+        VerticalBar { value: f64::NAN }.render(area, &mut buf);
+        assert_eq!(buf[(0, 3)].symbol(), "⣿");
+        assert_eq!(buf[(0, 3)].fg, crate::ui::theme::th().dim);
+        // Valor mínimo positivo acende o menor degrau braille na base.
+        let mut buf = Buffer::empty(area);
+        VerticalBar { value: 0.001 }.render(area, &mut buf);
+        assert_eq!(buf[(0, 3)].symbol(), "⣀");
+        // Cheio: todas as linhas preenchidas, topo na cor alta do gradiente.
+        let mut buf = Buffer::empty(area);
+        VerticalBar { value: 1.0 }.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "⣿");
+        assert_eq!(buf[(0, 0)].fg, gradient(1.0));
+    }
+
+    #[test]
+    fn escala_do_grafico_sem_alocar() {
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[200.0, 200.0], GraphColor::Fixed(Color::Rgb(200, 100, 50)))
+            .with_under(&[100.0, 100.0])
+            .with_scale(200.0)
+            .render(area, &mut buf);
+        // Igual a [1.0, 1.0] com under [0.5, 0.5]: linha de baixo escurece, de cima normal.
+        assert_eq!(buf[(1, 1)].fg, Color::Rgb(100, 50, 25));
+        assert_eq!(buf[(1, 0)].fg, Color::Rgb(200, 100, 50));
+    }
 }
 
 /// Barra cortada em partes coloridas (VRAM por categoria, como o gputaskman). Cada célula pega a
@@ -399,6 +456,59 @@ mod tests {
 pub struct Segmented<'a> {
     pub parts: &'a [(u64, Color)],
     pub total: u64,
+}
+
+/// Barra vertical preenchida de baixo para cima em braille (`⣀`, `⣤`, `⣶`, `⣿`) com o gradiente
+/// do tema pela altura (termômetro de CPU/GPU, mesmo padrão visual dos gráficos).
+pub struct VerticalBar {
+    /// 0..=1.
+    pub value: f64,
+}
+
+const VBRAILLE: [&str; 5] = ["⣿", "⣀", "⣤", "⣶", "⣿"];
+
+impl Widget for VerticalBar {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let w = usize::from(area.width);
+        let h = usize::from(area.height);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let v = if self.value.is_finite() {
+            self.value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Resolução de 4 fileiras de pontos braille por linha; qualquer valor > 0 acende a base.
+        let max_steps = h * 4;
+        let steps = if v <= 0.0 {
+            0
+        } else {
+            ((v * max_steps as f64).round() as usize).clamp(1, max_steps)
+        };
+        let dim = crate::ui::theme::th().dim;
+        for row in 0..h {
+            // `row` = 0 na base, `h - 1` no topo.
+            let base = row * 4;
+            let fill = steps.saturating_sub(base).min(4);
+            let t = if h > 1 {
+                row as f64 / (h - 1) as f64
+            } else {
+                v
+            };
+            let (sym, style) = if fill == 0 {
+                (VBRAILLE[0], Style::new().fg(dim))
+            } else {
+                (VBRAILLE[fill], Style::new().fg(gradient(t)))
+            };
+            let y = area.y + (h - 1 - row) as u16;
+            for col in 0..w {
+                if let Some(cell) = buf.cell_mut((area.x + col as u16, y)) {
+                    cell.set_symbol(sym).set_style(style);
+                }
+            }
+        }
+    }
 }
 
 impl Widget for Segmented<'_> {

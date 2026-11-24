@@ -225,7 +225,12 @@ fn per_logical_raw(items: &[(String, f64)], max: f64, last: &mut Vec<f64>) -> Op
         .enumerate()
         .map(|(i, (_, x))| {
             if x.is_nan() {
-                last.get(i).copied().unwrap_or(0.0)
+                let prev = last.get(i).copied().unwrap_or(0.0);
+                crate::debug::log(
+                    "cpu",
+                    &format!("PDH returned NaN for logical {i}; kept {prev:.1}"),
+                );
+                prev
             } else {
                 x.clamp(0.0, max)
             }

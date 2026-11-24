@@ -232,11 +232,24 @@ impl ProcCollector {
             .map_or(std::time::Duration::MAX, |(_, t)| t.elapsed())
     }
 
-    /// Esquece as leituras (aba fechada: a próxima abertura começa do zero).
-    pub(super) fn reset(&mut self) {
+    /// Esquece as leituras (aba fechada: a próxima abertura começa do zero). Se `keep_buf` for
+    /// `true` (jogo em foco precisando da RAM dele), reaproveita o buffer.
+    pub(super) fn reset(&mut self, keep_buf: bool) {
         self.prev = HashMap::new();
         self.prev_sys = None;
-        self.buf = Vec::new();
+        if !keep_buf {
+            self.buf = Vec::new();
+        }
+    }
+
+    /// Working set privado de `pid` reaproveitando o buffer (sem abrir o processo: seguro para
+    /// anticheat). Usado na aba Geral para mostrar a RAM do jogo na barra da memória.
+    pub(super) fn private_ws_cached(&mut self, pid: u32) -> Option<u64> {
+        self.query()
+            .ok()?
+            .into_iter()
+            .find(|r| r.pid == pid)
+            .map(|r| r.mem)
     }
 
     fn query(&mut self) -> Result<Vec<Raw>, String> {

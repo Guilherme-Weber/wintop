@@ -26,11 +26,11 @@ use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-    SetFileInformationByHandle,
+    FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_CREATION_DISPOSITION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_MODE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, SetFileInformationByHandle,
 };
 use windows::core::PCWSTR;
 
@@ -523,6 +523,61 @@ impl UserDir {
         }
         r
     }
+
+    /// Acrescenta `data` ao fim de `name` sem seguir links nem hardlinks; se o tamanho já atingiu
+    /// `max_bytes`, renomeia `name` para `backup` (pelo handle) antes de abrir um arquivo novo.
+    pub fn append_rotating(
+        &self,
+        name: &str,
+        backup: &str,
+        max_bytes: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let p = self.file(name);
+        let open_new = || {
+            open(
+                &p,
+                FILE_APPEND_DATA.0 | GENERIC_READ.0 | DELETE.0,
+                FILE_SHARE_READ,
+                CREATE_NEW,
+                false,
+                true,
+            )
+            .map_err(String::from)
+        };
+        let c = match open(
+            &p,
+            FILE_APPEND_DATA.0 | GENERIC_READ.0 | DELETE.0,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            false,
+            true,
+        ) {
+            Ok(existing) => {
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                // SAFETY: handle conferido; estrutura local.
+                unsafe { GetFileInformationByHandle(existing.raw(), &raw mut info) }
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+                if size > 0 && size.saturating_add(data.len() as u64) > max_bytes {
+                    // Renomeia pelo próprio handle conferido (sem janela de troca no nome).
+                    rename_over(existing.raw(), &self.file(backup))?;
+                    drop(existing);
+                    open_new()?
+                } else {
+                    existing
+                }
+            }
+            Err(OpenError::NotFound) => open_new()?,
+            Err(e) => return Err(e.into()),
+        };
+        let _ = &self.dir;
+        // SAFETY: handle conferido e só nosso; ManuallyDrop não fecha (c.handle fecha no Drop).
+        let mut f =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(c.handle.as_raw_handle()) });
+        f.write_all(data)
+            .map_err(|e| format!("{}: {e}", p.display()))
+    }
 }
 
 /// Arquivo aberto por `UserDir::hold`: travado contra escrita, troca e exclusão até o drop.
@@ -830,5 +885,35 @@ mod tests {
         // System32 não é do usuário (AppData redirecionado para lá não vale).
         let sys = crate::win::system_dir().expect("System32");
         assert!(UserDir::open(&sys, "wintop", false).is_err());
+    }
+
+    #[test]
+    fn append_rotating_acrescenta_e_rotaciona_no_limite() {
+        let b = roaming();
+        let n = name("append_rot");
+        let d = UserDir::create(&b, &n).expect("pasta");
+        d.append_rotating("debug.log", "debug.log.1", 20, b"linha 1\n")
+            .expect("1ª escrita");
+        d.append_rotating("debug.log", "debug.log.1", 20, b"linha 2\n")
+            .expect("2ª escrita");
+        assert_eq!(
+            d.read("debug.log", 256).expect("leitura").as_deref(),
+            Some("linha 1\nlinha 2\n")
+        );
+        // 16 + 10 > 20 bytes: gira o atual para `.1` e cria um novo.
+        d.append_rotating("debug.log", "debug.log.1", 20, b"linha 345\n")
+            .expect("rotação");
+        assert_eq!(
+            d.read("debug.log", 256).expect("leitura novo").as_deref(),
+            Some("linha 345\n")
+        );
+        assert_eq!(
+            d.read("debug.log.1", 256)
+                .expect("leitura backup")
+                .as_deref(),
+            Some("linha 1\nlinha 2\n")
+        );
+        drop(d);
+        let _ = std::fs::remove_dir_all(b.join(&n));
     }
 }

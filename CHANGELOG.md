@@ -6,6 +6,49 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Adicionado
+
+- Modo debug opcional no `config.toml` (`debug = false` por padrão, com recarga ao vivo):
+  registra em `wintop-debug.log` (na pasta do config, via `userfile`, com rotação em 2 MiB para
+  `.1`) transições de falha e recuperação das fontes, erros transitórios/tolerados (recusas do
+  SMART na janela de tolerância, `NaN` de processadores lógicos no PDH, eventos descartados no
+  ETW), pânicos isolados de coletores/threads e falhas silenciosas de config ou atualização.
+- Termômetro vertical de temperatura à direita das caixas da CPU (`Tctl`) e da GPU (NVML), com
+  limite de referência no topo, barra vertical em braille no gradiente do tema e leitura atual
+  embaixo (oculto automaticamente em terminais estreitos ou GPUs sem NVML).
+- RAM do jogo em foco destacada como categoria `game` na barra segmentada e na legenda da RAM
+  (como na VRAM), coletada na thread lenta por `SystemProcessInformation` sem abrir o processo do
+  jogo.
+- Razão efetiva dinâmica `(Nx)` no frame generation (ex.: `2.5x` em MFG dinâmico), a partir da
+  razão `apresentados / reais` no ETW quando diferente do multiplicador nominal.
+- Cores semânticas configuráveis em `[colors]` (`accent`, `ok`, `warn`) em todos os 5 temas
+  (mantendo o tema `mono` em tons de cinza exceto falhas) para destacar valores principais,
+  estados saudáveis (`all OK`, `virt enabled`, `throttle none`, `SMART OK`, link conectado) e
+  alertas (`throttle` ativo, temperaturas elevadas, limitado pela GPU).
+
+### Alterado
+
+- Caixa da GPU reorganizada no mesmo padrão da CPU + memória: gráfico, engines e dados da placa
+  (`clk`, `temp`, `fans`, `PCIe`/`drv`/`VBIOS`) ficam separados da seção de VRAM (`VRAM`,
+  legenda, `shared`, `phys`, `session VRAM`) por um divisor horizontal rotulado `── vram ──`, e os
+  mini gráficos das engines (`copy`/3D, `encode`, `decode`, `mem act`) acompanham a largura dos
+  núcleos da CPU com altura e espaçamento idênticos entre si (e linha de base sutil em `0%`), num
+  balanço `56% / 44%` entre CPU e GPU.
+- Gráficos de FPS e frametime continuam avançando no ritmo da UI mesmo no ocioso (sem jogo em
+  foco), desenhando linha de base apagada enquanto o histórico anterior sai pela esquerda até `r`.
+- Barra de `pagefile` alinhada no mesmo padrão de `RAM` e `commit`, mostrando `usado / total (%)`
+  em bytes.
+- Cor de `ram_modified` ajustada nos temas coloridos para se distinguir claramente da categoria
+  `game` na barra da RAM.
+
+### Corrigido
+
+- SMART de SSDs SATA (`IOCTL_STORAGE_PREDICT_FAILURE` retornando `error 0x1F` /
+  `ERROR_GEN_FAILURE` de forma intermitente): leitura de temperatura e `PredictFailure` unificadas
+  num único IOCTL (eliminando a 2ª chamada imediata), checagem de estado de energia
+  (`GetDevicePowerState`) estendida a SSDs SATA em DevSleep/D3, tentativas rápidas também para
+  discos que falharam na descoberta inicial e reserva via `SMART_RCV_DRIVE_DATA` (`0x07C088`).
+
 ## [1.2.1] - 2026-11-22
 
 A 1.2.0 não foi publicada (a tag existe, sem release): esta versão inclui tudo o que estava nela.

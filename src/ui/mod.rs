@@ -222,6 +222,7 @@ fn event_loop(
             match r {
                 Ok(()) => return Ok(Outcome::Restart),
                 Err(e) => {
+                    crate::debug::log("update", &format!("apply failed: {e}"));
                     st.update = None;
                     st.toast = Some((
                         format!("update failed: {e}"),
@@ -494,6 +495,10 @@ fn config_mtime() -> Option<std::time::SystemTime> {
 /// Valores do config editado com o wintop aberto, aplicados na hora.
 fn apply_config(st: &mut view::State, engine: &Engine, cfg: &crate::config::Loaded) {
     let c = &cfg.config;
+    crate::debug::set_enabled(c.debug);
+    for w in &cfg.warnings {
+        crate::debug::log("config", w);
+    }
     theme::set(theme::build(&c.theme, &c.colors));
     st.theme_name = theme::th().name.to_string();
     st.interval_ms = engine.set_interval_ms(c.interval_ms);
@@ -518,7 +523,10 @@ fn save(cfg: &mut crate::config::Loaded, st: &mut view::State) {
     // Gravou: um erro anterior (arquivo travado por um editor) deixa de valer.
     st.notice = match cfg.save(&c) {
         Ok(()) => cfg.warnings.first().cloned(),
-        Err(e) => Some(e),
+        Err(e) => {
+            crate::debug::log("config", &format!("save failed: {e}"));
+            Some(e)
+        }
     };
 }
 

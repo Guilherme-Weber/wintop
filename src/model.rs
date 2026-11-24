@@ -86,8 +86,8 @@ pub struct Memory {
     pub modified: Metric<u64>,
     pub paged_pool: Metric<u64>,
     pub nonpaged_pool: Metric<u64>,
-    /// Uso do arquivo de paginação (`_Total`), 0-100.
-    pub pagefile_usage: Metric<f64>,
+    /// Arquivo de paginação (usado e total, em bytes).
+    pub pagefile_usage: Metric<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +371,26 @@ pub struct FrameGen {
     pub real_fps: f64,
     /// Frames apresentados por frame real (2x, 3x, 4x), quando o jogo informa.
     pub multiplier: Option<u32>,
+    /// Razão efetiva (apresentados / reais) no último segundo (MFG dinâmico).
+    pub effective: Option<f64>,
+}
+
+impl FrameGen {
+    /// Texto do multiplicador ("4x", ou razão efetiva como "2.5x" no MFG dinâmico).
+    pub fn ratio_text(&self) -> Option<String> {
+        if let Some(r) = self.effective.filter(|r| r.is_finite() && *r >= 1.5) {
+            if let Some(m) = self.multiplier
+                && (r - f64::from(m)).abs() < 0.2
+            {
+                return Some(format!("{m}x"));
+            }
+            if (r - r.round()).abs() < 0.15 {
+                return Some(format!("{}x", r.round() as u32));
+            }
+            return Some(format!("{}x", crate::fmt::num(r, 1)));
+        }
+        self.multiplier.map(|m| format!("{m}x"))
+    }
 }
 
 /// Jogo acompanhado pelo RTSS.
@@ -453,6 +473,8 @@ pub struct Slow {
     pub disk_temps: Metric<Vec<DiskTemp>>,
     /// Processos (só com a aba Processos ou GPU visível; `None` fora delas).
     pub procs: Option<Metric<Vec<Proc>>>,
+    /// Working set privado (bytes) do jogo em foco (`(pid, bytes)`), via `SystemProcessInformation`.
+    pub game_ram: Option<(u32, u64)>,
     pub took: Duration,
 }
 
@@ -481,7 +503,172 @@ impl Slow {
             gpus: Err(m.clone()),
             disk_temps: Err(m.clone()),
             procs: Some(Err(m)),
+            game_ram: None,
             took: Duration::ZERO,
         }
+    }
+}
+
+fn any_fail(visit: impl FnOnce(&mut dyn FnMut(&str, Option<&Missing>))) -> bool {
+    let mut hit = false;
+    visit(&mut |_, e| {
+        if matches!(e, Some(Missing::Fail(_))) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+impl Cpu {
+    /// Percorre cada métrica deste bloco como `(nome, Option<&Missing>)` (`None` = `Ok`).
+    /// Compartilhado entre o rodapé (`failing_sources`) e o log de debug (`debug.rs`) para que
+    /// um campo novo nunca fique de fora de um dos dois.
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("name", self.name.as_ref().err());
+        f("topology", self.topology.as_ref().err());
+        f("base_mhz", self.base_mhz.as_ref().err());
+        f("virtualization", self.virtualization.as_ref().err());
+        f("usage", self.usage.as_ref().err());
+        f("per_logical", self.per_logical.as_ref().err());
+        f("kernel_per_logical", self.kernel_per_logical.as_ref().err());
+        f("kernel", self.kernel.as_ref().err());
+        f("freq_mhz", self.freq_mhz.as_ref().err());
+        f("freq_per_logical", self.freq_per_logical.as_ref().err());
+        f("counts", self.counts.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl CpuSensors {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("tctl", self.tctl.as_ref().err());
+        f("ccds", self.ccds.as_ref().err());
+        f("package_power", self.package_power.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl Memory {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("total", self.total.as_ref().err());
+        f("used", self.used.as_ref().err());
+        f("commit", self.commit.as_ref().err());
+        f("cached", self.cached.as_ref().err());
+        f("standby", self.standby.as_ref().err());
+        f("modified", self.modified.as_ref().err());
+        f("paged_pool", self.paged_pool.as_ref().err());
+        f("nonpaged_pool", self.nonpaged_pool.as_ref().err());
+        f("pagefile_usage", self.pagefile_usage.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl Disk {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("model", self.model.as_ref().err());
+        f("bus", self.bus.as_ref().err());
+        f("ssd", self.ssd.as_ref().err());
+        f("capacity", self.capacity.as_ref().err());
+        f("pool_member", self.pool_member.as_ref().err());
+        f("active", self.active.as_ref().err());
+        f("read", self.read.as_ref().err());
+        f("write", self.write.as_ref().err());
+        f("response", self.response.as_ref().err());
+        f("iops", self.iops.as_ref().err());
+        f("queue", self.queue.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl Nic {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("link", self.link.as_ref().err());
+        f("send", self.send.as_ref().err());
+        f("recv", self.recv.as_ref().err());
+        f("errors", self.errors.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl Gpu {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("name", self.name.as_ref().err());
+        f("driver", self.driver.as_ref().err());
+        f("usage", self.usage.as_ref().err());
+        f("dedicated", self.dedicated.as_ref().err());
+        f("shared", self.shared.as_ref().err());
+        f("encoder", self.encoder.as_ref().err());
+        f("decoder", self.decoder.as_ref().err());
+        f("other_engine", self.other_engine.as_ref().err());
+        if self.no_nvml.is_none() {
+            f("vbios", self.vbios.as_ref().err());
+            f("mem_activity", self.mem_activity.as_ref().err());
+            f("physical", self.physical.as_ref().err());
+            f("temp", self.temp.as_ref().err());
+            f("temp_slowdown", self.temp_slowdown.as_ref().err());
+            f("clock_graphics", self.clock_graphics.as_ref().err());
+            f("clock_sm", self.clock_sm.as_ref().err());
+            f("clock_mem", self.clock_mem.as_ref().err());
+            f("clock_video", self.clock_video.as_ref().err());
+            f("power", self.power.as_ref().err());
+            f("fans", self.fans.as_ref().err());
+            if let Ok(fans) = &self.fans {
+                for (i, fan) in fans.iter().enumerate() {
+                    f(&format!("fan{i}.percent"), fan.percent.as_ref().err());
+                    f(&format!("fan{i}.rpm"), fan.rpm.as_ref().err());
+                }
+            }
+            f("pcie_link", self.pcie_link.as_ref().err());
+            f("pstate", self.pstate.as_ref().err());
+            f("throttle", self.throttle.as_ref().err());
+        } else {
+            f("nvml", self.no_nvml.as_ref());
+        }
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl OwnUsage {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("cpu", self.cpu.as_ref().err());
+        f("private_ws", self.private_ws.as_ref().err());
+        f("commit", self.commit.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl Game {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("resolution", self.resolution.as_ref().err());
+        f("fps", self.fps.as_ref().err());
+        f("frametime", self.frametime.as_ref().err());
+        f("lows", self.lows.as_ref().err());
+        f("gpu_time", self.gpu_time.as_ref().err());
+        f("bound", self.bound.as_ref().err());
+    }
+
+    pub fn has_failure(&self) -> bool {
+        any_fail(|f| self.visit_metrics(f))
     }
 }

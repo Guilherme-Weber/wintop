@@ -8,6 +8,13 @@ edition = "2024"
 # A versão com que é compilado e testado (fixada em rust-toolchain.toml).
 rust-version = "1.100"
 
+# Binário separado da lib: o manifesto requireAdministrator (build.rs) vai só no wintop.exe,
+# e os testes unitários rodam pela lib em qualquer terminal sem elevação.
+[[bin]]
+name = "wintop"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 windows = { version = "0.62.2", features = [
     "Wdk_System_SystemInformation",
@@ -111,7 +118,7 @@ windows = { version = "0.62.2", features = [
 
 [[example]]
 name = "fps_probe"
-test = false
+test = true
 
 [[example]]
 name = "spike_framegen"

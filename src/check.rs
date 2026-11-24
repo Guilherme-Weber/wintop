@@ -141,6 +141,7 @@ pub fn run(json: bool) -> i32 {
             procs: true,
             gpu: true,
         },
+        0,
     );
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
     // Só lê: o --check não cria nem grava o config.
@@ -167,8 +168,10 @@ pub fn run(json: bool) -> i32 {
     };
     r.line("config.toml", &state, |()| {
         format!(
-            "{path} (theme {}, interval {} ms)",
-            cfg.config.theme, cfg.config.interval_ms
+            "{path} (theme {}, interval {} ms, debug {})",
+            cfg.config.theme,
+            cfg.config.interval_ms,
+            if cfg.config.debug { "on" } else { "off" }
         )
     });
     own_report(&mut r, &f);
@@ -275,7 +278,14 @@ fn fast_report(r: &mut Report, f: &Fast) {
             r.line("Cached", &m.cached, |v| bytes(*v));
             r.line("Paged pool", &m.paged_pool, |v| bytes(*v));
             r.line("Non-paged pool", &m.nonpaged_pool, |v| bytes(*v));
-            r.line("Page file usage", &m.pagefile_usage, |v| pct(*v));
+            r.line("Page file usage", &m.pagefile_usage, |(u, t)| {
+                format!(
+                    "{} / {} ({})",
+                    bytes(*u),
+                    bytes(*t),
+                    pct(*u as f64 / (*t).max(1) as f64 * 100.0)
+                )
+            });
         }
     }
 
@@ -499,7 +509,7 @@ fn fps_report(r: &mut Report, f: &Fps) {
             r.line("  Resolution", &g.resolution, |(x, y)| format!("{x}x{y}"));
             r.line("  FPS", &g.fps, |v| num(*v, 1));
             if let Some(fg) = &g.framegen {
-                let mult = fg.multiplier.map_or(String::new(), |m| format!(" ({m}x)"));
+                let mult = fg.ratio_text().map_or(String::new(), |m| format!(" ({m})"));
                 r.line("  Real FPS (frame gen)", &Ok(fg.real_fps), |v| {
                     format!("{}{mult}", num(*v, 1))
                 });

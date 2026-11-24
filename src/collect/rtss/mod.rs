@@ -1,77 +1,24 @@
-//! FPS pelo RTSS (thread própria): Shared Memory `RTSSSharedMemoryV2` e pipe de frametime.
-//!
-//! - Shared Memory (v2.x, offsets do MSVC a partir do header oficial; campos novos só se a
-//!   versão e o tamanho da entrada os cobrirem): jogo, API, resolução, tempos de GPU.
-//! - Pipe `\\.\pipe\RTSS_Frametime`: um registro `{dwApp, dwFrametime}` por frame (`dwApp` =
-//!   índice da entrada na Shared Memory; µs). 8 instâncias criadas por nós, DACL restrita,
-//!   rótulo de integridade média, overlapped, sem clientes remotos. O hook do RTSS só conecta no
-//!   início do jogo.
-//! - Jogo aberto antes do wintop: frametime amostrado na Shared Memory a cada 250 ms, marcado
-//!   como aproximado (lows só como ordem de grandeza).
-//! - ETW (`etw.rs`, fonte primária): DXGI `Present_Start` do jogo escolhido aqui (frametime
-//!   exato também para jogos abertos antes do wintop) e marcadores Reflex (frames reais e
-//!   multiplicador do frame gen). Sem frames por ETW (Vulkan, OpenGL, D3D9), vale o pipe.
-//! - Lows (1% e 0,1%) calculados pelo wintop numa janela de 60 s (os do RTSS só existem no
-//!   modo benchmark).
+//! FPS pelo RTSS e ETW (thread própria): Shared Memory RTSSSharedMemoryV2 (shm.rs), pipe de
+//! frametime (pipe.rs) e agregação de frames/lows/frame gen (ETW + pipe + Shared Memory).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
+
+mod pipe;
+mod shm;
+
+use pipe::{
+    INSTANCES, Instance, MAX_FRAMES, MAX_KNOWN, MAX_SIGNALS_PER_PUMP, Pending, create_pipe,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
-    PIPE_ACCESS_DUPLEX, ReadFile,
-};
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
-};
-use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::System::Threading::{
-    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
-};
-use windows::core::PCWSTR;
+pub use shm::hooked_now;
+use shm::{ACTIVE_MS, App, SHM_NAME, api_name, is_ignored, read_apps, select_game, start_rtss};
 
 use crate::collect::etw;
 use crate::model::{Fps, FrameGen, FrameSource, Game, Metric, Missing, fail, neutral};
 use crate::shm::SharedView;
-use crate::win::{self, own, wide};
-
-// RTSS_SHARED_MEMORY
-const SHM_NAME: &str = "RTSSSharedMemoryV2";
-const RTSS_SIGNATURE: u32 = 0x5254_5353; // 'RTSS'
-const RTSS_DEAD: u32 = 0xDEAD;
-const OFF_VERSION: usize = 4;
-const OFF_APP_ENTRY_SIZE: usize = 8;
-const OFF_APP_ARR_OFFSET: usize = 12;
-const OFF_APP_ARR_SIZE: usize = 16;
-const OFF_LAST_FOREGROUND_PID: usize = 68; // v2.16+
-// RTSS_SHARED_MEMORY_APP_ENTRY (offsets do compilador MSVC, header v2.21)
-const E_PID: usize = 0;
-const E_NAME: usize = 4;
-const E_FLAGS: usize = 264;
-const E_TIME0: usize = 268;
-const E_TIME1: usize = 272;
-const E_FRAMES: usize = 276;
-const E_FRAME_TIME: usize = 280;
-const E_RES_X: usize = 9224; // v2.20+
-const E_RES_Y: usize = 9228;
-const E_GPU_ACTIVE: usize = 9336; // v2.21+
-const E_GPU_FRAME: usize = 9340;
-const V2_16: u32 = 0x0002_0010;
-const V2_20: u32 = 0x0002_0014;
-const V2_21: u32 = 0x0002_0015;
-const MAX_APPS: usize = 256;
 
 /// Janela em que um jogo exato (pipe) continua exato sem frames: acima de `ACTIVE_MS` (que usa
 /// o relógio do RTSS, de 15,6 ms), para um travamento de ~2 s não piscar como "approx.".
@@ -80,8 +27,6 @@ const EXACT_GRACE: Duration = Duration::from_millis(ACTIVE_MS as u64 + 500);
 const FREEZE_MIN_US: u64 = 50_000;
 /// Período mais longo entre amostras da thread do RTSS (sem jogo).
 const RTSS_PERIOD_MAX: Duration = Duration::from_secs(1);
-/// Idade máxima do último período de FPS para o app contar como "ativo".
-const ACTIVE_MS: u32 = 2000;
 /// Janela dos lows.
 const WINDOW: Duration = Duration::from_secs(60);
 /// Recalcular os lows no máximo uma vez por segundo (ordenar ~9 mil frames).
@@ -92,7 +37,6 @@ const GPU_BOUND: f64 = 0.9;
 const RTSS_START_GRACE: Duration = Duration::from_secs(15);
 /// Sem Shared Memory depois de iniciar: nova tentativa a cada minuto.
 const RTSS_START_RETRY: Duration = Duration::from_secs(60);
-const RTSS_KEY: &str = r"SOFTWARE\Unwinder\RTSS";
 /// Atraso da entrega do ETW (flush de 100 ms + consumidor): as contas dos frames por ETW usam
 /// "agora" menos isto, para o último segundo não parecer vazio nem um congelamento.
 const ETW_LAG: Duration = Duration::from_millis(250);
@@ -109,158 +53,6 @@ const MAX_REAL: usize = 4096;
 const MULT_FRESH: Duration = Duration::from_secs(2);
 /// Sem multiplicador informado: apresentados/reais a partir disto = frame gen.
 const FG_RATIO: f64 = 1.6;
-
-fn api_name(flags: u32) -> &'static str {
-    match flags & 0xFFFF {
-        0x1 => "OpenGL",
-        0x2 => "DirectDraw",
-        0x3 => "D3D8",
-        0x4 => "D3D9",
-        0x5 => "D3D9Ex",
-        // O RTSS informa D3D10 para jogos D3D11 (Deadlock: 0x6, e o jogo carrega D3D11). Os
-        // dois passam pelo DXGI e confirmar a API exigiria ler os módulos do jogo (proibido
-        // pelo anticheat): nunca afirmar a errada.
-        0x6 | 0x7 => "D3D10/11",
-        0x8 => "D3D12",
-        0x9 => "D3D12 AFR",
-        0xA => "Vulkan",
-        0 => "none",
-        _ => "unknown API",
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct App {
-    /// Índice da entrada na Shared Memory (= `dwApp` do pipe).
-    index: u32,
-    pid: u32,
-    name: String,
-    api: u32,
-    fps: f64,
-    frametime_us: u32,
-    /// ms desde o fim do último período de FPS; `None` = nenhum período registrado.
-    age_ms: Option<u32>,
-    res: Option<(u32, u32)>,
-    gpu: Option<(u32, u32)>,
-}
-
-/// Idade sem underflow: `now` é lido depois de `t1`; diferença "negativa" = 0.
-fn age_ms(now: u32, t1: u32) -> Option<u32> {
-    if t1 == 0 {
-        return None;
-    }
-    let d = now.wrapping_sub(t1);
-    Some(if d > i32::MAX as u32 { 0 } else { d })
-}
-
-/// Aplicativos da Shared Memory, PID em primeiro plano e versão.
-fn read_apps(v: &SharedView) -> Result<(Vec<App>, Option<u32>, u32), String> {
-    // SAFETY: sem pré-condições; lido a cada entrada, depois de `t1` (ver `age_ms`).
-    read_apps_at(v, || unsafe { GetTickCount() })
-}
-
-/// Como `read_apps`, com o relógio dado (o fuzz usa um instante fixo: sementes reproduzíveis).
-fn read_apps_at(
-    v: &SharedView,
-    tick: impl Fn() -> u32,
-) -> Result<(Vec<App>, Option<u32>, u32), String> {
-    let oob = || "RTSS shared memory read out of bounds".to_string();
-    let sig = v.u32_at(0).ok_or_else(oob)?;
-    if sig == RTSS_DEAD {
-        return Err("RTSS is shutting down".into());
-    }
-    if sig != RTSS_SIGNATURE {
-        return Err(format!("invalid RTSS signature {sig:#x}"));
-    }
-    let ver = v.u32_at(OFF_VERSION).ok_or_else(oob)?;
-    if ver >> 16 != 2 {
-        return Err(format!(
-            "unsupported RTSS shared memory {}.{}",
-            ver >> 16,
-            ver & 0xFFFF
-        ));
-    }
-    let esize = v.u32_at(OFF_APP_ENTRY_SIZE).ok_or_else(oob)? as usize;
-    let arr = v.u32_at(OFF_APP_ARR_OFFSET).ok_or_else(oob)? as usize;
-    let count = (v.u32_at(OFF_APP_ARR_SIZE).ok_or_else(oob)? as usize).min(MAX_APPS);
-    if esize < E_FRAME_TIME + 4 {
-        return Err(format!("RTSS app entry of {esize} bytes is too small"));
-    }
-    let has_res = ver >= V2_20 && esize >= E_RES_Y + 4;
-    let has_gpu = ver >= V2_21 && esize >= E_GPU_FRAME + 4;
-    let fg = if ver >= V2_16 {
-        v.u32_at(OFF_LAST_FOREGROUND_PID)
-    } else {
-        None
-    };
-    let mut apps = Vec::new();
-    for i in 0..count {
-        let e = v.entry(arr, i, esize).ok_or_else(oob)?;
-        let pid = v.u32_at(e + E_PID).ok_or_else(oob)?;
-        if pid == 0 {
-            continue;
-        }
-        let name = v.cstr(e + E_NAME, 260).ok_or_else(oob)?;
-        let name = name.rsplit('\\').next().unwrap_or(&name).to_string();
-        let t0 = v.u32_at(e + E_TIME0).ok_or_else(oob)?;
-        let t1 = v.u32_at(e + E_TIME1).ok_or_else(oob)?;
-        let frames = v.u32_at(e + E_FRAMES).ok_or_else(oob)?;
-        let now = tick();
-        let span = t1.wrapping_sub(t0);
-        let fps = if t0 != 0 && span > 0 && span < 60_000 {
-            1000.0 * f64::from(frames) / f64::from(span)
-        } else {
-            0.0
-        };
-        let pair = |a: usize, b: usize| -> Result<(u32, u32), String> {
-            Ok((
-                v.u32_at(e + a).ok_or_else(oob)?,
-                v.u32_at(e + b).ok_or_else(oob)?,
-            ))
-        };
-        apps.push(App {
-            index: i as u32,
-            pid,
-            name,
-            api: v.u32_at(e + E_FLAGS).ok_or_else(oob)? & 0xFFFF,
-            fps,
-            frametime_us: v.u32_at(e + E_FRAME_TIME).ok_or_else(oob)?,
-            age_ms: age_ms(now, t1),
-            res: if has_res {
-                Some(pair(E_RES_X, E_RES_Y)?)
-            } else {
-                None
-            },
-            gpu: if has_gpu {
-                Some(pair(E_GPU_ACTIVE, E_GPU_FRAME)?)
-            } else {
-                None
-            },
-        });
-    }
-    Ok((apps, fg, ver))
-}
-
-/// Nome de executável na lista de ignorados (comparação sem diferenciar maiúsculas).
-fn is_ignored(list: &[String], name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    list.contains(&n)
-}
-
-/// Jogo atual: ativo, com API 3D e fora da lista de ignorados; o primeiro plano desempata,
-/// senão o de maior FPS.
-fn select_game<'a>(apps: &'a [App], fg: Option<u32>, ignored: &[String]) -> Option<&'a App> {
-    let candidates: Vec<&App> = apps
-        .iter()
-        .filter(|a| a.api != 0 && a.age_ms.is_some_and(|m| m < ACTIVE_MS))
-        .filter(|a| !is_ignored(ignored, &a.name))
-        .collect();
-    candidates
-        .iter()
-        .find(|a| Some(a.pid) == fg)
-        .or_else(|| candidates.iter().max_by(|a, b| a.fps.total_cmp(&b.fps)))
-        .copied()
-}
 
 /// (1% low, 0,1% low) em FPS: média dos frametimes do 1% (0,1%) mais lento. Exige 100
 /// amostras; com menos de 1000, o 0,1% usa o pior frame.
@@ -470,367 +262,14 @@ impl EtwFrames {
             Some(m) => m >= 2,
             None => real >= 5 && presented / real as f64 >= FG_RATIO,
         };
+        let effective =
+            (real >= 5 && presented > 0.0).then(|| (presented / real as f64).clamp(1.0, 16.0));
         (real > 0 && active).then_some(FrameGen {
             real_fps: real as f64,
             multiplier: mult,
+            effective,
         })
     }
-}
-
-/// Registros completos de 8 bytes; a sobra de uma mensagem partida (`ERROR_MORE_DATA`) fica em
-/// `carry`; sobra numa mensagem completa (malformada) é descartada.
-///
-/// `known`: índices de apps (fora dos ignorados) na última leitura da Shared Memory. Um índice
-/// ainda desconhecido (jogo que acabou de abrir, antes da próxima amostra) entra com teto
-/// pequeno, em no máximo `MAX_UNKNOWN_RINGS` filas: um cliente local inundando o pipe com
-/// índices inventados não faz a memória crescer.
-fn feed(
-    rings: &mut HashMap<u32, Ring>,
-    known: &HashSet<u32>,
-    ignored: &HashSet<u32>,
-    carry: &mut Vec<u8>,
-    data: &[u8],
-    complete: bool,
-) {
-    carry.extend_from_slice(data);
-    let whole = carry.len() / 8 * 8;
-    let now = Instant::now();
-    let mut unknown = rings.keys().filter(|i| !known.contains(i)).count();
-    for rec in carry[..whole].as_chunks::<8>().0 {
-        let app = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-        let us = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-        // Índice fora da Shared Memory ou frametime 0 (sem delta): registro ignorado.
-        if (app as usize) >= MAX_APPS || us == 0 || ignored.contains(&app) {
-            continue;
-        }
-        if known.contains(&app) {
-            rings.entry(app).or_default().push(now, us);
-        } else if let Some(r) = rings.get_mut(&app) {
-            r.push_capped(now, us, UNKNOWN_FRAMES);
-        } else if unknown < MAX_UNKNOWN_RINGS {
-            unknown += 1;
-            rings
-                .entry(app)
-                .or_default()
-                .push_capped(now, us, UNKNOWN_FRAMES);
-        }
-    }
-    carry.drain(..whole);
-    if complete {
-        carry.clear();
-    }
-}
-
-// --- Pipe ---
-
-const INSTANCES: usize = 8;
-/// Buffer de leitura por instância: 512 registros de 8 bytes por leitura (mensagens maiores
-/// chegam em partes, com ERROR_MORE_DATA).
-const BUF: usize = 4 * 1024;
-/// Frames guardados por app: 1000 FPS × 60 s.
-const MAX_FRAMES: usize = 60_000;
-/// Conclusões de leitura atendidas por período: acima disso o pipe espera o próximo período
-/// (um cliente inundando não prende a thread num laço).
-const MAX_SIGNALS_PER_PUMP: u32 = 1024;
-/// Índices ainda fora da Shared Memory: quantos e quantos frames cada (4 s a 1000 FPS).
-const MAX_UNKNOWN_RINGS: usize = 8;
-/// Apps com a janela completa de frames (os 3D mais recentes da Shared Memory).
-const MAX_KNOWN: usize = 8;
-const UNKNOWN_FRAMES: usize = 4096;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pending {
-    None,
-    Connect,
-    /// Cliente conectou antes do `ConnectNamedPipe`: evento sinalizado à mão.
-    Connected,
-    /// Rearmar a conexão no próximo ciclo (ex.: `ERROR_NO_DATA`), sem recursão.
-    Rearm,
-    Read,
-}
-
-/// Uma instância do pipe. `ov` e `buf` em Box: o endereço não muda com I/O pendente. Toda
-/// conclusão passa pelo evento e é tratada no laço (`on_signal`), uma por vez.
-struct Instance {
-    pipe: OwnedHandle,
-    event: OwnedHandle,
-    ov: Box<OVERLAPPED>,
-    buf: Box<[u8]>,
-    carry: Vec<u8>,
-    pending: Pending,
-    connected: bool,
-}
-
-fn h(o: &OwnedHandle) -> HANDLE {
-    HANDLE(o.as_raw_handle())
-}
-
-impl Instance {
-    fn create(name: &[u16], first: bool, sa: &SECURITY_ATTRIBUTES) -> Result<Self, String> {
-        let mut mode: FILE_FLAGS_AND_ATTRIBUTES = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
-        if first {
-            mode |= FILE_FLAG_FIRST_PIPE_INSTANCE; // falha se outro servidor já existe
-        }
-        // SAFETY: atributos válidos durante a chamada.
-        let pipe = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(name.as_ptr()),
-                mode,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                INSTANCES as u32, // limite fixo: ninguém cria instâncias além das nossas
-                BUF as u32,
-                BUF as u32,
-                0,
-                Some(sa),
-            )
-        };
-        if pipe.is_invalid() {
-            return Err(format!(
-                "CreateNamedPipe: {}",
-                windows::core::Error::from_thread()
-            ));
-        }
-        // SAFETY: handle válido recém-criado, com um único dono.
-        let pipe = unsafe { own(pipe) };
-        // SAFETY: evento manual sem nome.
-        let event = unsafe { CreateEventW(None, true, false, None) }
-            .map_err(|e| format!("CreateEvent: {e}"))?;
-        // SAFETY: handle válido recém-criado, com um único dono.
-        let event = unsafe { own(event) };
-        let ov = Box::new(OVERLAPPED {
-            hEvent: h(&event),
-            ..Default::default()
-        });
-        Ok(Self {
-            pipe,
-            event,
-            ov,
-            buf: vec![0u8; BUF].into_boxed_slice(),
-            carry: Vec::new(),
-            pending: Pending::None,
-            connected: false,
-        })
-    }
-
-    fn fresh_ov(&mut self) {
-        *self.ov = OVERLAPPED {
-            hEvent: h(&self.event),
-            ..Default::default()
-        };
-    }
-
-    fn signal(&self) {
-        // SAFETY: evento válido.
-        unsafe {
-            let _ = SetEvent(h(&self.event));
-        }
-    }
-
-    fn start_connect(&mut self) {
-        self.connected = false;
-        self.carry.clear();
-        self.fresh_ov();
-        // SAFETY: `ov` (em Box) vive até a conclusão ou o cancelamento.
-        match unsafe { ConnectNamedPipe(h(&self.pipe), Some(&raw mut *self.ov)) } {
-            Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => self.pending = Pending::Connect,
-            Ok(()) => {
-                self.pending = Pending::Connected;
-                self.signal();
-            }
-            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
-                self.pending = Pending::Connected;
-                self.signal();
-            }
-            Err(e) if e.code() == ERROR_NO_DATA.to_hresult() => {
-                // O cliente conectou e fechou antes: desconecta e rearma no próximo ciclo.
-                // SAFETY: pipe válido; sem I/O pendente.
-                unsafe {
-                    let _ = DisconnectNamedPipe(h(&self.pipe));
-                }
-                self.pending = Pending::Rearm;
-                self.signal();
-            }
-            Err(_) => self.pending = Pending::None, // instância desativada
-        }
-    }
-
-    fn reconnect(&mut self) {
-        // SAFETY: pipe válido; sem I/O pendente aqui.
-        unsafe {
-            let _ = DisconnectNamedPipe(h(&self.pipe));
-        }
-        self.start_connect();
-    }
-
-    fn start_read(&mut self) {
-        self.fresh_ov();
-        // SAFETY: `buf` e `ov` (em Box) vivem até a conclusão ou o cancelamento.
-        let r = unsafe {
-            ReadFile(
-                h(&self.pipe),
-                Some(&mut self.buf),
-                None,
-                Some(&raw mut *self.ov),
-            )
-        };
-        match r {
-            Ok(()) => self.pending = Pending::Read,
-            Err(e)
-                if e.code() == ERROR_IO_PENDING.to_hresult()
-                    || e.code() == ERROR_MORE_DATA.to_hresult() =>
-            {
-                self.pending = Pending::Read;
-            }
-            Err(_) => {
-                self.pending = Pending::None;
-                self.reconnect();
-            }
-        }
-    }
-
-    /// O evento sinalizou: trata uma conclusão e arma a próxima operação.
-    fn on_signal(
-        &mut self,
-        rings: &mut HashMap<u32, Ring>,
-        known: &HashSet<u32>,
-        ignored: &HashSet<u32>,
-    ) {
-        // SAFETY: evento válido; a próxima operação (ou `signal`) volta a sinalizá-lo.
-        unsafe {
-            let _ = ResetEvent(h(&self.event));
-        }
-        let state = std::mem::replace(&mut self.pending, Pending::None);
-        let mut n = 0u32;
-        match state {
-            Pending::None => {}
-            Pending::Rearm => self.start_connect(),
-            Pending::Connected => {
-                self.connected = true;
-                self.start_read();
-            }
-            Pending::Connect => {
-                // SAFETY: conexão concluída sobre `ov`.
-                let r = unsafe {
-                    GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, false)
-                };
-                if r.is_ok() {
-                    self.connected = true;
-                    self.start_read();
-                } else {
-                    self.reconnect();
-                }
-            }
-            Pending::Read => {
-                // SAFETY: leitura concluída sobre `ov` (o evento sinalizou).
-                let r = unsafe {
-                    GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, false)
-                };
-                let got = (n as usize).min(self.buf.len());
-                match r {
-                    Ok(()) => {
-                        feed(
-                            rings,
-                            known,
-                            ignored,
-                            &mut self.carry,
-                            &self.buf[..got],
-                            true,
-                        );
-                        self.start_read();
-                    }
-                    Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                        feed(
-                            rings,
-                            known,
-                            ignored,
-                            &mut self.carry,
-                            &self.buf[..got],
-                            false,
-                        );
-                        self.start_read();
-                    }
-                    Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
-                    Err(_) => self.reconnect(),
-                }
-            }
-        }
-    }
-
-    /// Cancela o I/O pendente e espera a conclusão (nunca solta `ov`/`buf` com I/O no kernel).
-    fn cancel(&mut self) {
-        if !matches!(self.pending, Pending::Connect | Pending::Read) {
-            return;
-        }
-        let mut n = 0u32;
-        // SAFETY: cancela a operação sobre `ov` e espera a conclusão antes de soltar o Box.
-        unsafe {
-            let _ = CancelIoEx(h(&self.pipe), Some(&raw const *self.ov));
-            let _ = GetOverlappedResult(h(&self.pipe), &raw const *self.ov, &raw mut n, true);
-        }
-        self.pending = Pending::None;
-    }
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// As 8 instâncias do pipe, ou erro. Todas ou nenhuma: uma vaga livre deixaria outro processo
-/// do usuário criar uma instância e receber conexões do hook (GW inclui CREATE_PIPE_INSTANCE).
-/// Nome do pipe que o hook do RTSS procura.
-const PIPE_NAME: &str = r"\\.\pipe\RTSS_Frametime";
-
-fn create_pipe() -> Result<Vec<Instance>, String> {
-    create_pipe_named(PIPE_NAME)
-}
-
-fn create_pipe_named(name: &str) -> Result<Vec<Instance>, String> {
-    let name = wide(name);
-    let sid = crate::win::user_sid().ok_or("could not read the user SID")?;
-    // DACL protegida: SYSTEM e Administradores com controle total; o usuário (jogo sem
-    // elevação) com GRGW, sem WRITE_DAC/WRITE_OWNER. Rótulo de integridade média.
-    let sddl = wide(&format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})S:(ML;;NW;;;ME)"
-    ));
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &raw mut sd,
-            None,
-        )
-    }
-    .map_err(|e| format!("pipe SDDL: {e}"))?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: false.into(),
-    };
-    let instances: Result<Vec<Instance>, String> = (0..INSTANCES)
-        .map(|i| Instance::create(&name, i == 0, &sa))
-        .collect();
-    // SAFETY: descritor alocado acima; as instâncias já foram criadas.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
-    let mut instances =
-        instances.map_err(|e| format!("frametime pipe (another server running?): {e}"))?;
-    for inst in &mut instances {
-        inst.start_connect();
-    }
-    Ok(instances)
-}
-
-/// PIDs com o hook do RTSS agora (leitura direta da Shared Memory, sem esperar a thread do
-/// RTSS): a última checagem antes de abrir um processo sob demanda.
-pub fn hooked_now() -> Result<Vec<u32>, String> {
-    let v = SharedView::open(SHM_NAME).ok_or("RTSS shared memory unavailable")?;
-    let (apps, _, _) = read_apps(&v)?;
-    Ok(apps.iter().map(|a| a.pid).collect())
 }
 
 // --- Coletor ---
@@ -959,7 +398,7 @@ impl RtssCollector {
                 let k = (i + self.turn) % instances.len();
                 if instances[k].pending != Pending::None {
                     armed[n] = k;
-                    events[n + 1] = h(&instances[k].event);
+                    events[n + 1] = instances[k].event_handle();
                     n += 1;
                 }
             }
@@ -1155,7 +594,10 @@ impl RtssCollector {
         };
         let mut events = std::mem::take(&mut self.frames.scratch);
         // Descartes (caixa cheia) só acontecem numa inundação: os frames que chegaram valem.
-        let _ = s.drain(&mut events);
+        let dropped = s.drain(&mut events);
+        if dropped > 0 {
+            crate::debug::log("etw", &format!("dropped {dropped} events (inbox full)"));
+        }
         // Relógios lidos juntos: a idade de cada evento vira um `Instant` sem desvio.
         let (now, qpc) = (Instant::now(), etw::qpc_now());
         self.frames.ingest(&mut events, qpc, s.freq(), now);
@@ -1346,39 +788,12 @@ fn min_max_ms(us: &[u32]) -> Option<(f64, f64)> {
     Some((f64::from(*lo) / 1000.0, f64::from(*hi) / 1000.0))
 }
 
-/// Inicia o RTSS pelo caminho do registro (visão de 32 bits; o RTSS é um programa de 32 bits).
-fn start_rtss() -> Result<(), String> {
-    let path = win::reg_sz_32(RTSS_KEY, "InstallPath").ok_or("RTSS not installed")?;
-    let path = std::path::PathBuf::from(path);
-    if !win::is_local_absolute(&path) || !path.is_file() {
-        return Err(format!("invalid RTSS InstallPath {}", path.display()));
-    }
-    let dir = path.parent().ok_or("RTSS InstallPath has no folder")?;
-    // O RTSS roda elevado (filho do wintop): só de uma pasta que ninguém sem elevação altera.
-    crate::install::trusted_file(&path)?;
-    // Diretório de trabalho = pasta do RTSS (não o do wintop, que pode ser gravável pelo
-    // usuário) e sem herdar a entrada e a saída do wintop. PATH só com as pastas do sistema: o
-    // herdado vem do ambiente do usuário (HKCU\Environment), e uma DLL procurada no PATH viraria
-    // código do usuário rodando elevado.
-    // Processo próprio e fora do grupo de console do wintop (Ctrl+C no wintop não o atinge).
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let sys = win::system_dir().ok_or("System32 not found")?;
-    let windir = win::windows_dir().ok_or("Windows folder not found")?;
-    std::process::Command::new(&path)
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .current_dir(dir)
-        .env("PATH", format!("{};{}", sys.display(), windir.display()))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
-        .map_err(|e| format!("could not start {}: {e}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+
+    use super::pipe::*;
+    use super::shm::*;
     use super::*;
 
     fn app(index: u32, name: &str, api: u32, fps: f64, age: Option<u32>) -> App {
@@ -1765,13 +1180,27 @@ mod tests {
         let t = |now: Instant| now - ETW_LAG;
         let presented =
             |f: &EtwFrames, now: Instant| f.chains[&1].ring.last_second(t(now)).count() as f64;
-        // 4x informado: real = 1/4 dos apresentados.
+        // 4x informado: real = 1/4 dos apresentados, razão efetiva ~4x.
         let (f, now) = etw_frames(200, 4, Some(4), 3);
         let p = presented(&f, now);
         let fg = f.framegen(t(now), now, p).expect("frame gen 4x");
         assert_eq!(fg.multiplier, Some(4));
         assert!((fg.real_fps - 50.0).abs() <= 1.0, "{fg:?}");
+        assert_eq!(fg.ratio_text().as_deref(), Some("4x"));
         assert!((199.0..=201.0).contains(&p), "{p}");
+        // Razão dinâmica (MFG dinâmico: multiplicador nominal 4, mas efetivo ~2.5x).
+        let dyn_fg = crate::model::FrameGen {
+            real_fps: 60.0,
+            multiplier: Some(4),
+            effective: Some(2.5),
+        };
+        assert_eq!(dyn_fg.ratio_text().as_deref(), Some("2.5x"));
+        let near_int = crate::model::FrameGen {
+            real_fps: 50.0,
+            multiplier: Some(4),
+            effective: Some(3.96),
+        };
+        assert_eq!(near_int.ratio_text().as_deref(), Some("4x"));
         // Fila do ETW em ordem de tempo, mesmo com o evento fora de ordem.
         let ring = &f.chains[&1].ring.frames;
         assert!(

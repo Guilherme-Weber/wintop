@@ -123,7 +123,7 @@ pub(super) fn fast(step: u32) -> Fast {
             modified: Ok(GB),
             paged_pool: Ok(GB),
             nonpaged_pool: Ok(889 * MB),
-            pagefile_usage: Ok(0.8),
+            pagefile_usage: Ok((131 * MB, 16 * GB)),
         }),
         disks: Ok(vec![
             disk(0, "Netac SSD 512GB", &["E:"], Bus::Sata, true, false),
@@ -207,6 +207,7 @@ fn slow() -> Slow {
             t(8, Ok(40), "pool members"),
         ]),
         procs: None,
+        game_ram: Some((4242, 6 * GB)),
         took: Duration::from_millis(60),
     }
 }
@@ -443,6 +444,7 @@ fn frame_gen_mostra_fps_real() {
         g.framegen = Some(crate::model::FrameGen {
             real_fps: 47.0,
             multiplier: Some(4),
+            effective: Some(4.0),
         });
     }
     st.push_fps(s);
@@ -451,6 +453,21 @@ fn frame_gen_mostra_fps_real() {
     let out = render(&mut st, 160, 48);
     assert!(out.contains("ETW: exact"), "{out}");
     assert!(out.contains("FPS 190 · real 47 (4x)"), "{out}");
+    // Frame gen dinâmico (razão efetiva diferente do multiplicador nominal).
+    let mut dyn_fg = game();
+    if let Ok(g) = &mut dyn_fg.game {
+        g.source = crate::model::FrameSource::Etw;
+        g.fps = Ok(150.0);
+        g.framegen = Some(crate::model::FrameGen {
+            real_fps: 60.0,
+            multiplier: Some(4),
+            effective: Some(2.5),
+        });
+    }
+    st.push_fps(dyn_fg);
+    st.push_fast(fast(3));
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("FPS 150 · real 60 (2.5x)"), "{out}");
     // Falha do ETW (sem frame gen): linha própria com a causa.
     let mut s = game();
     s.etw = fail("StartTrace: access denied");
@@ -1586,4 +1603,119 @@ fn ajuda_pt_br() {
     let mut st = filled();
     st.help = true;
     insta::assert_snapshot!(pt_br(st, 160, 40));
+}
+
+#[test]
+fn melhorias_v13_barra_temp_divisor_vram_ram_do_jogo_e_cores_semanticas() {
+    let mut st = filled();
+    let mut t = Terminal::new(TestBackend::new(160, 48)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let out = t.backend().to_string();
+    // Divisor horizontal da VRAM na caixa da GPU (espelhando "── memory").
+    assert!(out.contains("── memory "), "{out}");
+    assert!(out.contains("── vram "), "{out}");
+    // RAM do jogo em foco aparece destacada na legenda da RAM.
+    assert!(out.contains("■ game 6.0G"), "{out}");
+    // Termômetros verticais de CPU (61° / 95°) e GPU (45° / 90°).
+    assert!(out.contains(" 61°") && out.contains(" 95°"), "{out}");
+    assert!(out.contains(" 45°") && out.contains(" 90°"), "{out}");
+    // Bordas continuam intactas em vários tamanhos.
+    for (w, h) in [(80, 24), (120, 30), (160, 48), (210, 52)] {
+        bordas_intactas(&mut st, w, h);
+    }
+    // Cores semânticas: "sources: all OK" em `th().ok` e "none" do throttle em `th().ok`.
+    let buf = t.backend().buffer();
+    let th = super::theme::th();
+    let has_colored = |needle: &str, color: ratatui::style::Color| -> bool {
+        let chars: Vec<char> = needle.chars().collect();
+        (0..48u16).any(|y| {
+            (0..=160u16.saturating_sub(chars.len() as u16)).any(|x| {
+                chars.iter().enumerate().all(|(k, c)| {
+                    buf[(x + k as u16, y)].symbol() == c.to_string()
+                        && buf[(x + k as u16, y)].fg == color
+                })
+            })
+        })
+    };
+    assert!(
+        has_colored("all OK", th.ok),
+        "rodapé all OK sem cor th().ok"
+    );
+    assert!(
+        has_colored("enabled", th.ok),
+        "virt enabled sem cor th().ok"
+    );
+    assert!(has_colored("none", th.ok), "throttle none sem cor th().ok");
+    // Jogo fechado (ocioso): aviso atualizado e RAM do jogo some da legenda.
+    let mut idle = game();
+    idle.game = neutral("no game in focus");
+    st.push_fps(idle);
+    st.push_fast(fast(121));
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("graphs scroll while idle · r resets"), "{out}");
+    assert!(!out.contains("■ game 6.0G"), "{out}");
+}
+
+#[test]
+fn tema_mono_continua_monocromatico_exceto_falha() {
+    let mono = super::theme::build("mono", &[]);
+    for c in [
+        mono.border,
+        mono.title,
+        mono.text,
+        mono.label,
+        mono.accent,
+        mono.ok,
+        mono.warn,
+        mono.neutral,
+        mono.selected,
+        mono.dim,
+    ] {
+        let ratatui::style::Color::Rgb(r, g, b) = c else {
+            panic!("esperava Rgb: {c:?}");
+        };
+        assert_eq!((r, g), (g, b), "cor não-cinza no tema mono: {c:?}");
+    }
+}
+
+#[test]
+fn engines_da_gpu_tem_altura_e_passo_identicos() {
+    let mut st = filled();
+    // Força 3D dominante para os 4 gráficos serem copy / encode / decode / mem act,
+    // cobrindo todos os restos (0, 1, 2, 3) ao variar a altura do terminal.
+    let mut f = fast(1);
+    if let Ok(gpus) = &mut f.gpus {
+        gpus[0].usage = Ok(80);
+        gpus[0].encoder = Ok(0);
+        gpus[0].decoder = Ok(0);
+        gpus[0].mem_activity = Ok(1);
+        gpus[0].other_engine = Ok(("Copy".into(), 0));
+    }
+    st.push_fast(f);
+    for h in 44..=55u16 {
+        let out = render(&mut st, 210, h);
+        let lines: Vec<&str> = out.lines().collect();
+        let row_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} ausente em 210x{h}:\n{out}"))
+        };
+        let y_copy = row_of("copy ");
+        let y_enc = row_of("encode ");
+        let y_dec = row_of("decode ");
+        let y_mem = row_of("mem act ");
+        let y_bot = row_of(" 45°");
+        let step = y_enc - y_copy;
+        assert!(step >= 2, "passo muito pequeno em 210x{h}: {step}");
+        assert_eq!(y_dec - y_enc, step, "encode diferente em 210x{h}");
+        assert_eq!(y_mem - y_dec, step, "decode diferente em 210x{h}");
+        assert_eq!(
+            y_bot - y_mem + 1,
+            step,
+            "mem act ({}) diferente dos demais ({step}) em 210x{h}",
+            y_bot - y_mem + 1
+        );
+        bordas_intactas(&mut st, 210, h);
+    }
 }

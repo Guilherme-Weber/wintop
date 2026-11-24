@@ -1439,7 +1439,22 @@ fn value_room(widths: &[Option<u16>]) -> usize {
 fn value_span(r: &SensorRow) -> Span<'static> {
     match &r.value {
         SensorValue::Num(m, unit, dec) => metric(m, |v| format!("{} {unit}", num(*v, *dec))),
-        SensorValue::Text(m) => metric(m, Clone::clone),
+        SensorValue::Text(m) => match m {
+            Ok(v) if r.name.trim() == "SMART" && v == "OK" => {
+                Span::styled(v.clone(), Style::new().fg(th().ok))
+            }
+            Ok(v) if r.name.trim() == "SMART" && v == "FAILURE PREDICTED" => Span::styled(
+                tr(v).into_owned(),
+                Style::new().fg(th().fail).add_modifier(Modifier::BOLD),
+            ),
+            Ok(v) if r.name == "Throttle" && v == "none" => {
+                Span::styled(tr(v).into_owned(), Style::new().fg(th().ok))
+            }
+            Ok(v) if r.name == "Throttle" && v != "idle" => {
+                Span::styled(printable(&tr(v)), Style::new().fg(th().warn))
+            }
+            _ => metric(m, Clone::clone),
+        },
     }
 }
 
