@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.3.1] - 2026-11-24
+
 ### Alterado
 
 - Barras horizontais (`RAM`, `commit`, `pagefile`, `VRAM` e `shared`) convertidas de blocos sólidos
