@@ -18,6 +18,11 @@ use crate::model::{Counts, Cpu, Metric, Topology, fail};
 use crate::pdh::{self, Query, Slot};
 use crate::win::filetime;
 
+/// Quantas coletas seguidas toleram um erro transitório de cálculo do PDH (`0x800007D6..D8`,
+/// ex.: passo de relógio/NTP ou delta negativo numa amostra isolada) repetindo a última leitura
+/// válida antes de exibir falha real.
+const TRANSIENT_LIMIT: u8 = 3;
+
 pub struct CpuCollector {
     query: Result<Query, String>,
     per: Slot,
@@ -33,6 +38,12 @@ pub struct CpuCollector {
     /// numa coleta repete o anterior, sem sumir da lista (sumir desalinharia as três listas e
     /// recriaria a grade de gráficos).
     last: [Vec<f64>; 3],
+    /// Últimos valores válidos de `_Total` (uso e desempenho) para absorver falhas transitórias
+    /// de cálculo do PDH (`0x800007D6..D8`) por até `TRANSIENT_LIMIT` coletas seguidas.
+    last_total: [Option<f64>; 2],
+    /// Coletas seguidas com erro transitório de cálculo do PDH em cada contador (`per`,
+    /// `per_kernel`, `perf`).
+    transient_streak: [u8; 3],
 }
 
 impl CpuCollector {
@@ -67,6 +78,8 @@ impl CpuCollector {
             virtualization: Ok(virt),
             times: None,
             last: Default::default(),
+            last_total: [None, None],
+            transient_streak: [0; 3],
         }
     }
 
@@ -82,58 +95,57 @@ impl CpuCollector {
         let sampled = self.sample();
         // Um contador só: a instância `_Total` vem junto com as dos lógicos.
         let array = match &sampled {
-            Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.per).or_else(fail),
+            Err(e) => Err(e.clone()),
+            Ok(()) => pdh::read_array_all(&self.query, &self.per),
         };
-        let usage = array.as_ref().map_err(Clone::clone).and_then(|a| {
-            a.iter()
-                .find(|(n, _)| n == "_Total")
-                .map(|(_, v)| *v)
-                .filter(|v| v.is_finite())
-                .map(|v| v.clamp(0.0, 100.0))
-                .map_or_else(|| fail("no _Total instance"), Ok)
-        });
-        // Antes de `per_logical` (a variável esconderia a função de mesmo nome).
-        let kernel_per_logical = match &sampled {
-            Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.per_kernel)
-                .or_else(fail)
-                .and_then(|a| {
-                    per_logical(&a, &mut self.last[1]).map_or_else(|| fail("no instances"), Ok)
-                }),
+        let (usage, per_logical) = resolve_cpu_array(
+            "usage",
+            array,
+            100.0,
+            &mut self.last[0],
+            &mut self.last_total[0],
+            &mut self.transient_streak[0],
+        );
+        // Antes de `per_logical` já está resolvido; agora o kernel por lógico.
+        let kernel_array = match &sampled {
+            Err(e) => Err(e.clone()),
+            Ok(()) => pdh::read_array_all(&self.query, &self.per_kernel),
         };
-        let per_logical = array.and_then(|a| {
-            per_logical(&a, &mut self.last[0]).map_or_else(|| fail("no instances"), Ok)
-        });
+        let (_, kernel_per_logical) = resolve_cpu_array(
+            "kernel",
+            kernel_array,
+            100.0,
+            &mut self.last[1],
+            &mut None,
+            &mut self.transient_streak[1],
+        );
         let kernel_per_logical = match (&per_logical, kernel_per_logical) {
             (Ok(u), Ok(k)) if u.len() != k.len() => fail("kernel instances differ from usage"),
             (_, k) => k,
         };
         // Clock efetivo = % Processor Performance × base (como o Task Manager); passa de 100%
         // com o turbo.
-        let perf = match &sampled {
-            Err(e) => fail(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.perf).or_else(fail),
+        let perf_array = match &sampled {
+            Err(e) => Err(e.clone()),
+            Ok(()) => pdh::read_array_all(&self.query, &self.perf),
         };
+        let (perf_total, perf_per_logical) = resolve_cpu_array(
+            "perf",
+            perf_array,
+            PERF_MAX,
+            &mut self.last[2],
+            &mut self.last_total[1],
+            &mut self.transient_streak[2],
+        );
         let to_mhz = |p: f64| -> Metric<f64> {
             self.base_mhz
                 .as_ref()
                 .map(|b| p / 100.0 * f64::from(*b))
                 .map_err(Clone::clone)
         };
-        let freq_mhz = perf.as_ref().map_err(Clone::clone).and_then(|a| {
-            a.iter()
-                .find(|(n, _)| n == "_Total")
-                .map(|(_, v)| *v)
-                .filter(|v| v.is_finite())
-                .map_or_else(|| fail("no _Total instance"), to_mhz)
-        });
-        let last_perf = &mut self.last[2];
-        let freq_per_logical: Metric<Vec<f64>> = perf.and_then(|a| {
-            per_logical_raw(&a, PERF_MAX, last_perf)
-                .map_or_else(|| fail("no instances"), Ok)
-                .and_then(|v| v.into_iter().map(to_mhz).collect())
-        });
+        let freq_mhz = perf_total.and_then(to_mhz);
+        let freq_per_logical: Metric<Vec<f64>> =
+            perf_per_logical.and_then(|v| v.into_iter().map(to_mhz).collect());
         let freq_per_logical = match (&per_logical, freq_per_logical) {
             (Ok(u), Ok(f)) if u.len() != f.len() => fail("clock instances differ from usage"),
             (_, f) => f,
@@ -194,7 +206,74 @@ fn kernel_share(prev: (u64, u64, u64), now: (u64, u64, u64)) -> Option<f64> {
     (total > 0).then(|| (dk.saturating_sub(di) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
 }
 
+/// Extrai `(_Total, por_lógico)` de uma leitura de contador por processador do PDH.
+///
+/// Em erros transitórios de cálculo diferencial do PDH (`0x800007D6..D8`, ex.: ajuste de relógio
+/// ou delta negativo numa amostra isolada), repete a última leitura válida por até
+/// `TRANSIENT_LIMIT` coletas seguidas (registrando em `debug.log`) antes de expor a falha. Se só
+/// `_Total` vier `NaN` numa coleta com lógicos válidos, calcula a média dos lógicos.
+fn resolve_cpu_array(
+    name: &str,
+    raw: Result<Vec<(String, f64)>, String>,
+    max: f64,
+    last_per: &mut Vec<f64>,
+    last_total: &mut Option<f64>,
+    streak: &mut u8,
+) -> (Metric<f64>, Metric<Vec<f64>>) {
+    match raw {
+        Ok(items) => {
+            *streak = 0;
+            let per =
+                per_logical_raw(&items, max, last_per).map_or_else(|| fail("no instances"), Ok);
+            let total = match items.iter().find(|(n, _)| n == "_Total").map(|(_, v)| *v) {
+                Some(v) if v.is_finite() => {
+                    let clamped = v.clamp(0.0, max);
+                    *last_total = Some(clamped);
+                    Ok(clamped)
+                }
+                // `_Total` veio com NaN mas os lógicos são válidos: usa a média deles (ou último).
+                Some(_) => {
+                    let fallback = per
+                        .as_ref()
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .map(|v| (v.iter().sum::<f64>() / v.len() as f64).clamp(0.0, max))
+                        .or(*last_total);
+                    if let Some(v) = fallback {
+                        crate::debug::log(
+                            "cpu",
+                            &format!("PDH returned NaN for {name} _Total; using {v:.1}"),
+                        );
+                        *last_total = Some(v);
+                        Ok(v)
+                    } else {
+                        fail("no _Total instance")
+                    }
+                }
+                None => fail("no _Total instance"),
+            };
+            (total, per)
+        }
+        Err(e) => {
+            if pdh::is_transient_calc(&e) && !last_per.is_empty() && *streak < TRANSIENT_LIMIT {
+                *streak += 1;
+                crate::debug::log(
+                    "cpu",
+                    &format!(
+                        "PDH transient error ({e}) on {name}; kept last sample ({}/{TRANSIENT_LIMIT})",
+                        *streak
+                    ),
+                );
+                let total = last_total.map_or_else(|| fail(e.clone()), Ok);
+                return (total, Ok(last_per.clone()));
+            }
+            (fail(e.clone()), fail(e))
+        }
+    }
+}
+
 /// Uso por processador lógico, ordenado por (grupo, número); ignora as instâncias `_Total`.
+#[cfg(test)]
 fn per_logical(items: &[(String, f64)], last: &mut Vec<f64>) -> Option<Vec<f64>> {
     per_logical_raw(items, 100.0, last)
 }
@@ -445,6 +524,94 @@ mod tests {
             per_logical(&items([f64::NAN, 5.0, 6.0]), &mut fresh),
             Some(vec![0.0, 5.0, 6.0])
         );
+    }
+
+    #[test]
+    fn erro_transitorio_do_pdh_mantem_ultima_leitura_ate_o_limite() {
+        let mut last_per = Vec::new();
+        let mut last_total = None;
+        let mut streak = 0u8;
+        let ok_items = || {
+            Ok(vec![
+                ("_Total".to_string(), 25.0),
+                ("0,0".to_string(), 20.0),
+                ("0,1".to_string(), 30.0),
+            ])
+        };
+        let (u, p) = resolve_cpu_array(
+            "usage",
+            ok_items(),
+            100.0,
+            &mut last_per,
+            &mut last_total,
+            &mut streak,
+        );
+        assert_eq!(u, Ok(25.0));
+        assert_eq!(p, Ok(vec![20.0, 30.0]));
+        assert_eq!(streak, 0);
+
+        // Até TRANSIENT_LIMIT falhas transitórias seguidas (0x800007D6..D8) repetem a última leitura.
+        for expected in 1..=TRANSIENT_LIMIT {
+            let (u, p) = resolve_cpu_array(
+                "usage",
+                Err("PDH negative denominator".into()),
+                100.0,
+                &mut last_per,
+                &mut last_total,
+                &mut streak,
+            );
+            assert_eq!(u, Ok(25.0));
+            assert_eq!(p, Ok(vec![20.0, 30.0]));
+            assert_eq!(streak, expected);
+        }
+        // Acima do limite, a falha aparece normalmente.
+        let (u, p) = resolve_cpu_array(
+            "usage",
+            Err("PDH negative denominator".into()),
+            100.0,
+            &mut last_per,
+            &mut last_total,
+            &mut streak,
+        );
+        assert!(u.is_err());
+        assert!(p.is_err());
+
+        // Leitura boa zera a contagem; erro não-transitório aparece imediatamente.
+        let _ = resolve_cpu_array(
+            "usage",
+            ok_items(),
+            100.0,
+            &mut last_per,
+            &mut last_total,
+            &mut streak,
+        );
+        assert_eq!(streak, 0);
+        let (u, p) = resolve_cpu_array(
+            "usage",
+            Err("PDH object not found".into()),
+            100.0,
+            &mut last_per,
+            &mut last_total,
+            &mut streak,
+        );
+        assert!(u.is_err());
+        assert!(p.is_err());
+
+        // Só `_Total` em NaN usa a média dos lógicos válidos.
+        let (u, p) = resolve_cpu_array(
+            "usage",
+            Ok(vec![
+                ("_Total".to_string(), f64::NAN),
+                ("0,0".to_string(), 10.0),
+                ("0,1".to_string(), 50.0),
+            ]),
+            100.0,
+            &mut last_per,
+            &mut last_total,
+            &mut streak,
+        );
+        assert_eq!(u, Ok(30.0));
+        assert_eq!(p, Ok(vec![10.0, 50.0]));
     }
 
     #[test]

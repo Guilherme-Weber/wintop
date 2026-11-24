@@ -6,6 +6,14 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Corrigido
+
+- CPU: erros transitórios de cálculo diferencial do PDH (`PDH 0x800007D6` / `PDH_CALC_NEGATIVE_DENOMINATOR`,
+  `0x800007D7` e `0x800007D8`, que podem ocorrer numa coleta isolada durante ajustes de relógio ou
+  delta negativo) agora repetem a última leitura válida por até 3 coletas seguidas (registrando em
+  `wintop-debug.log`) em vez de piscar falha e zerar a grade de núcleos; se só `_Total` vier `NaN`,
+  usa a média dos lógicos válidos.
+
 ## [1.3.1] - 2026-11-24
 
 ### Alterado

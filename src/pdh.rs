@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 
 use windows::Win32::System::Performance::{
+    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER,
     PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_NO_OBJECT, PDH_CSTATUS_VALID_DATA, PDH_FMT,
     PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
@@ -29,8 +30,20 @@ pub fn status_text(code: u32) -> String {
         PDH_CSTATUS_NO_INSTANCE => "PDH instance not found".into(),
         PDH_CSTATUS_INVALID_DATA | PDH_INVALID_DATA => "waiting for a second sample".into(),
         PDH_NO_DATA => "PDH returned no data".into(),
+        PDH_CALC_NEGATIVE_DENOMINATOR => "PDH negative denominator".into(),
+        PDH_CALC_NEGATIVE_TIMEBASE => "PDH negative timebase".into(),
+        PDH_CALC_NEGATIVE_VALUE => "PDH negative value".into(),
         c => format!("PDH 0x{c:08X}"),
     }
+}
+
+/// Erro transitório de cálculo diferencial do PDH (ajuste de relógio/NTP, delta negativo ou
+/// denominador zerado numa amostra isolada de `% Processor Time`, por exemplo).
+pub fn is_transient_calc(err: &str) -> bool {
+    matches!(
+        err,
+        "PDH negative denominator" | "PDH negative timebase" | "PDH negative value"
+    )
 }
 
 fn check(code: u32) -> Result<(), String> {
@@ -243,5 +256,19 @@ mod tests {
         assert!(other.value(total.expect("contador")).is_err());
         let a = read_array(&q, &per).expect("valores por processador");
         assert!(a.iter().any(|(n, _)| n == "_Total"), "{a:?}");
+    }
+
+    #[test]
+    fn codigos_transitorios_de_calculo_do_pdh() {
+        for code in [
+            PDH_CALC_NEGATIVE_DENOMINATOR,
+            PDH_CALC_NEGATIVE_TIMEBASE,
+            PDH_CALC_NEGATIVE_VALUE,
+        ] {
+            let msg = status_text(code);
+            assert!(is_transient_calc(&msg), "{code:#X} -> {msg}");
+        }
+        assert!(!is_transient_calc(&status_text(PDH_CSTATUS_NO_OBJECT)));
+        assert!(!is_transient_calc(&status_text(PDH_NO_DATA)));
     }
 }
