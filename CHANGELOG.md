@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.3.2] - 2026-11-24
+
 ### Corrigido
 
 - CPU: erros transitórios de cálculo diferencial do PDH (`PDH 0x800007D6` / `PDH_CALC_NEGATIVE_DENOMINATOR`,
