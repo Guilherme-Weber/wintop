@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.3.0] - 2026-11-24
+
 ### Adicionado
 
 - Modo debug opcional no `config.toml` (`debug = false` por padrão, com recarga ao vivo):
