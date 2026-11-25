@@ -103,6 +103,13 @@ fn tr_core(core: &str) -> Option<String> {
         let joined = out.join(" · ");
         return (joined != core).then_some(joined);
     }
+    if let Some(rest) = core
+        .strip_prefix("gpu ")
+        .and_then(|s| s.strip_suffix(" processes"))
+        && rest.contains('/')
+    {
+        return Some(format!("processos da gpu {rest}"));
+    }
     for (en, pt) in PREFIXES {
         // O rótulo pode ser só o prefixo ("limited by "), já sem o espaço do fim.
         if core == en.trim_end() {
@@ -150,6 +157,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("peak ", "pico "),
     ("(max ", "(máx "),
     ("Disk ", "Disco "),
+    ("S=sys P=page", "S=sis P=pag"),
 ];
 
 /// Finais de textos montados ("12 processes").
@@ -243,6 +251,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("(z next, esc back)", "(z próxima, esc volta)"),
     ("any key closes", "qualquer tecla fecha"),
     // Ajuda.
+    ("p, space", "p, espaço"),
     (
         "switch tabs (Overview, Processes, GPU, Sensors)",
         "trocar de aba (Geral, Processos, GPU, Sensores)",
@@ -392,12 +401,26 @@ const PT_BR: &[(&str, &str)] = &[
     ("game · RTSS unavailable", "jogo · RTSS indisponível"),
     // Rótulos.
     ("in use", "em uso"),
+    ("compressed", "comprimida"),
+    ("raw", "real"),
+    ("boot peak", "pico boot"),
+    ("paging", "paginação"),
+    ("hw res", "res. hw"),
+    ("hardware reserved", "reservada p/ hardware"),
+    ("bad pages", "páginas defeituosas"),
+    ("bad RAM pages", "páginas de RAM defeituosas"),
+    ("hardware fault", "falha de hardware"),
     ("modified", "modificada"),
     ("free", "livre"),
+    ("used", "em uso"),
+    ("reserved", "reservada"),
     ("kernel pools", "pools do kernel"),
     ("paged", "paginado"),
     ("non-paged", "não paginado"),
     ("by kind", "por tipo"),
+    ("adapter  3D/compute", "adaptador  3D/compute"),
+    ("adapter  busiest engine", "adaptador  engine mais usada"),
+    ("memory activity", "atividade da memória"),
     ("per core", "por núcleo"),
     ("kernel per core", "kernel por núcleo"),
     ("resolution", "resolução"),
@@ -460,6 +483,10 @@ const PT_BR: &[(&str, &str)] = &[
     ("no member temperature", "sem temperatura dos membros"),
     ("not reported by the drive", "não informado pelo disco"),
     ("not reported by the driver", "não informado pelo driver"),
+    ("not reported by firmware", "não informado pelo firmware"),
+    ("not supported by Windows", "sem suporte no Windows"),
+    ("needs elevation", "requer elevação"),
+    ("no page file", "sem arquivo de paginação"),
     ("not supported by NVML", "sem suporte no NVML"),
     ("needs NVML (NVIDIA only)", "requer NVML (só NVIDIA)"),
     (
@@ -606,6 +633,14 @@ mod tests {
         assert_eq!(tr("min 0% · max 99%"), "mín 0% · máx 99%");
         assert_eq!(tr("! 3 sources failing "), "! 3 fontes com falha ");
         assert_eq!(tr("F: Pool (5 members)"), "F: Pool (5 membros)");
+        assert_eq!(tr("gpu 1/2 processes"), "processos da gpu 1/2");
+        assert_eq!(
+            tr("S=sys P=page  [d] fold pool"),
+            "S=sis P=pag  [d] recolher pool"
+        );
+        assert_eq!(tr("p, space"), "p, espaço");
+        assert_eq!(tr("adapter  3D/compute "), "adaptador  3D/compute ");
+        assert_eq!(tr("memory activity "), "atividade da memória ");
         set(Lang::EnUs);
     }
 

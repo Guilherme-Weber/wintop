@@ -1,6 +1,7 @@
 //! `wintop --check`: coleta de aquecimento, espera ~300 ms, coleta de novo (contadores de
 //! taxa) e imprime o estado de cada métrica. Código de saída 1 se alguma métrica falhou.
 
+use std::io::Write;
 use std::time::Duration;
 
 use crate::collect::{FastCollectors, RtssCollector, SlowCollectors};
@@ -19,8 +20,7 @@ struct Entry {
     value: String,
 }
 
-#[derive(Default)]
-struct Report {
+struct Report<W: Write> {
     ok: u32,
     neutral: u32,
     failed: u32,
@@ -29,12 +29,26 @@ struct Report {
     section: String,
     subject: String,
     entries: Vec<Entry>,
+    out: W,
 }
 
-impl Report {
+impl<W: Write> Report<W> {
+    fn new(out: W, json: bool) -> Self {
+        Self {
+            ok: 0,
+            neutral: 0,
+            failed: 0,
+            json,
+            section: String::new(),
+            subject: String::new(),
+            entries: Vec::new(),
+            out,
+        }
+    }
+
     fn section(&mut self, title: &str) {
         if !self.json {
-            println!("\n{title}");
+            let _ = writeln!(self.out, "\n{title}");
         }
         self.section = title.to_string();
         self.subject.clear();
@@ -42,38 +56,52 @@ impl Report {
 
     /// Dispositivo das linhas seguintes (disco, placa, GPU, jogo).
     fn subject(&mut self, text: &str) {
+        let clean = printable(text);
         if !self.json {
-            println!("  {}", printable(text));
+            let _ = writeln!(self.out, "  {clean}");
         }
-        self.subject = printable(text);
+        self.subject = clean;
+    }
+
+    fn record(&mut self, label: &str, tag: &'static str, status: &'static str, text: &str) {
+        let clean = printable(text);
+        // Nomes e mensagens vêm de dispositivos e do sistema: sem controles no terminal.
+        if self.json {
+            self.entries.push(Entry {
+                section: self.section.clone(),
+                subject: self.subject.clone(),
+                name: label.trim().to_string(),
+                status,
+                value: clean,
+            });
+        } else {
+            let _ = writeln!(self.out, "  {tag}  {label:<34} {clean}");
+        }
+    }
+
+    fn missing(&mut self, label: &str, e: &Missing) {
+        let (tag, status, text) = match e {
+            Missing::Neutral(s) => {
+                self.neutral += 1;
+                ("N/A   ", "neutral", s.as_str())
+            }
+            Missing::Fail(s) => {
+                self.failed += 1;
+                ("FAIL  ", "failed", s.as_str())
+            }
+        };
+        self.record(label, tag, status, text);
     }
 
     fn line<T>(&mut self, label: &str, m: &Metric<T>, show: impl FnOnce(&T) -> String) {
-        let (tag, status, text) = match m {
+        match m {
             Ok(v) => {
                 self.ok += 1;
-                ("OK    ", "ok", show(v))
+                let text = show(v);
+                self.record(label, "OK    ", "ok", &text);
             }
-            Err(Missing::Neutral(s)) => {
-                self.neutral += 1;
-                ("N/A   ", "neutral", s.clone())
-            }
-            Err(Missing::Fail(s)) => {
-                self.failed += 1;
-                ("FAIL  ", "failed", s.clone())
-            }
-        };
-        // Nomes e mensagens vêm de dispositivos e do sistema: sem controles no terminal.
-        if !self.json {
-            println!("  {tag}  {label:<34} {}", printable(&text));
+            Err(e) => self.missing(label, e),
         }
-        self.entries.push(Entry {
-            section: self.section.clone(),
-            subject: self.subject.clone(),
-            name: label.trim().to_string(),
-            status,
-            value: printable(&text),
-        });
     }
 
     /// O relatório inteiro num objeto JSON (uma linha).
@@ -135,14 +163,16 @@ pub fn run(json: bool) -> i32 {
     std::thread::sleep(WARMUP);
     let f = fast.collect();
     // Com as abas Processos e GPU "visíveis": prova também as fontes delas (com aquecimento).
-    let s = slow.collect(
-        &std::sync::atomic::AtomicBool::new(false),
-        crate::model::View {
-            procs: true,
-            gpu: true,
-        },
-        0,
-    );
+    let s = slow
+        .collect(
+            &std::sync::atomic::AtomicBool::new(false),
+            crate::model::View {
+                procs: true,
+                gpu: true,
+            },
+            0,
+        )
+        .unwrap_or_else(|| Slow::failed("stopped"));
     // Sem iniciar o RTSS nem criar o pipe: o --check só diagnostica.
     // Só lê: o --check não cria nem grava o config.
     let cfg = crate::config::load_home(false);
@@ -150,10 +180,7 @@ pub fn run(json: bool) -> i32 {
         .with_ignored(cfg.config.rtss_ignored.clone())
         .sample();
 
-    let mut r = Report {
-        json,
-        ..Report::default()
-    };
+    let mut r = Report::new(std::io::stdout(), json);
     fast_report(&mut r, &f);
     slow_report(&mut r, &s);
     fps_report(&mut r, &fps);
@@ -162,18 +189,20 @@ pub fn run(json: bool) -> i32 {
         || "no AppData folder".to_string(),
         |p| p.display().to_string(),
     );
-    let state: crate::model::Metric<()> = match cfg.warnings.first() {
-        Some(w) => crate::model::fail(w.clone()),
-        None => Ok(()),
-    };
-    r.line("config.toml", &state, |()| {
-        format!(
-            "{path} (theme {}, interval {} ms, debug {})",
-            cfg.config.theme,
-            cfg.config.interval_ms,
-            if cfg.config.debug { "on" } else { "off" }
-        )
-    });
+    if cfg.warnings.is_empty() {
+        r.line("config.toml", &Ok(()), |()| {
+            format!(
+                "{path} (theme {}, interval {} ms, debug {})",
+                cfg.config.theme,
+                cfg.config.interval_ms,
+                if cfg.config.debug { "on" } else { "off" }
+            )
+        });
+    } else {
+        for w in &cfg.warnings {
+            r.missing("config.toml", &Missing::Fail(w.clone()));
+        }
+    }
     own_report(&mut r, &f);
     security_report(&mut r);
     let (fast_ms, slow_ms) = (f.took.as_secs_f64() * 1e3, s.took.as_secs_f64() * 1e3);
@@ -189,10 +218,10 @@ pub fn run(json: bool) -> i32 {
     i32::from(r.failed > 0)
 }
 
-fn fast_report(r: &mut Report, f: &Fast) {
+fn fast_report<W: Write>(r: &mut Report<W>, f: &Fast) {
     r.section("CPU");
     match &f.cpu {
-        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("collector", e),
         Ok(c) => {
             r.line("Name", &c.name, Clone::clone);
             r.line("Topology", &c.topology, |t| {
@@ -221,10 +250,14 @@ fn fast_report(r: &mut Report, f: &Fast) {
             });
             r.line("Current speed", &c.freq_mhz, |v| format!("{v:.0} MHz"));
             r.line("Speed per logical", &c.freq_per_logical, |f| {
-                let (lo, hi) = f
-                    .iter()
-                    .fold((f64::MAX, 0.0_f64), |(a, b), v| (a.min(*v), b.max(*v)));
-                format!("{} logical, {lo:.0}-{hi:.0} MHz (peak {hi:.0})", f.len())
+                if f.is_empty() {
+                    "0 logical".into()
+                } else {
+                    let (lo, hi) = f
+                        .iter()
+                        .fold((f64::MAX, 0.0_f64), |(a, b), v| (a.min(*v), b.max(*v)));
+                    format!("{} logical, {lo:.0}-{hi:.0} MHz (peak {hi:.0})", f.len())
+                }
             });
             r.line("Processes / threads / handles", &c.counts, |n| {
                 format!("{} / {} / {}", n.processes, n.threads, n.handles)
@@ -244,7 +277,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     r.section("CPU sensors");
     match &f.cpu_sensors {
-        Err(e) => r.line("PawnIO", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("PawnIO", e),
         Ok(s) => {
             r.line("Tctl", &s.tctl, |v| format!("{} °C", num(*v, 1)));
             r.line("CCD temperatures", &s.ccds, |v| {
@@ -261,7 +294,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     r.section("Memory");
     match &f.memory {
-        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("collector", e),
         Ok(m) => {
             let used_total = m.used.clone().and_then(|u| Ok((u, m.total.clone()?)));
             r.line("In use / total", &used_total, |(u, t)| {
@@ -269,12 +302,39 @@ fn fast_report(r: &mut Report, f: &Fast) {
                     "{} / {} ({})",
                     bytes(*u),
                     bytes(*t),
-                    pct(*u as f64 / *t as f64 * 100.0)
+                    pct(*u as f64 / (*t).max(1) as f64 * 100.0)
                 )
+            });
+            r.line("Hardware", &m.hardware, |hw| {
+                let mut parts = vec![hw.kind.to_string()];
+                if let Some(spd) = hw.speed_mt {
+                    parts.push(format!("{spd} MT/s"));
+                }
+                let slots = match hw.form_factor {
+                    Some(ff) => format!("{}/{} slots ({ff})", hw.slots_used, hw.slots_total),
+                    None => format!("{}/{} slots", hw.slots_used, hw.slots_total),
+                };
+                parts.push(slots);
+                parts.join(", ")
+            });
+            r.line("Hardware reserved", &m.hardware_reserved, |v| bytes(*v));
+            r.line("Compressed", &m.compressed, |c| {
+                if c.compressed > 0 && c.uncompressed > c.compressed {
+                    let ratio = c.uncompressed as f64 / c.compressed as f64;
+                    format!(
+                        "{} (~{} uncompressed, {}x)",
+                        bytes(c.compressed),
+                        bytes(c.uncompressed),
+                        num(ratio, 1)
+                    )
+                } else {
+                    bytes(c.compressed)
+                }
             });
             r.line("Committed / limit", &m.commit, |(c, l)| {
                 format!("{} / {}", bytes(*c), bytes(*l))
             });
+            r.line("Commit peak (boot)", &m.commit_peak, |v| bytes(*v));
             r.line("Cached", &m.cached, |v| bytes(*v));
             r.line("Paged pool", &m.paged_pool, |v| bytes(*v));
             r.line("Non-paged pool", &m.nonpaged_pool, |v| bytes(*v));
@@ -286,12 +346,22 @@ fn fast_report(r: &mut Report, f: &Fast) {
                     pct(*u as f64 / (*t).max(1) as f64 * 100.0)
                 )
             });
+            r.line("Paging (in / out)", &m.paging, |(i, o)| {
+                format!("{} / {} pages/s", num(*i, 0), num(*o, 0))
+            });
+            r.line("Bad RAM pages", &m.bad_pages, |n| {
+                if *n > 0 {
+                    format!("{n} (hardware fault)")
+                } else {
+                    "0".into()
+                }
+            });
         }
     }
 
     r.section("Disks");
     match &f.disks {
-        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("collector", e),
         Ok(list) => {
             for d in list {
                 let mut tags = d.letters.join(" ");
@@ -323,7 +393,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     r.section("Network");
     match &f.nics {
-        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("collector", e),
         Ok(list) => {
             for n in list {
                 r.subject(&format!("{} ({})", n.alias, n.description));
@@ -339,7 +409,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
 
     r.section("GPU");
     match &f.gpus {
-        Err(e) => r.line("collector", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("collector", e),
         Ok(list) => {
             for g in list {
                 r.subject(&format!("GPU {}", g.index));
@@ -384,7 +454,7 @@ fn fast_report(r: &mut Report, f: &Fast) {
                     }
                 });
                 match &g.fans {
-                    Err(e) => r.line("  Fans", &Err::<(), _>(e.clone()), |()| String::new()),
+                    Err(e) => r.missing("  Fans", e),
                     Ok(fans) => {
                         for (i, fan) in fans.iter().enumerate() {
                             r.line(&format!("  Fan {i} (%)"), &fan.percent, |v| format!("{v}%"));
@@ -417,10 +487,10 @@ fn fast_report(r: &mut Report, f: &Fast) {
     }
 }
 
-fn slow_report(r: &mut Report, s: &Slow) {
+fn slow_report<W: Write>(r: &mut Report<W>, s: &Slow) {
     r.section("Slow thread");
     match &s.gpus {
-        Err(e) => r.line("GPU PCIe", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("GPU PCIe", e),
         Ok(list) => {
             for g in list {
                 r.line(&format!("GPU {} PCIe TX", g.index), &g.pcie_tx, |v| {
@@ -466,9 +536,7 @@ fn slow_report(r: &mut Report, s: &Slow) {
         });
     }
     match &s.disk_temps {
-        Err(e) => r.line("Disk temperature", &Err::<(), _>(e.clone()), |()| {
-            String::new()
-        }),
+        Err(e) => r.missing("Disk temperature", e),
         Ok(list) => {
             for t in list {
                 let source = t.source;
@@ -487,7 +555,7 @@ fn slow_report(r: &mut Report, s: &Slow) {
     }
 }
 
-fn fps_report(r: &mut Report, f: &Fps) {
+fn fps_report<W: Write>(r: &mut Report<W>, f: &Fps) {
     r.section("FPS (RTSS)");
     r.line("RTSS", &f.rtss, Clone::clone);
     r.line("Frametime pipe", &f.pipe, |(n, c)| {
@@ -495,7 +563,7 @@ fn fps_report(r: &mut Report, f: &Fps) {
     });
     r.line("ETW frames", &f.etw, ToString::to_string);
     match &f.game {
-        Err(e) => r.line("Game", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("Game", e),
         Ok(g) => {
             let approx = match g.source {
                 crate::model::FrameSource::Approx => " (approx.: game opened before wintop)",
@@ -530,10 +598,10 @@ fn fps_report(r: &mut Report, f: &Fps) {
     }
 }
 
-fn own_report(r: &mut Report, f: &Fast) {
+fn own_report<W: Write>(r: &mut Report<W>, f: &Fast) {
     r.section("Diagnostics");
     match &f.own {
-        Err(e) => r.line("wintop usage", &Err::<(), _>(e.clone()), |()| String::new()),
+        Err(e) => r.missing("wintop usage", e),
         Ok(o) => {
             r.line("wintop CPU (whole system)", &o.cpu, |v| {
                 format!("{}%", num(*v, 3))
@@ -546,7 +614,7 @@ fn own_report(r: &mut Report, f: &Fast) {
 
 /// O que o wintop elevado executa ou carrega de outros programas, e a cópia instalada: nada
 /// pode ser alterado sem elevação (a mesma regra aplicada antes de usar cada um).
-fn security_report(r: &mut Report) {
+fn security_report<W: Write>(r: &mut Report<W>) {
     r.section("Security (files run or loaded elevated)");
     let check = |p: Option<std::path::PathBuf>, missing: &str| -> Metric<String> {
         match p {
@@ -580,11 +648,96 @@ fn security_report(r: &mut Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Counts, Cpu, Memory, Topology, fail, neutral};
 
     #[test]
     fn texto_json_escapado() {
         assert_eq!(json_str(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(json_str("x\ny\u{1}"), r#""x\u000ay\u0001""#);
         assert_eq!(json_str("°C ok"), "\"°C ok\"");
+    }
+
+    #[test]
+    fn relatorio_trata_memoria_zero_e_freq_vazia() {
+        let fast = Fast {
+            cpu: Ok(Cpu {
+                name: Ok("Test CPU".into()),
+                topology: Ok(Topology {
+                    sockets: 1,
+                    cores: 4,
+                    logical: 8,
+                    l1: 256 << 10,
+                    l2: 2 << 20,
+                    l3: 16 << 20,
+                }),
+                base_mhz: Ok(3500),
+                virtualization: Ok(true),
+                usage: Ok(12.5),
+                per_logical: Ok(vec![]),
+                kernel: Ok(2.0),
+                kernel_per_logical: Ok(vec![]),
+                freq_mhz: Ok(3500.0),
+                freq_per_logical: Ok(vec![]),
+                counts: Ok(Counts {
+                    processes: 10,
+                    threads: 20,
+                    handles: 30,
+                }),
+                uptime: Duration::from_secs(65),
+            }),
+            cpu_sensors: neutral("no PawnIO"),
+            memory: Ok(Memory {
+                used: Ok(0),
+                total: Ok(0),
+                commit: Ok((0, 0)),
+                commit_peak: Ok(0),
+                compressed: Ok(crate::model::CompressedMemory::default()),
+                cached: Ok(0),
+                modified: Ok(0),
+                standby: Ok(0),
+                paged_pool: Ok(0),
+                nonpaged_pool: Ok(0),
+                pagefile_usage: Ok((0, 0)),
+                paging: Ok((0.0, 0.0)),
+                hardware: Ok(crate::model::MemoryHardware {
+                    kind: "DDR4",
+                    speed_mt: Some(3600),
+                    slots_used: 4,
+                    slots_total: 4,
+                    form_factor: Some("DIMM"),
+                }),
+                hardware_reserved: Ok(0),
+                bad_pages: Ok(0),
+            }),
+            disks: fail("pdh error"),
+            nics: Ok(vec![]),
+            gpus: Ok(vec![]),
+            own: fail("own err"),
+            took: Duration::from_millis(5),
+        };
+        let mut r = Report::new(Vec::<u8>::new(), false);
+        fast_report(&mut r, &fast);
+        own_report(&mut r, &fast);
+        let text = String::from_utf8(r.out).expect("utf8");
+        assert!(text.contains("0 logical"), "{text}");
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{text}");
+        assert!(r.entries.is_empty(), "modo texto não acumula entries JSON");
+        assert_eq!(r.failed, 2);
+        assert_eq!(r.neutral, 1);
+
+        // Mesmo relatório em JSON preenche `entries` sem escrever texto.
+        let mut jr = Report::new(Vec::<u8>::new(), true);
+        fast_report(&mut jr, &fast);
+        assert!(jr.out.is_empty());
+        let json = jr.to_json(true, 5.0, 1.0);
+        assert!(json.contains(r#""elevated":true"#), "{json}");
+        assert!(
+            json.contains(r#""name":"Speed per logical","status":"ok","value":"0 logical""#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""section":"Disks","subject":"","name":"collector","status":"failed""#),
+            "{json}"
+        );
     }
 }

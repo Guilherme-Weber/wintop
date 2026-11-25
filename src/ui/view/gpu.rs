@@ -3,15 +3,16 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::state::{MinMax, Series, Session, State};
 use super::{
-    TEMP_BAR_W, bar_line, bar_sep, boxed, brief, draw_temp_bar, empty_box, failed_span, label,
-    line, metric, metric_styled, minmax, missing, put, section_divider, sep, short_bytes,
-    temp_color, text, text_room, with_failure, wrap,
+    TEMP_BAR_W, aligned_bar_text_w, bar_line, bar_sep, bar_value, boxed, brief, draw_temp_bar,
+    empty_box, faded, failed_span, label, line, metric, metric_styled, minmax, missing, put,
+    section_divider, sep, short_bytes, temp_color, text, text_room, usage_color, v_divider,
+    with_failure, wrap,
 };
 use crate::fmt::{bytes, num};
 use crate::i18n::tr;
@@ -57,28 +58,127 @@ fn engine_color(name: &str) -> Color {
 /// Largura padrão do painel de engines quando não há grade por núcleo da CPU de referência.
 const PANEL_W: u16 = 30;
 
+fn gpu_causes(g: &Gpu, width: u16) -> Vec<Line<'static>> {
+    let mut causes: Vec<Line<'static>> = Vec::new();
+    let mut engines = vec![
+        (usage_name(g), &g.usage),
+        ("encode", &g.encoder),
+        ("decode", &g.decoder),
+    ];
+    // Sem NVML, a causa da memória já está na linha do NVML (e ela nem entra na grade).
+    if g.no_nvml.is_none() {
+        engines.push(("mem act", &g.mem_activity));
+    }
+    for (name, m) in engines {
+        if let Err(e @ Missing::Fail(_)) = m {
+            causes.extend(wrap(
+                vec![label(&format!("{name} ")), missing(e)],
+                width,
+                0,
+                2,
+            ));
+        }
+    }
+    if let Err(e @ Missing::Fail(_)) = &g.other_engine {
+        causes.extend(wrap(vec![label("other engine "), missing(e)], width, 0, 2));
+    }
+    // `drv` e `VBIOS` não ocupam linha na aba Geral (ficam em Sensores), mas falhas aparecem.
+    if let Err(e @ Missing::Fail(_)) = &g.driver {
+        causes.extend(wrap(vec![label("drv "), missing(e)], width, 0, 2));
+    }
+    if g.no_nvml.is_none()
+        && let Err(e @ Missing::Fail(_)) = &g.vbios
+    {
+        causes.extend(wrap(vec![label("VBIOS "), missing(e)], width, 0, 2));
+    }
+    causes
+}
+
+/// `(n_cells, avail_top)` da caixa da GPU para ajustar `top_h` na aba Geral e manter todos os
+/// gráficos de engines com altura idêntica sem linhas vazias.
+fn gpu_layout_metrics(st: &State, g: &Gpu, inner_w: u16, inner_h: u16) -> (u16, u16) {
+    let (engine, _) = busiest_engine(g);
+    let details = gpu_details(st, g, inner_w);
+    let gb = |v: f64| bytes(v as u64);
+    let session_len = if st.session.vram.get().is_some() {
+        wrap(
+            vec![label("session VRAM "), minmax(st.session.vram, gb)],
+            inner_w,
+            0,
+            8,
+        )
+        .len() as u16
+    } else {
+        0
+    };
+    let card_h = (details.card.len() + gpu_causes(g, inner_w).len()) as u16;
+    let vram_base_h = (2 + details.legend.len() + details.phys.len()) as u16;
+    let vram_extra_h = if inner_h >= vram_base_h + card_h + 1 + session_len + 4 {
+        details.phys.len() as u16 + session_len
+    } else {
+        details.phys.len() as u16
+    };
+    let vram_h = 2 + details.legend.len() as u16 + vram_extra_h;
+    let div_h = u16::from(inner_h >= vram_h + card_h + 3);
+    let n_cells = engine_cells(g, engine).len() as u16;
+    let avail_top = inner_h.saturating_sub(vram_h + card_h + div_h);
+    (n_cells, avail_top)
+}
+
+/// Ajusta `top_h` em no máximo ±3 linhas (dentro de `min_top..=max_top`) para que a altura da
+/// área de gráficos da GPU divida exato pelo número de engines — eliminando qualquer linha em
+/// branco acima de `clk` ou `── vram ──` e mantendo todas as engines com a mesma altura.
+pub(super) fn snap_top_height(
+    st: &State,
+    gpu_w: u16,
+    top_h: u16,
+    min_top: u16,
+    max_top: u16,
+) -> u16 {
+    let Some(Ok(list)) = st.fast.as_ref().map(|f| &f.gpus) else {
+        return top_h;
+    };
+    let Some(g) = list.get(st.gpu_index(list.len())) else {
+        return top_h;
+    };
+    let inner_w = gpu_w.saturating_sub(2);
+    let (n_cells, avail_top) = gpu_layout_metrics(st, g, inner_w, top_h.saturating_sub(2));
+    if n_cells < 2 || avail_top < n_cells * 2 || avail_top.is_multiple_of(n_cells) {
+        return top_h;
+    }
+    // Prefere o menor ajuste (favorecendo crescer os gráficos em empate).
+    for delta in [1i16, -1, 2, -2, 3, -3] {
+        let Ok(cand) = u16::try_from(i16::try_from(top_h).unwrap_or(0) + delta) else {
+            continue;
+        };
+        if cand < min_top || cand > max_top {
+            continue;
+        }
+        let (n, avail) = gpu_layout_metrics(st, g, inner_w, cand.saturating_sub(2));
+        if n >= 2 && avail >= n * 2 && avail.is_multiple_of(n) {
+            return cand;
+        }
+    }
+    top_h
+}
+
 /// Caixa da GPU. `core_graph_w`: largura do gráfico de cada célula por núcleo da CPU, para os
 /// mini gráficos de copy/encode/decode/mem act terem a mesma largura (e altura idêntica entre si).
-pub(super) fn draw_gpu(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    st: &mut State,
-    core_graph_w: Option<u16>,
-) {
+pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph_w: Option<u16>) {
     let gpus = st.fast.as_ref().map(|f| &f.gpus);
     let Some(Ok(list)) = gpus else {
         empty_box(frame, area, "gpu", gpus);
         return;
     };
     let sel = st.gpu_index(list.len());
-    let Some(g) = list.get(sel).cloned() else {
+    let Some(g) = list.get(sel) else {
         frame.render_widget(
             Paragraph::new(missing(&Missing::Fail("no GPU found".into()))).block(boxed("gpu", "")),
             area,
         );
         return;
     };
-    let (engine, engine_v) = busiest_engine(&g);
+    let (engine, engine_v) = busiest_engine(g);
     // Com mais de uma GPU, a posição da exibida (tecla `g` troca).
     let gpu = if list.len() > 1 {
         format!("gpu {}/{}", sel + 1, list.len())
@@ -96,7 +196,7 @@ pub(super) fn draw_gpu(
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let mut details = gpu_details(st, &g, inner.width);
+    let mut details = gpu_details(st, g, inner.width);
     // Extremos da sessão como na caixa da CPU: a VRAM numa linha ("session RAM" da memória);
     // temperatura, potência e clock com o máximo ao lado do valor (`nvml_rows`).
     let gb = |v: f64| bytes(v as u64);
@@ -111,36 +211,8 @@ pub(super) fn draw_gpu(
     } else {
         Vec::new()
     };
-    // Falhas das engines (as da grade e as fora dela) inteiras, na largura da caixa, como as
-    // causas do uso na caixa da CPU; a grade e o cabeçalho só levam a marca curta.
-    let mut causes: Vec<Line<'static>> = Vec::new();
-    let mut engines = vec![
-        (usage_name(&g), &g.usage),
-        ("encode", &g.encoder),
-        ("decode", &g.decoder),
-    ];
-    // Sem NVML, a causa da memória já está na linha do NVML (e ela nem entra na grade).
-    if g.no_nvml.is_none() {
-        engines.push(("mem act", &g.mem_activity));
-    }
-    for (name, m) in engines {
-        if let Err(e @ Missing::Fail(_)) = m {
-            causes.extend(wrap(
-                vec![label(&format!("{name} ")), missing(e)],
-                inner.width,
-                0,
-                2,
-            ));
-        }
-    }
-    if let Err(e @ Missing::Fail(_)) = &g.other_engine {
-        causes.extend(wrap(
-            vec![label("other engine "), missing(e)],
-            inner.width,
-            0,
-            2,
-        ));
-    }
+    // Falhas das engines e de drv/VBIOS inteiras na largura da caixa; a grade só leva marca curta.
+    let causes = gpu_causes(g, inner.width);
     // Sem altura para tudo, os extremos da VRAM saem primeiro (continuam na aba Sensores): as
     // leituras ao vivo têm prioridade.
     details.card.splice(0..0, causes);
@@ -154,48 +226,17 @@ pub(super) fn draw_gpu(
     let div_h = u16::from(inner.height >= vram_h + card_h + 3);
     // Engines ao lado do gráfico, como a grade por lógico da CPU: o 3D (ou, com ele no gráfico
     // principal, a engine mais usada fora ele e o vídeo), encoder, decoder e a memória.
-    let cells = engine_cells(&g, engine);
+    let cells = engine_cells(g, engine);
     let n_cells = cells.len() as u16;
-    // Os detalhes (métricas) têm prioridade sobre a altura do gráfico.
+    // Os detalhes (métricas) têm prioridade sobre a altura do gráfico; sem linhas em branco
+    // acima de `clk` ou `── vram ──` (todo o espaço vai para os gráficos).
     let avail_top = inner.height.saturating_sub(vram_h + card_h + div_h);
-    // Para os `n_cells` gráficos das engines terem exatamente a mesma altura e o mesmo passo
-    // vertical entre si (sem espaçamento assimétrico sobrando no último): quando `avail_top` não
-    // divide exato por `n_cells`, o resto (1..=3 linhas) vira respiro uniforme fora de `top`.
-    let (pad_after_top, pad_after_card, pad_bottom) = if n_cells >= 2 && avail_top >= n_cells * 2 {
-        match avail_top % n_cells {
-            0 => (0, 0, 0),
-            1 => (1, 0, 0),
-            2 => {
-                if div_h > 0 {
-                    (1, 1, 0)
-                } else {
-                    (1, 0, 1)
-                }
-            }
-            _ => {
-                if div_h > 0 {
-                    (1, 1, 1)
-                } else {
-                    (1, 0, 2)
-                }
-            }
-        }
-    } else {
-        (0, 0, 0)
-    };
-    let graph_min = n_cells.max(4).min(
-        avail_top
-            .saturating_sub(pad_after_top + pad_after_card + pad_bottom)
-            .max(2),
-    );
-    let [top, _gap1, card_area, _gap2, div_area, vram_area, _gap3] = Layout::vertical([
+    let graph_min = n_cells.max(4).min(avail_top.max(2));
+    let [top, card_area, div_area, vram_area] = Layout::vertical([
         Constraint::Min(graph_min),
-        Constraint::Length(pad_after_top),
         Constraint::Length(card_h),
-        Constraint::Length(pad_after_card),
         Constraint::Length(div_h),
         Constraint::Length(vram_h),
-        Constraint::Length(pad_bottom),
     ])
     .areas(inner);
     // Termômetro vertical à direita quando há espaço e leitura de temperatura (NVML).
@@ -204,13 +245,13 @@ pub(super) fn draw_gpu(
     } else {
         None
     };
-    // Largura do painel de engines = largura do gráfico por núcleo da CPU (+1 da folga à esquerda),
-    // ou `PANEL_W` quando a CPU está em lista compacta / GPU ampliada.
-    let target_panel_w = core_graph_w.map_or(PANEL_W, |w| w.saturating_add(1).max(12));
-    let show_temp = gpu_temp.is_some() && top.width >= target_panel_w + 18 && top.height >= 4;
+    // Largura do painel de engines = largura do gráfico por núcleo da CPU, ou `PANEL_W` quando a
+    // CPU está em lista compacta / GPU ampliada.
+    let target_panel_w = core_graph_w.map_or(PANEL_W, |w| w.max(12));
+    let show_temp = gpu_temp.is_some() && top.width >= target_panel_w + 20 && top.height >= 4;
     let (top_main, temp_area) = if show_temp {
         let [left, t] = Layout::horizontal([
-            Constraint::Min(target_panel_w + 13),
+            Constraint::Min(target_panel_w + 14),
             Constraint::Length(TEMP_BAR_W),
         ])
         .areas(top);
@@ -222,14 +263,25 @@ pub(super) fn draw_gpu(
         let limit = f64::from(g.temp_slowdown.as_ref().copied().unwrap_or(95));
         draw_temp_bar(frame, t_area, f64::from(t_val), limit);
     }
-    let panel_w = target_panel_w.min(top_main.width.saturating_sub(10));
-    let [graph, panel] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(panel_w)]).areas(top_main);
+    let panel_w = target_panel_w.min(top_main.width.saturating_sub(12));
+    let [graph, sep_col, panel] = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(2),
+        Constraint::Length(panel_w),
+    ])
+    .areas(top_main);
+    v_divider(frame, sep_col.x, sep_col.y, sep_col.height, top_main);
 
-    // Gráfico da engine dominante: valor e nome na 1ª linha, extremos na 2ª (como a CPU).
-    let head = if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
+    // Gráfico da engine dominante: valor colorido pela carga + nome + min/max na mesma linha
+    // quando couber (libera +1 linha inteira para o gráfico).
+    let mut head = if [&g.usage, &g.encoder, &g.decoder].iter().any(|m| m.is_ok()) {
         vec![
-            text(format!("{engine_v}%")).add_modifier(Modifier::BOLD),
+            Span::styled(
+                format!("{engine_v}%"),
+                Style::new()
+                    .fg(usage_color(f64::from(engine_v)))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" "),
             Span::styled(engine.to_string(), Style::new().fg(engine_color(engine))),
         ]
@@ -237,29 +289,50 @@ pub(super) fn draw_gpu(
         // Causa inteira nas linhas de baixo (`causes`).
         vec![brief(&g.usage, |v| format!("{v}%"))]
     };
-    line(frame, head, graph.x, graph.y, graph.width, graph);
     let mm = minmax(st.session.gpu, |v| format!("{}%", num(v, 0)));
-    line(frame, vec![mm], graph.x, graph.y + 1, graph.width, graph);
+    let head_w: usize = head.iter().map(Span::width).sum();
+    let mm_w = mm.width();
+    let graph_top = if mm_w == 0 {
+        1
+    } else if head_w + 2 + mm_w <= usize::from(graph.width) {
+        head.extend([sep(), mm]);
+        1
+    } else if head_w + 1 + mm_w <= usize::from(graph.width) {
+        head.extend([Span::raw(" "), mm]);
+        1
+    } else if graph.height >= 3 {
+        line(frame, vec![mm], graph.x, graph.y + 1, graph.width, graph);
+        2
+    } else {
+        1
+    };
+    line(frame, head, graph.x, graph.y, graph.width, graph);
     let gr = Rect::new(
         graph.x,
-        graph.y + 2,
+        graph.y + graph_top,
         graph.width.saturating_sub(1),
-        graph.height.saturating_sub(2),
+        graph.height.saturating_sub(graph_top),
     );
     frame.render_widget(
         Graph::new(
-            st.gpu.get_mut(sel).map_or(&[][..], Series::values),
+            st.gpu.get(sel).map_or(&[][..], Series::values),
             GraphColor::Height,
-        ),
+        )
+        .with_baseline(th().dim),
         gr.intersection(graph),
     );
-    let panel = Rect::new(
-        panel.x + 1,
-        panel.y,
-        panel.width.saturating_sub(1),
-        panel.height,
-    );
-    draw_engine_cells(frame, panel, &cells, st.gpu_video.get_mut(sel));
+    // Folga de 1 coluna antes do divisor do termômetro (espelhando a grade da CPU).
+    let panel_draw = if show_temp {
+        Rect::new(
+            panel.x,
+            panel.y,
+            panel.width.saturating_sub(1),
+            panel.height,
+        )
+    } else {
+        panel
+    };
+    draw_engine_cells(frame, panel_draw, &cells, st.gpu_video.get(sel));
 
     // Leituras da placa (clocks, temp, potência, ventoinhas, PCIe/driver) acima do divisor.
     put(frame, Paragraph::new(details.card), card_area, inner);
@@ -274,9 +347,10 @@ pub(super) fn draw_gpu(
         .and_then(|s| s.gpus.as_ref().ok())
         .and_then(|l| l.iter().find(|x| x.index == g.index));
     let b = vram_area;
+    let min_text_w = aligned_bar_text_w(&[&g.dedicated, &g.shared]);
     match slow.map(|s| &s.vram) {
-        Some(Ok(v)) => vram_bar(frame, b, v, details.game_pid, &g.dedicated),
-        _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated),
+        Some(Ok(v)) => vram_bar(frame, b, v, details.game_pid, &g.dedicated, min_text_w),
+        _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated, min_text_w),
     }
     let n = details.legend.len() as u16;
     for (i, l) in details.legend.into_iter().enumerate() {
@@ -287,7 +361,7 @@ pub(super) fn draw_gpu(
             b,
         );
     }
-    bar_line(frame, b, 1 + n, "shared", &g.shared);
+    bar_line(frame, b, 1 + n, "shared", &g.shared, min_text_w);
     for (i, l) in vram_extra.into_iter().enumerate() {
         put(
             frame,
@@ -370,12 +444,20 @@ fn draw_engine_cells(
     frame: &mut Frame<'_>,
     area: Rect,
     cells: &[EngineCell],
-    mut series: Option<&mut [Series; 5]>,
+    series: Option<&[Series; 5]>,
 ) {
     let n = cells.len() as u16;
     if n == 0 || area.width == 0 || area.height == 0 {
         return;
     }
+    let name_span = |c: &EngineCell, txt: String| -> Span<'static> {
+        let color = match c.name.as_str() {
+            "encode" => th().encode,
+            "decode" => th().decode,
+            _ => th().label,
+        };
+        Span::styled(tr(&txt).into_owned(), Style::new().fg(color))
+    };
     let head_w = |c: &EngineCell, w: usize| -> Vec<Span<'static>> {
         match &c.value {
             Ok(x) => {
@@ -383,7 +465,10 @@ fn draw_engine_cells(
                 let max_name = w.saturating_sub(s.len() + 1);
                 let name: String = c.name.chars().take(max_name).collect();
                 let pad = w.saturating_sub(name.chars().count() + s.len()).max(1);
-                vec![label(&format!("{name}{:pad$}", "")), text(s)]
+                vec![
+                    name_span(c, format!("{name}{:pad$}", "")),
+                    faded(text(s), *x == 0),
+                ]
             }
             // A causa inteira de uma falha está nas linhas de baixo da caixa.
             Err(Missing::Fail(_)) => {
@@ -392,9 +477,9 @@ fn draw_engine_cells(
                 let max_name = w.saturating_sub(fw + 1);
                 let name: String = c.name.chars().take(max_name).collect();
                 let pad = w.saturating_sub(name.chars().count() + fw).max(1);
-                vec![label(&format!("{name}{:pad$}", "")), f]
+                vec![name_span(c, format!("{name}{:pad$}", "")), f]
             }
-            Err(e) => vec![label(&format!("{:<8} ", c.name)), missing(e)],
+            Err(e) => vec![name_span(c, format!("{:<8} ", c.name)), missing(e)],
         }
     };
     let head_compact = |c: &EngineCell| -> Vec<Span<'static>> { head_w(c, 13) };
@@ -423,22 +508,41 @@ fn draw_engine_cells(
         put(frame, Paragraph::new(lines), area, area);
         return;
     }
-    // Todas as células com exatamente a mesma altura `ch` e o mesmo passo vertical (sem gap
-    // assimétrico só entre as primeiras). A linha de base apagada marca o piso de cada gráfico
-    // mesmo em 0%, deixando a altura idêntica visível a olho nu.
+    // Todas as células com exatamente a mesma altura `ch` e o mesmo passo vertical. Quando a
+    // altura é `n * ch + (n - 1)` (ex.: zoom), usa 1 linha uniforme entre células.
+    let (ch, step) = if area.height >= n * 2 + (n - 1) && (area.height - (n - 1)).is_multiple_of(n)
+    {
+        let c = (area.height - (n - 1)) / n;
+        (c, c + 1)
+    } else {
+        (ch, ch)
+    };
     let cell_w = usize::from(area.width);
     for (k, c) in cells.iter().enumerate() {
-        let y = area.y + k as u16 * ch;
+        let y = area.y + k as u16 * step;
         let cell = Rect::new(area.x, y, area.width, ch).intersection(area);
         if let Err(e @ Missing::Neutral(_)) = &c.value {
-            // Estado neutro: o texto alinhado depois do nome, quebrando por palavra.
-            let mut lines = wrap(vec![missing(e)], cell.width, 9, 9);
-            if let Some(first) = lines.first_mut()
-                && let Some(pad) = first.spans.first_mut()
-            {
-                *pad = label(&format!("{:<8} ", c.name));
+            // Estado neutro: rótulo + "-" na 1ª linha e motivo quebrado em largura cheia abaixo
+            // (evita coluna estreita de 2 letras quando o painel herda a largura de um núcleo).
+            let max_name = cell_w.saturating_sub(2);
+            let name: String = c.name.chars().take(max_name).collect();
+            let pad = cell_w.saturating_sub(name.chars().count() + 1).max(1);
+            line(
+                frame,
+                vec![
+                    name_span(c, format!("{name}{:pad$}", "")),
+                    Span::styled("-", Style::new().fg(th().neutral)),
+                ],
+                cell.x,
+                cell.y,
+                cell.width,
+                cell,
+            );
+            if cell.height > 1 {
+                let body = Rect::new(cell.x, cell.y + 1, cell.width, cell.height - 1);
+                let lines = wrap(vec![missing(e)], body.width, 0, 0);
+                put(frame, Paragraph::new(lines), body, cell);
             }
-            put(frame, Paragraph::new(lines), cell, cell);
             continue;
         }
         if c.value.is_err() {
@@ -446,7 +550,7 @@ fn draw_engine_cells(
             continue;
         }
         line(frame, head_w(c, cell_w), cell.x, cell.y, cell.width, cell);
-        if let Some(s) = series.as_mut().and_then(|s| s.get_mut(c.series)) {
+        if let Some(s) = series.and_then(|s| s.get(c.series)) {
             let g = Rect::new(
                 cell.x,
                 cell.y + 1,
@@ -475,10 +579,9 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .slow
         .as_ref()
         .and_then(|s| s.gpus.as_ref().ok())
-        .and_then(|l| l.iter().find(|x| x.index == g.index))
-        .cloned();
+        .and_then(|l| l.iter().find(|x| x.index == g.index));
     let slow_err = match st.slow.as_ref().map(|s| &s.gpus) {
-        Some(Err(e)) => Some(e.clone()),
+        Some(Err(e)) => Some(e),
         _ => None,
     };
     let game_pid = st
@@ -486,23 +589,20 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .as_ref()
         .and_then(|f| f.game.as_ref().ok())
         .map(|g| g.pid);
-    let legend = vram_legend(slow.as_ref().map(|s| &s.vram), game_pid, width);
+    let legend = vram_legend(slow.map(|s| &s.vram), game_pid, width);
     // GPU sem NVML: os campos só dele numa linha, com o motivo (não repetido em cada um).
     let (card_rows, phys_row): (Vec<Vec<Span<'static>>>, Option<Vec<Span<'static>>>) =
         if let Some(m) = &g.no_nvml {
             (
-                vec![
-                    vec![
-                        label("NVML   "),
-                        missing(m),
-                        label(" (clocks, temp, power, fans, PCIe, P-state)"),
-                    ],
-                    vec![label("drv    "), metric(&g.driver, Clone::clone)],
-                ],
+                vec![vec![
+                    label("NVML   "),
+                    missing(m),
+                    label(" (clocks, temp, power, fans, PCIe, P-state)"),
+                ]],
                 None,
             )
         } else {
-            nvml_rows(g, slow.as_ref(), slow_err.as_ref(), &st.session)
+            nvml_rows(g, slow, slow_err, &st.session)
         };
     let card = card_rows
         .into_iter()
@@ -549,11 +649,14 @@ fn nvml_rows(
         Ok([u, f, r, t]) => vec![
             // O total físico é o mesmo da barra da VRAM: só aparece se diferir.
             label("phys   "),
-            text(format!("{} used", bytes(*u))),
+            text(format!("{} ", bytes(*u))),
+            label("used"),
             sep(),
-            text(format!("{} free", bytes(*f))),
+            text(format!("{} ", bytes(*f))),
+            label("free"),
             sep(),
-            text(format!("{} reserved", bytes(*r))),
+            text(format!("{} ", bytes(*r))),
+            label("reserved"),
             label(&if g.dedicated.as_ref().is_ok_and(|(_, tot)| tot == t) {
                 " (NVML)".to_string()
             } else {
@@ -591,7 +694,9 @@ fn nvml_rows(
             ),
             max(session.gpu_temp),
             Span::raw(" "),
-            metric(&g.temp_slowdown, |v| format!("(slowdown {v} °C)")),
+            metric_styled(&g.temp_slowdown, th().label, |v| {
+                format!("(slowdown {v} °C)")
+            }),
             sep(),
             label("power "),
             metric_styled(&g.power, th().accent, |(p, l)| {
@@ -613,26 +718,26 @@ fn nvml_rows(
             match &g.fans {
                 Ok(list) => {
                     for (i, f) in list.iter().enumerate() {
+                        if i > 0 {
+                            v.push(sep());
+                        }
                         v.extend([
                             label(&format!("fan{i} ")),
-                            metric(&f.percent, |p| format!("{p}%")),
+                            faded(metric(&f.percent, |p| format!("{p}%")), f.percent == Ok(0)),
                             Span::raw(" "),
                             metric(&f.rpm, |r| format!("{r} rpm")),
-                            sep(),
                         ]);
                     }
                 }
                 Err(e) => v.push(missing(e)),
             }
-            v
-        },
-        {
-            let mut v = vec![
-                label("PCIe   "),
+            v.extend([
+                bar_sep(),
+                label("PCIe "),
                 metric_styled(&g.pcie_link, th().accent, |(gen_, w)| {
                     format!("Gen{gen_} x{w}")
                 }),
-            ];
+            ]);
             if let Some(s) = &slow {
                 v.extend([
                     label("  tx "),
@@ -643,13 +748,6 @@ fn nvml_rows(
             } else if let Some(e) = &slow_err {
                 v.extend([label("  tx/rx "), missing(e)]);
             }
-            v.extend([
-                bar_sep(),
-                label("drv "),
-                metric(&g.driver, Clone::clone),
-                label("  VBIOS "),
-                metric(&g.vbios, Clone::clone),
-            ]);
             v
         },
     ];
@@ -699,7 +797,7 @@ fn vram_color(k: VramKind) -> Color {
         VramKind::Browser => th().vram_browser,
         VramKind::System => th().vram_system,
         VramKind::Kernel => th().vram_kernel,
-        VramKind::Free => th().dim,
+        VramKind::Free => th().neutral,
     }
 }
 
@@ -733,21 +831,20 @@ pub(super) fn vram_bar(
     b: &VramBreakdown,
     game_pid: Option<u32>,
     dedicated: &Metric<(u64, u64)>,
+    min_text_w: u16,
 ) {
     if area.height == 0 {
         return;
     }
     let parts = vram_parts(b, game_pid);
-    let t = metric(dedicated, |(u, t)| {
-        format!(
-            " {} / {} ({}%)",
-            bytes(*u),
-            bytes(*t),
-            num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
-        )
-    });
+    let (val_line, raw_w) = bar_value(dedicated);
     let label_w = VRAM_LABEL_W.min(area.width);
-    let text_w = text_room(&t, dedicated.is_err(), area.width, label_w);
+    let target_w = if dedicated.is_err() {
+        raw_w
+    } else {
+        raw_w.max(min_text_w)
+    };
+    let text_w = text_room(target_w, dedicated.is_err(), area.width, label_w);
     line(frame, vec![label("VRAM  ")], area.x, area.y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     let colored: Vec<(u64, Color)> = parts
@@ -762,9 +859,14 @@ pub(super) fn vram_bar(
         },
         Rect::new(area.x + label_w, area.y, bar_w, 1).intersection(area),
     );
+    let p = if dedicated.is_err() {
+        Paragraph::new(val_line)
+    } else {
+        Paragraph::new(val_line).right_aligned()
+    };
     put(
         frame,
-        Paragraph::new(t),
+        p,
         Rect::new(area.x + label_w + bar_w, area.y, text_w, 1),
         area,
     );

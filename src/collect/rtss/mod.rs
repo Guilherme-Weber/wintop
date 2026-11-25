@@ -150,10 +150,10 @@ struct EtwFrames {
 }
 
 impl EtwFrames {
-    fn retarget(&mut self, pid: Option<u32>) {
+    fn retarget(&mut self, pid: Option<u32>, now: Instant) {
         if self.pid != pid {
             self.pid = pid;
-            self.since = pid.map(|_| Instant::now());
+            self.since = pid.map(|_| now);
             self.chains.clear();
             self.real.clear();
             self.mult = None;
@@ -289,15 +289,9 @@ pub fn failed(cause: &str) -> Fps {
 /// Lows em cache: (instante, PID, fonte, valor).
 type LowsCache = Option<(Instant, u32, FrameSource, Metric<(f64, f64)>)>;
 
-pub struct RtssCollector {
-    view: Option<SharedView>,
-    /// Se o RTSS deve ser iniciado quando ausente (modo normal; nunca no `--check`).
-    start_rtss: bool,
-    started_at: Option<Instant>,
-    start_error: Option<String>,
-    /// `Err(None)`: pipe desligado de propósito (`--check`); `Err(Some(e))`: falhou.
-    pipe: Result<Vec<Instance>, Option<String>>,
-    turn: usize,
+/// Estado puro e testável da agregação de frames (ETW > pipe > Shared Memory), detecção de
+/// congelamento, lows e frame gen, sem dependência de handles do Windows nem de `Instant::now()`.
+struct FrameTracker {
     /// Frames do pipe por índice da Shared Memory.
     exact: HashMap<u32, Ring>,
     /// Índices dos apps (fora dos ignorados) na última amostra: os que o pipe guarda inteiros.
@@ -308,10 +302,6 @@ pub struct RtssCollector {
     ignored_names: Vec<String>,
     /// Amostras aproximadas da Shared Memory por PID.
     approx: HashMap<u32, Ring>,
-    /// Sessão ETW: `Err(None)` = desligada de propósito (`--check`); `Err(Some(e))` = falhou.
-    etw: Result<etw::Session, Option<String>>,
-    /// Falha ao ligar os providers para o jogo atual.
-    etw_error: Option<String>,
     frames: EtwFrames,
     /// Último jogo escolhido e quando: o ETW continua nele por `ETW_HOLD` sem jogo escolhido
     /// (um congelamento tira o jogo da lista de ativos do RTSS por um instante).
@@ -321,36 +311,14 @@ pub struct RtssCollector {
     published: Option<(u32, Instant)>,
 }
 
-impl RtssCollector {
-    /// `pipe`: criar o servidor do pipe (só no modo normal: o `--check` não espera frames).
-    pub fn new(start_rtss: bool, pipe: bool) -> Self {
+impl FrameTracker {
+    fn new(ignored_names: Vec<String>) -> Self {
         Self {
-            view: None,
-            start_rtss,
-            started_at: None,
-            start_error: None,
-            pipe: if pipe {
-                create_pipe().map_err(Some)
-            } else {
-                Err(None)
-            },
-            turn: 0,
             exact: HashMap::new(),
             known: HashSet::new(),
             ignored: HashSet::new(),
-            ignored_names: crate::config::DEFAULT_RTSS_IGNORED
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            ignored_names,
             approx: HashMap::new(),
-            // Junto com o pipe: só no modo normal (o `--check` roda com a TUI aberta e não
-            // pode parar a sessão dela).
-            etw: if pipe {
-                etw::Session::start().map_err(Some)
-            } else {
-                Err(None)
-            },
-            etw_error: None,
             frames: EtwFrames::default(),
             last_game: None,
             lows: None,
@@ -358,157 +326,26 @@ impl RtssCollector {
         }
     }
 
-    /// Troca a lista de ignorados (do `config.toml`).
-    pub fn with_ignored(mut self, list: Vec<String>) -> Self {
-        self.ignored_names = list;
-        self
-    }
-
-    /// Como `with_ignored`, com o coletor rodando: a próxima amostra refaz os índices
-    /// conhecidos e ignorados com a lista nova.
-    pub fn set_ignored(&mut self, list: Vec<String>) {
-        self.ignored_names = list;
-    }
-
-    /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
-    /// (evento manual) for sinalizado; devolve `true` nesse caso.
-    pub fn pump(&mut self, deadline: Instant, stop: HANDLE) -> bool {
-        let mut handled = 0u32;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            let timeout = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-            let Ok(instances) = &mut self.pipe else {
-                // SAFETY: evento válido (dono: o motor, que espera esta thread terminar).
-                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
-            };
-            if handled >= MAX_SIGNALS_PER_PUMP {
-                // SAFETY: evento válido.
-                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
-            }
-            // O evento de parada vem primeiro (índice 0); depois os das instâncias armadas,
-            // começando por uma diferente a cada volta (justiça entre clientes).
-            let mut events = [HANDLE::default(); INSTANCES + 1];
-            let mut armed = [0usize; INSTANCES];
-            events[0] = stop;
-            let mut n = 0;
-            for i in 0..instances.len() {
-                let k = (i + self.turn) % instances.len();
-                if instances[k].pending != Pending::None {
-                    armed[n] = k;
-                    events[n + 1] = instances[k].event_handle();
-                    n += 1;
-                }
-            }
-            self.turn = self.turn.wrapping_add(1);
-            // SAFETY: eventos válidos (no máximo 9).
-            let r = unsafe { WaitForMultipleObjects(&events[..=n], false, timeout) };
-            let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-            if idx == 0 {
-                return true;
-            }
-            match armed[..n].get(idx - 1) {
-                Some(&k) => {
-                    instances[k].on_signal(&mut self.exact, &self.known, &self.ignored);
-                    handled += 1;
-                }
-                None => return false, // timeout ou erro
-            }
-        }
-    }
-
-    /// `None` com a Shared Memory aberta; senão o estado do RTSS (iniciando ou falha).
-    fn open_view(&mut self) -> Option<Missing> {
-        if self.view.is_none() {
-            self.view = SharedView::open(SHM_NAME);
-        }
-        if self.view.is_some() {
-            self.started_at = None;
-            self.start_error = None;
-            return None;
-        }
-        if !self.start_rtss {
-            return Some(Missing::Fail("RTSS not running".into()));
-        }
-        // Nova tentativa de iniciar depois de `RTSS_START_RETRY`.
-        if self
-            .started_at
-            .is_none_or(|t| t.elapsed() >= RTSS_START_RETRY)
-        {
-            self.started_at = Some(Instant::now());
-            self.start_error = start_rtss().err();
-        }
-        if let Some(e) = &self.start_error {
-            return Some(Missing::Fail(format!("RTSS not running: {e}")));
-        }
-        Some(
-            if self
-                .started_at
-                .is_some_and(|t| t.elapsed() < RTSS_START_GRACE)
-            {
-                Missing::Neutral("starting RTSS".into())
-            } else {
-                Missing::Fail("RTSS not running (started, but no shared memory yet)".into())
-            },
-        )
-    }
-
-    /// Sem Shared Memory válida os índices do pipe não têm dono: descarta tudo.
-    fn forget_frames(&mut self) {
+    fn reset(&mut self, now: Instant) {
         self.exact.clear();
         self.approx.clear();
         self.lows = None;
         self.last_game = None;
-        self.retarget(None);
+        self.frames.retarget(None, now);
         // Sem Shared Memory válida, nenhum índice é "conhecido" (o teto vale para todos).
         self.known.clear();
         self.ignored.clear();
         self.published = None;
     }
 
-    /// Uma amostra: estado do RTSS e do jogo.
-    pub fn sample(&mut self) -> Fps {
-        if let Ok(list) = &mut self.pipe {
-            for inst in list.iter_mut().filter(|i| i.pending == Pending::None) {
-                inst.start_connect();
-            }
-        }
-        let pipe = match &self.pipe {
-            Ok(list) => Ok((list.len(), list.iter().filter(|i| i.connected).count())),
-            Err(Some(e)) => fail(e.clone()),
-            Err(None) => neutral("not started in --check"),
-        };
-        if let Some(missing) = self.open_view() {
-            self.forget_frames();
-            return Fps {
-                rtss: Err(missing.clone()),
-                pipe,
-                etw: self.etw_status(),
-                game: Err(missing),
-                hooked: Vec::new(),
-            };
-        }
-        let read = self.view.as_ref().map(read_apps);
-        let (apps, fg, ver) = match read {
-            Some(Ok(x)) => x,
-            Some(Err(e)) => {
-                // 0xDEAD ou lixo: desmapeia e reconecta na próxima amostra.
-                self.view = None;
-                self.forget_frames();
-                return Fps {
-                    rtss: fail(e.clone()),
-                    pipe,
-                    etw: self.etw_status(),
-                    game: fail(e),
-                    hooked: Vec::new(),
-                };
-            }
-            None => unreachable!("view aberta em open_view"),
-        };
-        let rtss = Ok(format!("shared memory {}.{}", ver >> 16, ver & 0xFFFF));
-        let now = Instant::now();
+    /// Atualiza índices conhecidos/ignorados, poda anéis, escolhe o jogo em foco e devolve
+    /// `(índice_do_jogo_em_apps, pid_desejado_para_etw)`.
+    fn sync_apps(
+        &mut self,
+        apps: &[App],
+        fg: Option<u32>,
+        now: Instant,
+    ) -> (Option<usize>, Option<u32>) {
         // Só os índices de apps acompanhados (os ignorados, como navegadores, não guardam 60 s
         // de frames).
         let (ign, ok): (Vec<&App>, Vec<&App>) = apps
@@ -538,7 +375,8 @@ impl RtssCollector {
         for r in self.exact.values_mut().chain(self.approx.values_mut()) {
             r.prune(now);
         }
-        let chosen = select_game(&apps, fg, &self.ignored_names);
+        let chosen = select_game(apps, fg, &self.ignored_names);
+        let chosen_idx = chosen.and_then(|g| apps.iter().position(|a| std::ptr::eq(a, g)));
         if let Some(g) = chosen {
             self.last_game = Some((g.pid, now));
         } else {
@@ -547,72 +385,10 @@ impl RtssCollector {
                 now.duration_since(*t) < ETW_HOLD && ok.iter().any(|a| a.pid == *pid && a.api != 0)
             });
         }
-        self.retarget(self.last_game.map(|(pid, _)| pid));
-        self.ingest();
-        let game = match chosen {
-            None => neutral("no 3D game in focus"),
-            Some(g) => Ok(self.game(g, now)),
-        };
-        // O pior frame é "desde a publicação anterior": o que sobrou não passa para a próxima.
-        for c in self.frames.chains.values_mut() {
-            c.peak = None;
-        }
-        let hooked = apps.iter().map(|a| a.pid).collect();
-        Fps {
-            rtss,
-            pipe,
-            etw: self.etw_status(),
-            game,
-            hooked,
-        }
+        (chosen_idx, self.last_game.map(|(pid, _)| pid))
     }
 
-    /// Desliga o ETW (testes da reserva: pipe e Shared Memory).
-    #[cfg(test)]
-    pub(crate) fn disable_etw(&mut self) {
-        self.retarget(None);
-        self.etw = Err(None);
-    }
-
-    /// Liga os providers do ETW para o jogo (ou desliga sem jogo).
-    fn retarget(&mut self, pid: Option<u32>) {
-        // Os frames só valem para o PID com os providers ligados de fato (falha ao ligar = sem
-        // alvo, e o aquecimento recomeça quando ligar).
-        let on = match &mut self.etw {
-            Ok(s) => {
-                self.etw_error = s.target(pid).err();
-                self.etw_error.is_none()
-            }
-            Err(_) => false,
-        };
-        self.frames.retarget(if on { pid } else { None });
-    }
-
-    fn ingest(&mut self) {
-        let Ok(s) = &self.etw else {
-            return;
-        };
-        let mut events = std::mem::take(&mut self.frames.scratch);
-        // Descartes (caixa cheia) só acontecem numa inundação: os frames que chegaram valem.
-        let dropped = s.drain(&mut events);
-        if dropped > 0 {
-            crate::debug::log("etw", &format!("dropped {dropped} events (inbox full)"));
-        }
-        // Relógios lidos juntos: a idade de cada evento vira um `Instant` sem desvio.
-        let (now, qpc) = (Instant::now(), etw::qpc_now());
-        self.frames.ingest(&mut events, qpc, s.freq(), now);
-        self.frames.scratch = events;
-    }
-
-    fn etw_status(&self) -> Metric<&'static str> {
-        match (&self.etw, &self.etw_error) {
-            (Ok(_), None) => Ok("DXGI + Reflex markers"),
-            (Ok(_), Some(e)) | (Err(Some(e)), _) => fail(e.clone()),
-            (Err(None), _) => neutral("not started in --check"),
-        }
-    }
-
-    fn game(&mut self, g: &App, now: Instant) -> Game {
+    fn build_game(&mut self, g: &App, now: Instant) -> Game {
         // Exato enquanto o pipe trouxe frames na janela de atividade (um travamento de 1-2 s
         // não vira "approx." nem perde os lows exatos).
         let exact_recent = self
@@ -749,6 +525,275 @@ impl RtssCollector {
                     .map(|us| f64::from(us) / 1000.0)
                 }
             },
+        }
+    }
+
+    fn clear_etw_peaks(&mut self) {
+        for c in self.frames.chains.values_mut() {
+            c.peak = None;
+        }
+    }
+}
+
+pub struct RtssCollector {
+    view: Option<SharedView>,
+    /// Se o RTSS deve ser iniciado quando ausente (modo normal; nunca no `--check`).
+    start_rtss: bool,
+    started_at: Option<Instant>,
+    start_error: Option<String>,
+    /// `Err(None)`: pipe desligado de propósito (`--check`); `Err(Some(e))`: falhou.
+    pipe: Result<Vec<Instance>, Option<String>>,
+    turn: usize,
+    /// Sessão ETW: `Err(None)` = desligada de propósito (`--check`); `Err(Some(e))` = falhou.
+    etw: Result<etw::Session, Option<String>>,
+    /// Falha ao ligar os providers para o jogo atual.
+    etw_error: Option<String>,
+    tracker: FrameTracker,
+}
+
+impl RtssCollector {
+    /// `pipe`: criar o servidor do pipe (só no modo normal: o `--check` não espera frames).
+    pub fn new(start_rtss: bool, pipe: bool) -> Self {
+        Self {
+            view: None,
+            start_rtss,
+            started_at: None,
+            start_error: None,
+            pipe: if pipe {
+                create_pipe().map_err(Some)
+            } else {
+                Err(None)
+            },
+            turn: 0,
+            // Junto com o pipe: só no modo normal (o `--check` roda com a TUI aberta e não
+            // pode parar a sessão dela).
+            etw: if pipe {
+                etw::Session::start().map_err(Some)
+            } else {
+                Err(None)
+            },
+            etw_error: None,
+            tracker: FrameTracker::new(
+                crate::config::DEFAULT_RTSS_IGNORED
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Troca a lista de ignorados (do `config.toml`).
+    pub fn with_ignored(mut self, list: Vec<String>) -> Self {
+        self.tracker.ignored_names = list;
+        self
+    }
+
+    /// Como `with_ignored`, com o coletor rodando: a próxima amostra refaz os índices
+    /// conhecidos e ignorados com a lista nova.
+    pub fn set_ignored(&mut self, list: Vec<String>) {
+        self.tracker.ignored_names = list;
+    }
+
+    /// Atende o pipe até `deadline` (conclusões de conexão e leitura). Volta na hora se `stop`
+    /// (evento manual) for sinalizado; devolve `true` nesse caso.
+    pub fn pump(&mut self, deadline: Instant, stop: HANDLE) -> bool {
+        let mut handled = 0u32;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let timeout = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+            let Ok(instances) = &mut self.pipe else {
+                // SAFETY: evento válido (dono: o motor, que espera esta thread terminar).
+                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
+            };
+            if handled >= MAX_SIGNALS_PER_PUMP {
+                // SAFETY: evento válido.
+                return unsafe { WaitForSingleObject(stop, timeout) } == WAIT_OBJECT_0;
+            }
+            // O evento de parada vem primeiro (índice 0); depois os das instâncias armadas,
+            // começando por uma diferente a cada volta (justiça entre clientes).
+            let mut events = [HANDLE::default(); INSTANCES + 1];
+            let mut armed = [0usize; INSTANCES];
+            events[0] = stop;
+            let mut n = 0;
+            for i in 0..instances.len() {
+                let k = (i + self.turn) % instances.len();
+                if instances[k].pending != Pending::None {
+                    armed[n] = k;
+                    events[n + 1] = instances[k].event_handle();
+                    n += 1;
+                }
+            }
+            self.turn = self.turn.wrapping_add(1);
+            // SAFETY: eventos válidos (no máximo 9).
+            let r = unsafe { WaitForMultipleObjects(&events[..=n], false, timeout) };
+            let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            if idx == 0 {
+                return true;
+            }
+            match armed[..n].get(idx - 1) {
+                Some(&k) => {
+                    instances[k].on_signal(
+                        &mut self.tracker.exact,
+                        &self.tracker.known,
+                        &self.tracker.ignored,
+                    );
+                    handled += 1;
+                }
+                None => return false, // timeout ou erro
+            }
+        }
+    }
+
+    /// `None` com a Shared Memory aberta; senão o estado do RTSS (iniciando ou falha).
+    fn open_view(&mut self) -> Option<Missing> {
+        if self.view.is_none() {
+            self.view = SharedView::open(SHM_NAME);
+        }
+        if self.view.is_some() {
+            self.started_at = None;
+            self.start_error = None;
+            return None;
+        }
+        if !self.start_rtss {
+            return Some(Missing::Fail("RTSS not running".into()));
+        }
+        // Nova tentativa de iniciar depois de `RTSS_START_RETRY`.
+        if self
+            .started_at
+            .is_none_or(|t| t.elapsed() >= RTSS_START_RETRY)
+        {
+            self.started_at = Some(Instant::now());
+            self.start_error = start_rtss().err();
+        }
+        if let Some(e) = &self.start_error {
+            return Some(Missing::Fail(format!("RTSS not running: {e}")));
+        }
+        Some(
+            if self
+                .started_at
+                .is_some_and(|t| t.elapsed() < RTSS_START_GRACE)
+            {
+                Missing::Neutral("starting RTSS".into())
+            } else {
+                Missing::Fail("RTSS not running (started, but no shared memory yet)".into())
+            },
+        )
+    }
+
+    /// Sem Shared Memory válida os índices do pipe não têm dono: descarta tudo.
+    fn forget_frames(&mut self) {
+        let now = Instant::now();
+        self.tracker.reset(now);
+        self.retarget(None, now);
+    }
+
+    /// Uma amostra: estado do RTSS e do jogo.
+    pub fn sample(&mut self) -> Fps {
+        if let Ok(list) = &mut self.pipe {
+            for inst in list.iter_mut().filter(|i| i.pending == Pending::None) {
+                inst.start_connect();
+            }
+        }
+        let pipe = match &self.pipe {
+            Ok(list) => Ok((list.len(), list.iter().filter(|i| i.connected).count())),
+            Err(Some(e)) => fail(e.clone()),
+            Err(None) => neutral("not started in --check"),
+        };
+        if let Some(missing) = self.open_view() {
+            self.forget_frames();
+            return Fps {
+                rtss: Err(missing.clone()),
+                pipe,
+                etw: self.etw_status(),
+                game: Err(missing),
+                hooked: Vec::new(),
+            };
+        }
+        let read = self.view.as_ref().map(read_apps);
+        let (apps, fg, ver) = match read {
+            Some(Ok(x)) => x,
+            Some(Err(e)) => {
+                // 0xDEAD ou lixo: desmapeia e reconecta na próxima amostra.
+                self.view = None;
+                self.forget_frames();
+                return Fps {
+                    rtss: fail(e.clone()),
+                    pipe,
+                    etw: self.etw_status(),
+                    game: fail(e),
+                    hooked: Vec::new(),
+                };
+            }
+            None => unreachable!("view aberta em open_view"),
+        };
+        let rtss = Ok(format!("shared memory {}.{}", ver >> 16, ver & 0xFFFF));
+        let now = Instant::now();
+        let (chosen_idx, target_pid) = self.tracker.sync_apps(&apps, fg, now);
+        self.retarget(target_pid, now);
+        self.ingest();
+        let game = match chosen_idx {
+            None => neutral("no 3D game in focus"),
+            Some(i) => Ok(self.tracker.build_game(&apps[i], now)),
+        };
+        // O pior frame é "desde a publicação anterior": o que sobrou não passa para a próxima.
+        self.tracker.clear_etw_peaks();
+        let hooked = apps.iter().map(|a| a.pid).collect();
+        Fps {
+            rtss,
+            pipe,
+            etw: self.etw_status(),
+            game,
+            hooked,
+        }
+    }
+
+    /// Desliga o ETW (testes da reserva: pipe e Shared Memory).
+    #[cfg(test)]
+    pub(crate) fn disable_etw(&mut self) {
+        self.retarget(None, Instant::now());
+        self.etw = Err(None);
+    }
+
+    /// Liga os providers do ETW para o jogo (ou desliga sem jogo).
+    fn retarget(&mut self, pid: Option<u32>, now: Instant) {
+        // Os frames só valem para o PID com os providers ligados de fato (falha ao ligar = sem
+        // alvo, e o aquecimento recomeça quando ligar).
+        let on = match &mut self.etw {
+            Ok(s) => {
+                self.etw_error = s.target(pid).err();
+                self.etw_error.is_none()
+            }
+            Err(_) => false,
+        };
+        self.tracker
+            .frames
+            .retarget(if on { pid } else { None }, now);
+    }
+
+    fn ingest(&mut self) {
+        let Ok(s) = &self.etw else {
+            return;
+        };
+        let mut events = std::mem::take(&mut self.tracker.frames.scratch);
+        // Descartes (caixa cheia) só acontecem numa inundação: os frames que chegaram valem.
+        let dropped = s.drain(&mut events);
+        if dropped > 0 {
+            crate::debug::log("etw", &format!("dropped {dropped} events (inbox full)"));
+        }
+        // Relógios lidos juntos: a idade de cada evento vira um `Instant` sem desvio.
+        let (now, qpc) = (Instant::now(), etw::qpc_now());
+        self.tracker.frames.ingest(&mut events, qpc, s.freq(), now);
+        self.tracker.frames.scratch = events;
+    }
+
+    fn etw_status(&self) -> Metric<&'static str> {
+        match (&self.etw, &self.etw_error) {
+            (Ok(_), None) => Ok("DXGI + Reflex markers"),
+            (Ok(_), Some(e)) | (Err(Some(e)), _) => fail(e.clone()),
+            (Err(None), _) => neutral("not started in --check"),
         }
     }
 }
@@ -1121,8 +1166,8 @@ mod tests {
         let extra: Vec<_> = (0..6).map(|_| open().expect("cliente extra")).collect();
         assert!(open().is_err(), "9ª conexão recusada");
         c.pump(Instant::now() + Duration::from_millis(300), stop);
-        assert_eq!(c.exact.get(&3).map(|r| r.frames.len()), Some(100));
-        assert_eq!(c.exact.get(&5).map(|r| r.frames.len()), Some(50));
+        assert_eq!(c.tracker.exact.get(&3).map(|r| r.frames.len()), Some(100));
+        assert_eq!(c.tracker.exact.get(&5).map(|r| r.frames.len()), Some(50));
         drop(extra);
         // Parada: o pump volta na hora mesmo com prazo longo.
         // SAFETY: evento válido.
@@ -1142,8 +1187,8 @@ mod tests {
     /// `mult`) durante `secs`, terminando agora. QPC em µs (frequência 1 MHz).
     fn etw_frames(fps: u32, fg: u32, mult: Option<u32>, secs: u32) -> (EtwFrames, Instant) {
         let mut f = EtwFrames::default();
-        f.retarget(Some(7));
         let now = Instant::now();
+        f.retarget(Some(7), now);
         f.since = now.checked_sub(Duration::from_secs(u64::from(secs) + 1));
         let n = fps * secs;
         let step = 1_000_000 / i64::from(fps);
@@ -1361,5 +1406,90 @@ mod tests {
         assert_eq!(big.frames.front().map(|f| f.1), Some(11));
         assert!(r.recent(now, Duration::from_secs(2)));
         assert!(!r.recent(now + Duration::from_secs(3), Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn frame_tracker_prioridade_congelamento_troca_e_peak() {
+        let mut tr = FrameTracker::new(defaults());
+        let t0 = Instant::now();
+        let mut g = app(0, "game.exe", 6, 100.0, Some(10));
+        g.frametime_us = 10_000;
+        let apps = vec![g.clone()];
+
+        // 1) Sem pipe nem ETW -> Approx.
+        let (idx, target) = tr.sync_apps(&apps, Some(g.pid), t0);
+        assert_eq!((idx, target), (Some(0), Some(g.pid)));
+        let out = tr.build_game(&apps[0], t0);
+        assert_eq!(out.source, FrameSource::Approx);
+        assert_eq!(out.fps, Ok(100.0));
+
+        // 2) Chegam frames no pipe (100 FPS = 10 ms) -> assume Pipe como fonte.
+        let t1 = t0 + Duration::from_secs(2);
+        {
+            let ring = tr.exact.entry(0).or_default();
+            ring.pid = Some(g.pid);
+            for i in 0..100 {
+                let at = t1 - Duration::from_millis(1000 - i * 10);
+                ring.push(at, if i == 90 { 35_000 } else { 10_000 });
+            }
+        }
+        let (idx, _) = tr.sync_apps(&apps, Some(g.pid), t1);
+        assert_eq!(idx, Some(0));
+        let out = tr.build_game(&apps[0], t1);
+        assert_eq!(out.source, FrameSource::Pipe);
+        assert_eq!(out.peak_ms, Some(35.0));
+
+        // Congelamento de 500 ms (gap > 2x avg) reduz o FPS em vez de congelar no antigo.
+        let t_stall = t1 + Duration::from_millis(500);
+        let stalled = tr.build_game(&apps[0], t_stall);
+        assert_eq!(stalled.source, FrameSource::Pipe);
+        assert!(stalled.fps.as_ref().unwrap() < &80.0, "{:?}", stalled.fps);
+
+        // 1,5 s sem frames: dentro de EXACT_GRACE continua Pipe, mas reporta "no frames".
+        let t_freeze = t1 + Duration::from_millis(1500);
+        let frozen = tr.build_game(&apps[0], t_freeze);
+        assert_eq!(frozen.source, FrameSource::Pipe);
+        assert_eq!(frozen.fps, neutral("no frames in the last second"));
+
+        // 3) ETW toma prioridade sobre Pipe e calcula MFG dinâmico.
+        let t2 = t1 + Duration::from_secs(5);
+        tr.frames.retarget(Some(g.pid), t2 - Duration::from_secs(3));
+        let now_qpc = 10_000_000i64;
+        let mut ev = Vec::new();
+        for i in 0..300u32 {
+            let qpc = now_qpc - i64::from(300 - i) * 5_000; // 200 FPS
+            ev.push(etw::Event {
+                pid: g.pid,
+                qpc,
+                kind: etw::Kind::Present { swapchain: 1 },
+            });
+            if i % 3 == 0 {
+                ev.push(etw::Event {
+                    pid: g.pid,
+                    qpc,
+                    kind: etw::Kind::SimStart,
+                });
+                ev.push(etw::Event {
+                    pid: g.pid,
+                    qpc,
+                    kind: etw::Kind::Multiplier(3),
+                });
+            }
+        }
+        tr.frames.ingest(&mut ev, now_qpc, 1_000_000, t2);
+        let out = tr.build_game(&apps[0], t2);
+        assert_eq!(out.source, FrameSource::Etw);
+        let fg = out.framegen.expect("MFG 3x");
+        assert_eq!(fg.ratio_text().as_deref(), Some("3x"));
+
+        // 4) Sem jogo ativo por < ETW_HOLD: mantém target ETW do último jogo.
+        let mut idle_app = g.clone();
+        idle_app.age_ms = Some(ACTIVE_MS + 500);
+        let (idx, hold_target) = tr.sync_apps(&[idle_app], None, t2 + Duration::from_secs(2));
+        assert_eq!(idx, None);
+        assert_eq!(hold_target, Some(g.pid));
+        // Após ETW_HOLD: solta o alvo ETW.
+        let (_, expired_target) = tr.sync_apps(&[], None, t2 + ETW_HOLD + Duration::from_secs(1));
+        assert_eq!(expired_target, None);
     }
 }

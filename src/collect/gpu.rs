@@ -25,10 +25,12 @@ use windows::core::Interface;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use super::gpu_engine::{AdapterUse, EngineCollector, adapter_use};
+use super::gpu_engine::{
+    AdapterUse, AdapterUseAcc, EngineCollector, Engines, EnginesAcc, parse_engine,
+};
 use super::vram::{ProcMem, VramCollector};
 use crate::model::{Fan, Gpu, GpuProc, GpuSlow, Metric, Missing, VramBreakdown, fail, neutral};
-use crate::pdh::{self, Query, Slot};
+use crate::pdh::{self, PdhError, Query, Slot};
 use crate::win;
 
 const NVIDIA: u32 = 0x10DE;
@@ -221,15 +223,36 @@ fn prefix_of(a: &Adapter) -> String {
 }
 
 /// Soma das instâncias PDH de um adaptador.
+#[cfg(test)]
 fn sum_for(items: &[(String, f64)], prefix: &str) -> Option<f64> {
     let mut hit = false;
     let total = items
         .iter()
-        .filter(|(n, _)| n.to_ascii_lowercase().starts_with(prefix))
+        .filter(|(n, _)| win::starts_with_ignore_ascii_case(n, prefix))
         .inspect(|_| hit = true)
         .map(|(_, v)| *v)
         .sum();
     hit.then_some(total)
+}
+
+/// Soma um contador `\GPU Adapter Memory(*)` para cada adaptador em uma única passagem sem alocar
+/// `String` por instância PDH.
+fn sum_adapter_memory(
+    q: &Result<Query, PdhError>,
+    slot: &Slot,
+    prefixes: &[Option<&str>],
+) -> Result<Vec<Option<f64>>, PdhError> {
+    let mut sums = vec![None; prefixes.len()];
+    pdh::for_each_array(q, slot, |name, v| {
+        for (sum, pref) in sums.iter_mut().zip(prefixes) {
+            if let Some(p) = pref
+                && win::starts_with_ignore_ascii_case(name, p)
+            {
+                *sum = Some(sum.unwrap_or(0.0) + v);
+            }
+        }
+    })?;
+    Ok(sums)
 }
 
 fn nv<T>(r: Result<T, NvmlError>) -> Metric<T> {
@@ -339,7 +362,7 @@ fn statics(nvml: &Result<Nvml, String>) -> Vec<Static> {
 pub struct GpuCollector {
     nvml: SharedNvml,
     gpus: Vec<Static>,
-    query: Result<Query, String>,
+    query: Result<Query, PdhError>,
     dedicated: Slot,
     shared: Slot,
     /// `\GPU Engine(*)` do adaptador (uso sem NVML e a engine fora o 3D e o vídeo), e as
@@ -408,23 +431,44 @@ impl GpuCollector {
             Ok(q) => q.collect(),
             Err(e) => Err(e.clone()),
         };
-        let arr = |slot: &Slot| {
-            sampled
-                .clone()
-                .and_then(|()| pdh::read_array(&self.query, slot))
-        };
-        let dedicated = arr(&self.dedicated);
-        let shared = arr(&self.shared);
+        let prefixes: Vec<Option<&str>> = self
+            .gpus
+            .iter()
+            .map(|s| s.adapter.as_ref().ok().map(|(p, _)| p.as_str()))
+            .collect();
+        let dedicated = sampled
+            .clone()
+            .and_then(|()| sum_adapter_memory(&self.query, &self.dedicated, &prefixes));
+        let shared = sampled
+            .clone()
+            .and_then(|()| sum_adapter_memory(&self.query, &self.shared, &prefixes));
         if sampled.is_ok() && self.engines.is_some() {
             self.engine_samples = self.engine_samples.saturating_add(1);
         }
-        let engines: Metric<Vec<(String, f64)>> = match &self.engines {
+        let engines: Metric<Vec<AdapterUse>> = match &self.engines {
             None => fail("GPU engine query is closed"),
             Some(slot) => match (&sampled, slot) {
                 (_, Err(e)) | (Err(e), _) => fail(e.clone()),
                 // 1ª coleta: a taxa ainda não existe (não é "0%").
                 _ if self.engine_samples < 2 => neutral("waiting for a second sample"),
-                _ => pdh::read_array(&self.query, slot).or_else(fail),
+                _ => {
+                    let mut accs: Vec<AdapterUseAcc> =
+                        (0..prefixes.len()).map(|_| AdapterUseAcc::new()).collect();
+                    pdh::for_each_array(&self.query, slot, |name, v| {
+                        let Some((_, adapter, eng, engtype)) = parse_engine(name) else {
+                            return;
+                        };
+                        for (acc, pref) in accs.iter_mut().zip(&prefixes) {
+                            if let Some(p) = pref
+                                && win::starts_with_ignore_ascii_case(adapter, p)
+                            {
+                                acc.push_parsed(&adapter[p.len()..], eng, engtype, v);
+                            }
+                        }
+                    })
+                    .map(|()| accs.into_iter().map(AdapterUseAcc::finish).collect())
+                    .or_else(fail)
+                }
             },
         };
         let out = self
@@ -432,10 +476,12 @@ impl GpuCollector {
             .iter()
             .enumerate()
             .map(|(pos, s)| {
-                let vram = |items: &Result<Vec<(String, f64)>, String>| -> Metric<u64> {
-                    let (prefix, _) = s.adapter.as_ref().map_err(Clone::clone)?;
-                    let items = items.as_ref().map_err(|e| Missing::Fail(e.clone()))?;
-                    sum_for(items, prefix)
+                let vram = |sums: &Result<Vec<Option<f64>>, PdhError>| -> Metric<u64> {
+                    s.adapter.as_ref().map_err(Clone::clone)?;
+                    let sums = sums
+                        .as_ref()
+                        .map_err(|e| Missing::Fail(e.message.clone()))?;
+                    sums[pos]
                         .map(|v| v as u64)
                         .map_or_else(|| fail(NO_PDH_INSTANCE), Ok)
                 };
@@ -449,8 +495,11 @@ impl GpuCollector {
                         dxgi_gpu(why, &fail(NO_PDH_INSTANCE))
                     }
                     (Source::Dxgi(_, why), _) => {
-                        let used = s.adapter.as_ref().map_err(Clone::clone).and_then(|(p, _)| {
-                            Ok(adapter_use(engines.as_ref().map_err(Clone::clone)?, p))
+                        let used = s.adapter.as_ref().map_err(Clone::clone).and_then(|_| {
+                            engines
+                                .as_ref()
+                                .map(|v| v[pos].clone())
+                                .map_err(Clone::clone)
                         });
                         dxgi_gpu(why, &used)
                     }
@@ -461,7 +510,7 @@ impl GpuCollector {
                     g.other_engine = match (&s.adapter, &engines) {
                         (Err(e), _) | (_, Err(e)) => Err(e.clone()),
                         _ if lost_adapter(&used_vram) => fail(NO_PDH_INSTANCE),
-                        (Ok((p, _)), Ok(rows)) => other_engine(Ok(adapter_use(rows, p).other)),
+                        (Ok(_), Ok(all)) => other_engine(Ok(all[pos].other.clone())),
                     };
                 }
                 g.index = pos as u32;
@@ -634,7 +683,7 @@ fn vram_and_procs(
     luid: &Metric<String>,
     total: Metric<u64>,
     collected: &Result<(), String>,
-    engine_rows: Option<&Metric<Vec<(String, f64)>>>,
+    engines: Option<Result<&Engines, &Missing>>,
     names: Option<&HashMap<u32, String>>,
 ) -> (Metric<VramBreakdown>, Option<Metric<Vec<GpuProc>>>) {
     let breakdown = match (luid, total, collected) {
@@ -643,25 +692,23 @@ fn vram_and_procs(
         (_, Err(e), _) => Err(e),
         (_, _, Err(e)) => fail(e.clone()),
     };
-    let procs = engine_rows.map(|rows| {
+    let procs = engines.map(|eng| {
         let l = luid.clone()?;
         // LUID trocado (reset): a lista vazia esconderia a causa.
         if lost_adapter(&breakdown) {
             return fail(NO_PDH_INSTANCE);
         }
         collected.clone().or_else(fail)?;
-        let mem = vram.per_process_detail(&l).or_else(fail)?;
+        let local = breakdown.as_ref().ok().map(|b| b.processes.as_slice());
+        let mem = vram.per_process_detail(&l, local).or_else(fail)?;
         if names.is_none() {
             // Sem a lista de processos: o cache cobre os PIDs desta lista.
-            let engine_pids: Vec<u32> = rows.as_ref().map_or_else(
-                |_| Vec::new(),
-                |r| super::gpu_engine::group(r, &l).into_keys().collect(),
-            );
+            let engine_pids: Vec<u32> = eng.map_or_default(|e| e.keys().copied().collect());
             vram.refresh_names(mem.keys().copied().chain(engine_pids));
         }
-        let list = gpu_procs(&mem, rows, &l, names.unwrap_or(&vram.names));
+        let list = gpu_procs(&mem, eng, names.unwrap_or(&vram.names));
         // Engines em falha e nenhum processo com VRAM: a lista vazia esconderia a causa.
-        match rows {
+        match eng {
             Err(e) if list.is_empty() => Err(e.clone()),
             _ => Ok(list),
         }
@@ -713,9 +760,27 @@ impl GpuSlowCollector {
         }
         // Uma coleta PDH por ciclo, para todas as GPUs (a VRAM e o detalhe leem dela).
         let collected = self.vram.collect();
-        let engine_rows: Option<Metric<Vec<(String, f64)>>> = detail.then(|| {
+        let engines_per_gpu: Option<Metric<Vec<Engines>>> = detail.then(|| {
             match self.engines.collect() {
-                Ok(true) => self.engines.rows().or_else(fail),
+                Ok(true) => {
+                    let mut accs: Vec<EnginesAcc> =
+                        (0..self.gpus.len()).map(|_| EnginesAcc::new()).collect();
+                    self.engines
+                        .for_each_row(|name, v| {
+                            let Some((pid, adapter, _, engtype)) = parse_engine(name) else {
+                                return;
+                            };
+                            for (acc, (_, luid)) in accs.iter_mut().zip(&self.gpus) {
+                                if let Ok(p) = luid
+                                    && win::starts_with_ignore_ascii_case(adapter, p)
+                                {
+                                    acc.push_parsed(pid, engtype, v);
+                                }
+                            }
+                        })
+                        .map(|()| accs.into_iter().map(EnginesAcc::finish).collect())
+                        .or_else(fail)
+                }
                 // 1ª coleta depois de abrir: a taxa ainda não existe (não é "0%").
                 Ok(false) => neutral("waiting for a second sample"),
                 Err(e) => fail(e),
@@ -744,8 +809,10 @@ impl GpuSlowCollector {
                 (None, Source::Dxgi(a, _)) => Ok(a.dedicated_total),
                 (None, Source::Nvml(_)) => fail("NVML device missing"),
             };
-            let (vram_b, procs) =
-                vram_and_procs(vram, luid, total, &collected, engine_rows.as_ref(), names);
+            let gpu_engines = engines_per_gpu
+                .as_ref()
+                .map(|m| m.as_ref().map(|v| &v[pos]));
+            let (vram_b, procs) = vram_and_procs(vram, luid, total, &collected, gpu_engines, names);
             // PCIe custa ~23 ms por sentido: no máximo a cada `PCIE_EVERY`, mesmo quando abrir
             // uma aba acorda a thread lenta antes da hora. KB/s → bytes/s.
             let (pcie_tx, pcie_rx) = match (&device, source) {
@@ -796,15 +863,11 @@ impl GpuSlowCollector {
 /// Junta a VRAM por processo e as engines: um processo entra se tem VRAM ou engine em uso.
 fn gpu_procs(
     mem: &HashMap<u32, ProcMem>,
-    engine_rows: &Metric<Vec<(String, f64)>>,
-    luid: &str,
+    engines: Result<&Engines, &Missing>,
     names: &HashMap<u32, String>,
 ) -> Vec<GpuProc> {
-    let engines = engine_rows
-        .as_ref()
-        .map(|rows| super::gpu_engine::group(rows, luid));
     let mut pids: Vec<u32> = mem.keys().copied().collect();
-    if let Ok(e) = &engines {
+    if let Ok(e) = engines {
         pids.extend(e.keys().copied());
     }
     pids.sort_unstable();
@@ -821,9 +884,9 @@ fn gpu_procs(
                 local,
                 non_local,
                 committed,
-                engines: match &engines {
+                engines: match engines {
                     Ok(e) => Ok(e.get(&pid).cloned().unwrap_or_default()),
-                    Err(err) => Err((*err).clone()),
+                    Err(err) => Err(err.clone()),
                 },
             }
         })

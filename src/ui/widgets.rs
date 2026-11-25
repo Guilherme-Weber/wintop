@@ -6,14 +6,19 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
-/// Gradiente do tema entre baixo (0), meio (0,5) e alto (1).
-pub fn gradient(t: f64) -> Color {
-    let rgb = |c: Color| match c {
+fn rgb_f64(c: Color) -> (f64, f64, f64) {
+    match c {
         Color::Rgb(r, g, b) => (f64::from(r), f64::from(g), f64::from(b)),
         _ => (128.0, 128.0, 128.0),
-    };
-    let t3 = super::theme::th();
-    let (low, mid, high) = (rgb(t3.low), rgb(t3.mid), rgb(t3.high));
+    }
+}
+
+fn gradient_rgb(
+    t: f64,
+    low: (f64, f64, f64),
+    mid: (f64, f64, f64),
+    high: (f64, f64, f64),
+) -> Color {
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
     } else {
@@ -26,6 +31,12 @@ pub fn gradient(t: f64) -> Color {
     };
     let mix = |x: f64, y: f64| (x + (y - x) * u).round() as u8;
     Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+/// Gradiente do tema entre baixo (0), meio (0,5) e alto (1).
+pub fn gradient(t: f64) -> Color {
+    let t3 = super::theme::th();
+    gradient_rgb(t, rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high))
 }
 
 /// O mesmo tom com metade do brilho (parte de kernel dos gráficos de CPU).
@@ -170,10 +181,54 @@ impl Widget for Graph<'_> {
                     .map_or(0, |&v| dots(norm(v), max))
             })
         };
+        // Pré-calcula o gradiente fora do laço por célula (evita w×h leituras do tema).
+        let grad_stops = matches!(self.color, GraphColor::Height | GraphColor::Value).then(|| {
+            let t3 = super::theme::th();
+            (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high))
+        });
+        let mut row_colors = [Color::Reset; 64];
+        if matches!(self.color, GraphColor::Height)
+            && h > 1
+            && let Some((low, mid, high)) = grad_stops
+        {
+            for (row, slot) in row_colors.iter_mut().enumerate().take(h) {
+                *slot = gradient_rgb(row as f64 / (h - 1) as f64, low, mid, high);
+            }
+        }
         for col in 0..w {
             let (sl, sr) = (sample(col * 2), sample(col * 2 + 1));
             let (l, r) = (dots(sl, max), dots(sr, max));
             let peak = sl.max(sr);
+            let col_color = match self.color {
+                GraphColor::Height if h > 1 => Color::Reset,
+                GraphColor::Height | GraphColor::Value => {
+                    let (low, mid, high) =
+                        grad_stops.unwrap_or(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+                    gradient_rgb(0.25 + 0.75 * peak, low, mid, high)
+                }
+                GraphColor::Fixed(c) => c,
+                GraphColor::Threshold { base, alert, at } => {
+                    if peak >= at {
+                        alert
+                    } else {
+                        base
+                    }
+                }
+                GraphColor::Bands {
+                    base,
+                    over,
+                    low,
+                    low_at,
+                } => {
+                    if peak > 1.0 {
+                        over
+                    } else if peak < low_at {
+                        low
+                    } else {
+                        base
+                    }
+                }
+            };
             // Kernel da coluna: o menor dos dois (a célula só escurece se estiver toda por baixo).
             let k = under_dots(col * 2).min(under_dots(col * 2 + 1));
             for row in 0..h {
@@ -214,41 +269,16 @@ impl Widget for Graph<'_> {
                     continue;
                 }
                 let ch = char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ');
-                let color = match self.color {
-                    // Com 1 linha não há altura: a cor vem do valor (como em `Value`), senão
-                    // ficaria sempre na base escura do gradiente.
-                    GraphColor::Height => {
-                        if h > 1 {
-                            gradient(row as f64 / (h - 1) as f64)
-                        } else {
-                            gradient(0.25 + 0.75 * peak)
-                        }
+                let color = if matches!(self.color, GraphColor::Height) && h > 1 {
+                    if row < row_colors.len() {
+                        row_colors[row]
+                    } else if let Some((low, mid, high)) = grad_stops {
+                        gradient_rgb(row as f64 / (h - 1) as f64, low, mid, high)
+                    } else {
+                        col_color
                     }
-                    // Atividade pequena não some no fundo (a base do gradiente é escura): a cor
-                    // parte de um quarto da escala.
-                    GraphColor::Value => gradient(0.25 + 0.75 * peak),
-                    GraphColor::Fixed(c) => c,
-                    GraphColor::Threshold { base, alert, at } => {
-                        if peak >= at {
-                            alert
-                        } else {
-                            base
-                        }
-                    }
-                    GraphColor::Bands {
-                        base,
-                        over,
-                        low,
-                        low_at,
-                    } => {
-                        if peak > 1.0 {
-                            over
-                        } else if peak < low_at {
-                            low
-                        } else {
-                            base
-                        }
-                    }
+                } else {
+                    col_color
                 };
                 // Pelo menos metade da célula na parte de kernel: o mesmo tom, mais escuro (com a
                 // célula inteira, kernel baixo nunca apareceria na grade por núcleo).
@@ -290,18 +320,21 @@ impl Widget for Meter {
         } else {
             ((v * max_steps as f64).round() as usize).clamp(1, max_steps)
         };
-        let dim = crate::ui::theme::th().dim;
+        let t3 = crate::ui::theme::th();
+        let dim = t3.dim;
+        let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
+        let denom = w.max(2).saturating_sub(1) as f64;
         for i in 0..w {
             let fill = steps.saturating_sub(i * 2).min(2);
             let (sym, style) = match fill {
                 0 => ("⣿", Style::new().fg(dim)),
                 1 => (
                     "⡇",
-                    Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64)),
+                    Style::new().fg(gradient_rgb(i as f64 / denom, low, mid, high)),
                 ),
                 _ => (
                     "⣿",
-                    Style::new().fg(gradient(i as f64 / w.max(2).saturating_sub(1) as f64)),
+                    Style::new().fg(gradient_rgb(i as f64 / denom, low, mid, high)),
                 ),
             };
             // Só dentro do buffer (área parcialmente fora da tela num terminal pequeno).
@@ -508,7 +541,9 @@ impl Widget for VerticalBar {
         } else {
             ((v * max_steps as f64).round() as usize).clamp(1, max_steps)
         };
-        let dim = crate::ui::theme::th().dim;
+        let t3 = crate::ui::theme::th();
+        let dim = t3.dim;
+        let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
         for row in 0..h {
             // `row` = 0 na base, `h - 1` no topo.
             let base = row * 4;
@@ -521,7 +556,10 @@ impl Widget for VerticalBar {
             let (sym, style) = if fill == 0 {
                 (VBRAILLE[0], Style::new().fg(dim))
             } else {
-                (VBRAILLE[fill], Style::new().fg(gradient(t)))
+                (
+                    VBRAILLE[fill],
+                    Style::new().fg(gradient_rgb(t, low, mid, high)),
+                )
             };
             let y = area.y + (h - 1 - row) as u16;
             for col in 0..w {
@@ -539,11 +577,12 @@ impl Widget for Segmented<'_> {
         if w == 0 || area.height == 0 || self.total == 0 {
             return;
         }
+        let dim = crate::ui::theme::th().dim;
         for i in 0..w {
             // Meio da célula, em bytes.
             let mid = ((i as f64 + 0.5) / w as f64) * self.total as f64;
             let mut acc = 0.0;
-            let mut color = crate::ui::theme::th().dim;
+            let mut color = dim;
             for &(bytes, c) in self.parts {
                 acc += bytes as f64;
                 if mid < acc {

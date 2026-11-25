@@ -156,15 +156,13 @@ pub fn run() {
     // Sobras de uma troca anterior (o exe antigo, que estava em uso).
     update::remove_stale_old(&mode);
 
-    if run_ui(&mode) == ui::Outcome::Restart {
+    if let ui::Outcome::Restart(pending) = run_ui(&mode) {
         // Versão nova no lugar: a instância é liberada e o exe novo abre neste mesmo console
         // (herda a elevação). Este processo só espera por ele, para quem abriu o wintop (um
         // shell) não retomar o console no meio.
         drop(instance);
-        let Some(exe) = update::exe_of(&mode) else {
-            std::process::exit(1);
-        };
-        match update::relaunch(&exe) {
+        let exe = pending.exe().to_path_buf();
+        match pending.relaunch() {
             Ok(s) => std::process::exit(s.code().unwrap_or(0)),
             Err(e) => {
                 eprintln!("wintop: could not start {}: {e}", exe.display());
@@ -219,7 +217,11 @@ fn run_ui(mode: &update::Mode) -> ui::Outcome {
     for w in &cfg.warnings {
         debug::log("config", w);
     }
-    ui::theme::set(ui::theme::build(&cfg.config.theme, &cfg.config.colors));
+    ui::theme::set(ui::theme::build_with_no_color(
+        &cfg.config.theme,
+        &cfg.config.colors,
+        ui::theme::no_color(),
+    ));
     let interval = cfg.config.interval_ms;
     let ignored = cfg.config.rtss_ignored.clone();
     // Versão nova: consultada numa thread (a TUI pergunta quando a resposta chegar).

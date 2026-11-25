@@ -18,8 +18,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 
 use crate::model::{Metric, VramBreakdown, VramKind, VramProc, fail};
-use crate::pdh::{self, Query, Slot};
-use crate::win::{from_wide, own};
+use crate::pdh::{self, PdhError, Query, Slot};
+use crate::win::{from_wide, own, starts_with_ignore_ascii_case};
 
 const BROWSERS: &[&str] = &[
     "firefox.exe",
@@ -45,12 +45,11 @@ const SYSTEM: &[&str] = &[
 
 /// Categoria de um processo pelo nome.
 pub(super) fn classify(name: &str, pid: u32) -> VramKind {
-    let n = name.to_ascii_lowercase();
-    if n == "dwm.exe" {
+    if name.eq_ignore_ascii_case("dwm.exe") {
         VramKind::Compositor
-    } else if BROWSERS.contains(&n.as_str()) {
+    } else if BROWSERS.iter().any(|b| name.eq_ignore_ascii_case(b)) {
         VramKind::Browser
-    } else if SYSTEM.contains(&n.as_str()) || pid <= 4 {
+    } else if SYSTEM.iter().any(|s| name.eq_ignore_ascii_case(s)) || pid <= 4 {
         VramKind::System
     } else {
         VramKind::App
@@ -155,7 +154,7 @@ pub(super) type ProcMem = (u64, u64, u64);
 /// local e a confirmada só são lidas com a aba GPU visível (mesmo objeto PDH da local: a
 /// coleta custa o mesmo).
 pub(super) struct VramCollector {
-    query: Result<Query, String>,
+    query: Result<Query, PdhError>,
     local: Slot,
     non_local: Slot,
     committed: Slot,
@@ -195,17 +194,17 @@ impl VramCollector {
 
     /// Soma por PID de um contador de processo, só das instâncias do adaptador.
     fn per_process(&self, slot: &Slot, luid: &str) -> Result<HashMap<u32, u64>, String> {
-        let rows = pdh::read_array(&self.query, slot)?;
         let mut out: HashMap<u32, u64> = HashMap::new();
-        for (name, v) in &rows {
+        pdh::for_each_array(&self.query, slot, |name, v| {
             if let Some((pid, rest)) = parse_instance(name)
-                && rest.to_ascii_lowercase().starts_with(luid)
+                && starts_with_ignore_ascii_case(rest, luid)
             {
                 // `as` satura (NaN = 0); a soma também, com valores corrompidos do PDH.
                 let e = out.entry(pid).or_default();
-                *e = e.saturating_add(*v as u64);
+                *e = e.saturating_add(v as u64);
             }
-        }
+        })
+        .map_err(String::from)?;
         Ok(out)
     }
 
@@ -235,10 +234,21 @@ impl VramCollector {
     }
 
     /// VRAM local, não local e confirmada por PID (aba GPU), da coleta feita pelo `read`.
-    pub(super) fn per_process_detail(&self, luid: &str) -> Result<HashMap<u32, ProcMem>, String> {
+    /// Quando `local` já foi lido no `breakdown`, reaproveita sem reler o contador PDH.
+    pub(super) fn per_process_detail(
+        &self,
+        luid: &str,
+        local: Option<&[VramProc]>,
+    ) -> Result<HashMap<u32, ProcMem>, String> {
         let mut out: HashMap<u32, ProcMem> = HashMap::new();
-        for (pid, v) in self.per_process(&self.local, luid)? {
-            out.entry(pid).or_default().0 = v;
+        if let Some(procs) = local {
+            for p in procs {
+                out.entry(p.pid).or_default().0 = p.local;
+            }
+        } else {
+            for (pid, v) in self.per_process(&self.local, luid)? {
+                out.entry(pid).or_default().0 = v;
+            }
         }
         for (pid, v) in self.per_process(&self.non_local, luid)? {
             out.entry(pid).or_default().1 = v;
@@ -256,8 +266,8 @@ impl VramCollector {
         self.names.retain(|p, _| seen.contains(p));
         self.unnamed.retain(|p| seen.contains(p));
         match &self.query {
-            Ok(q) => q.collect(),
-            Err(e) => Err(e.clone()),
+            Ok(q) => q.collect().map_err(String::from),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -281,16 +291,18 @@ impl VramCollector {
             self.refresh_names(using.into_iter());
         }
         let names = names.unwrap_or(&self.names);
-        let adapter = pdh::read_array(&self.query, &self.adapter).or_else(fail)?;
-        let mine: Vec<u64> = adapter
-            .iter()
-            .filter(|(n, _)| n.to_ascii_lowercase().starts_with(luid))
-            .map(|(_, v)| *v as u64)
-            .collect();
-        if mine.is_empty() {
+        let mut hit = false;
+        let mut adapter_used = 0u64;
+        pdh::for_each_array(&self.query, &self.adapter, |name, v| {
+            if starts_with_ignore_ascii_case(name, luid) {
+                hit = true;
+                adapter_used = adapter_used.saturating_add(v as u64);
+            }
+        })
+        .or_else(fail)?;
+        if !hit {
             return fail(super::gpu::NO_PDH_INSTANCE);
         }
-        let adapter_used = mine.iter().fold(0u64, |a, v| a.saturating_add(*v));
         let list: Vec<(u32, u64)> = per_process.into_iter().collect();
         Ok(breakdown(&list, adapter_used, total, names))
     }

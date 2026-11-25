@@ -171,12 +171,13 @@ impl SlowCollectors {
         }
     }
 
-    /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro).
+    /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro; durante
+    /// o aquecimento de aba devolve `None` para não publicar falhas falsas de encerramento).
     /// `view`: abas visíveis; processos e engines da GPU só são coletados com elas à vista
     /// (ao abrir, uma leitura de aquecimento e ~300 ms de espera: as taxas precisam de duas).
     /// `game_pid`: PID do jogo em foco (0 = nenhum), para medir o working set privado dele na
     /// barra da RAM sem abrir o processo.
-    pub fn collect(&mut self, stop: &AtomicBool, view: View, game_pid: u32) -> Slow {
+    pub fn collect(&mut self, stop: &AtomicBool, view: View, game_pid: u32) -> Option<Slow> {
         let start = Instant::now();
         let want_procs = view.procs || view.gpu;
         if !want_procs {
@@ -210,13 +211,7 @@ impl SlowCollectors {
             warm = true;
         }
         if warm && nap(TAB_WARMUP, stop) {
-            return Slow {
-                gpus: fail("stopping"),
-                disk_temps: fail("stopping"),
-                procs: None,
-                game_ram: None,
-                took: start.elapsed(),
-            };
+            return None;
         }
         // Aba trocada entre Processos e GPU logo depois de uma leitura: a taxa precisa de uma
         // janela mínima (senão o tempo do sistema nem avançou um tick e a CPU sai 0%).
@@ -224,13 +219,7 @@ impl SlowCollectors {
             && let Some(left) = TAB_WARMUP.checked_sub(self.procs.since_last())
             && nap(left, stop)
         {
-            return Slow {
-                gpus: fail("stopping"),
-                disk_temps: fail("stopping"),
-                procs: None,
-                game_ram: None,
-                took: start.elapsed(),
-            };
+            return None;
         }
         let procs = want_procs.then(|| guarded("process", || self.procs.read()));
         let game_ram = if game_pid == 0 {
@@ -253,13 +242,13 @@ impl SlowCollectors {
             g.read(view.gpu, names.as_ref())
         });
         let disk_temps = run("disk temperature", &mut self.disk_temp, |c| c.read(stop));
-        Slow {
+        Some(Slow {
             gpus,
             disk_temps,
             procs,
             game_ram,
             took: start.elapsed(),
-        }
+        })
     }
 }
 

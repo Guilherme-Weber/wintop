@@ -8,9 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::state::State;
+use super::table;
 use super::{
     boxed, empty_box, faded, failed_span, label, line, metric, metric_styled, put, short_bytes,
-    tabs, temp_color, wrap,
+    temp_color, wrap,
 };
 use crate::fmt::num;
 use crate::i18n::tr;
@@ -21,22 +22,22 @@ use crate::win::printable;
 // --- Discos ---
 
 /// Ordem de exibição: discos com letra e o virtual; membros do pool depois (recolhidos se
-/// `fold`). Devolve (disco, é membro).
-pub(super) fn disk_order(st: &State) -> Vec<(Disk, bool)> {
+/// `fold`). Devolve (&disco, é membro).
+pub(super) fn disk_order(st: &State) -> Vec<(&Disk, bool)> {
     let Some(Ok(list)) = st.fast.as_ref().map(|f| &f.disks) else {
         return Vec::new();
     };
-    let mut out: Vec<(Disk, bool)> = list
+    let mut out: Vec<(&Disk, bool)> = list
         .iter()
         .filter(|d| d.pool_member != Ok(true))
-        .map(|d| (d.clone(), false))
+        .map(|d| (d, false))
         .collect();
-    out.sort_by_key(|(d, _)| d.letters.first().cloned().unwrap_or_else(|| "~".into()));
+    out.sort_by_key(|(d, _)| d.letters.first().map_or("~", String::as_str));
     if !pool_folded(st, list.len()) {
         out.extend(
             list.iter()
                 .filter(|d| d.pool_member == Ok(true))
-                .map(|d| (d.clone(), true)),
+                .map(|d| (d, true)),
         );
     }
     out
@@ -116,14 +117,13 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         note("disks", "temperature", e);
     }
     // Todos os discos, inclusive os membros recolhidos do pool (a falha deles também aparece).
-    let all: Vec<Disk> = st
+    let all: &[Disk] = st
         .fast
         .as_ref()
         .and_then(|f| f.disks.as_ref().ok())
-        .cloned()
-        .unwrap_or_default();
+        .map_or(&[], Vec::as_slice);
     for d in all {
-        let name = disk_label(&d);
+        let name = disk_label(d);
         let fails: [(&str, Option<&Missing>); 5] = [
             ("model", d.model.as_ref().err()),
             ("bus", d.bus.as_ref().err()),
@@ -134,8 +134,11 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         for (what, m) in fails {
             match m {
                 Some(m @ Missing::Fail(_)) => note(&name, what, m),
-                // "asleep" cabe na coluna da capacidade; outro estado vai para a nota.
-                Some(m @ Missing::Neutral(n)) if n.chars().count() > 6 => note(&name, what, m),
+                // "asleep" cabe na coluna da capacidade (6 cols); em idiomas onde a tradução
+                // passa de 6 cols (ex.: "repouso"), vai para a nota em vez de estourar a coluna.
+                Some(m @ Missing::Neutral(n)) if tr(n).chars().count() > 6 => {
+                    note(&name, what, m);
+                }
                 _ => {}
             }
         }
@@ -146,14 +149,14 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         {
             note(&name, "I/O counters", m);
         }
-        if let Some(t) = disk_temp(st, &d)
+        if let Some(t) = disk_temp(st, d)
             && let Err(m) = &t.celsius
             && (matches!(m, Missing::Fail(_)) || tr(&m.to_string()).chars().count() > DISK_TEMP_W)
         {
             note(&name, "temperature", m);
         }
         // Previsão de falha do SMART: aviso em vermelho (não é falha da fonte, é do disco).
-        match disk_temp(st, &d).map(|t| &t.health) {
+        match disk_temp(st, d).map(|t| &t.health) {
             Some(Ok(true)) => note(
                 &name,
                 "SMART",
@@ -166,14 +169,19 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+pub(super) fn draw_disks(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    st: &State,
+    order: &[(&Disk, bool)],
+    precomputed_notes: Option<(u16, Vec<Line<'static>>)>,
+) {
     let disks = st.fast.as_ref().map(|f| &f.disks);
     let Some(Ok(all)) = disks else {
         empty_box(frame, area, "disks", disks);
         return;
     };
     let members = all.iter().filter(|d| d.pool_member == Ok(true)).count();
-    let order = disk_order(st);
     let folded = pool_folded(st, all.len());
     let block = boxed(
         "disks",
@@ -207,12 +215,13 @@ pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     } else {
         (24, 41)
     };
-    // O nome encolhe antes de tudo (até 12 colunas); a atividade fica com a sobra. As colunas
-    // nunca se sobrepõem: sem largura, o lado direito é que perde as últimas colunas.
+    // O nome encolhe antes de tudo (até 10 cols no piso 80×24 para "! failed" de temperatura
+    // caber inteiro); a atividade fica com a sobra. As colunas nunca se sobrepõem.
+    let name_min = if tiny { 10 } else { 12 };
     let name_w = inner
         .width
         .saturating_sub(left_w + info_full + 4)
-        .clamp(12, if wide { 34 } else { 26 });
+        .clamp(name_min, if wide { 34 } else { 26 });
     let spark_w = inner.width.saturating_sub(name_w + left_w + info_full);
     let info_x = inner.x + name_w + left_w + spark_w;
     let info_w = inner
@@ -272,7 +281,10 @@ pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     );
     // As notas (causas) têm linhas reservadas no fim da caixa: os discos que não couberem
     // entram no "+N more", nunca as causas.
-    let notes = disk_notes(st, inner.width);
+    let notes = match precomputed_notes {
+        Some((w, n)) if w == inner.width => n,
+        _ => disk_notes(st, inner.width),
+    };
     let rows = usize::from(inner.height.saturating_sub(1)).saturating_sub(notes.len());
     // Não cabem todos: a última linha avisa quantos ficaram de fora (nada some sem aviso).
     let shown = if order.len() > rows {
@@ -323,9 +335,9 @@ pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             name = tr(&format!("{letters} {model} ({members} members)")).into_owned();
         }
         // Pela largura no terminal (nome do PnP com caracteres largos não empurra as colunas).
-        let name_cell = tabs::cell(&name, name_w.saturating_sub(1), false);
+        let name_cell = table::cell(&name, name_w.saturating_sub(1), false);
         // Sem valor: "!" para falha (a causa está nas notas), "?" para estado neutro; a
-        // capacidade de um HDD em repouso diz "asleep".
+        // capacidade de um HDD em repouso diz "asleep" se couber em 6 cols no idioma atual.
         let bus = d
             .bus
             .as_ref()
@@ -336,7 +348,7 @@ pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             .map_or_else(missing_mark, |s| if *s { "SSD" } else { "HDD" }.to_string());
         let cap = match &d.capacity {
             Ok(c) => short_bytes(*c),
-            Err(Missing::Neutral(n)) if n.chars().count() <= 6 => n.clone(),
+            Err(Missing::Neutral(n)) if tr(n).chars().count() <= 6 => tr(n).into_owned(),
             Err(e) => missing_mark(e),
         };
         let flags = format!(
@@ -374,10 +386,10 @@ pub(super) fn draw_disks(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         line(frame, left_spans, inner.x, y, name_w + left_w, inner);
         if spark_w > 0
-            && let Some(s) = st.disks.get_mut(&d.number)
+            && let Some(s) = st.disks.get(&d.number)
         {
             frame.render_widget(
-                Graph::new(s.values(), GraphColor::Value),
+                Graph::new(s.values(), GraphColor::Value).with_baseline(th().dim),
                 Rect::new(inner.x + name_w + left_w, y, spark_w, 1).intersection(inner),
             );
         }

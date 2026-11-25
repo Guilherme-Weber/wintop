@@ -5,24 +5,17 @@
 //! (5700X3D) na Etapa 0. `PawnIOLib.dll` por caminho absoluto (`InstallLocation` do registro);
 //! o módulo vem de `<pasta do exe>\modules\` (o `build.rs` copia para lá na compilação).
 
-use std::ffi::{CStr, c_void};
+use std::ffi::CStr;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, FreeLibrary, HANDLE, HLOCAL, HMODULE, LocalFree, WAIT_ABANDONED,
-    WAIT_FAILED, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, FreeLibrary, HANDLE, HMODULE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-};
-use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_SZ, RegGetValueW,
 };
 use windows::Win32::System::Threading::{
     CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
@@ -31,7 +24,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PCSTR, PCWSTR, w};
 
 use crate::model::{CpuSensors, Metric, Missing, fail, neutral};
-use crate::win::{own, wide};
+use crate::win::{SecurityDescriptor, own, wide};
 
 type FnOpen = unsafe extern "system" fn(*mut HANDLE) -> HRESULT;
 type FnLoad = unsafe extern "system" fn(HANDLE, *const u8, usize) -> HRESULT;
@@ -278,29 +271,18 @@ impl PawnIo {
 fn open_pci_mutex() -> Result<OwnedHandle, String> {
     // S:(ML;;NW;;;ME): sem o rótulo, o objeto criado por um processo elevado fica com
     // integridade alta e a escrita (MUTEX_MODIFY_STATE) é negada a quem roda em média.
-    let sddl = wide("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;AU)S:(ML;;NW;;;ME)");
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: SDDL terminado em zero; o descritor é liberado logo após o uso.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &raw mut sd,
-            None,
-        )
-    }
-    .map_err(|e| format!("Access_PCI mutex SDDL: {e}"))?;
+    let sd = SecurityDescriptor::from_sddl(
+        "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100001;;;AU)S:(ML;;NW;;;ME)",
+    )
+    .map_err(|e| format!("Access_PCI mutex {e}"))?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
+        lpSecurityDescriptor: sd.raw().0,
         bInheritHandle: false.into(),
     };
-    // SAFETY: atributos válidos durante a chamada; se o mutex já existir, só é aberto.
+    // SAFETY: atributos válidos enquanto `sd` vive; se o mutex já existir, só é aberto.
     let r = unsafe { CreateMutexW(Some(&raw const sa), false, w!("Global\\Access_PCI")) };
-    // SAFETY: descritor alocado por ConvertString...; não é usado depois daqui.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
+    drop(sd);
     let h = match r {
         Ok(h) => h,
         // Já criado por um serviço (SYSTEM) com DACL restrita: o CreateMutexW pede acesso
@@ -324,35 +306,22 @@ fn open_pci_mutex() -> Result<OwnedHandle, String> {
     Ok(unsafe { own(h) })
 }
 
-/// Pasta de instalação do PawnIO pelo registro. Sem fallback fixo: valor ausente, vazio ou
-/// relativo é erro (processo elevado não carrega DLL de caminho incerto). Só `REG_SZ` (o que o
-/// instalador grava): um `REG_EXPAND_SZ` seria expandido com o ambiente herdado do processo
-/// sem elevação que abriu o wintop.
 /// `PawnIOLib.dll` da instalação do PawnIO (para a auditoria do `--check`).
 pub fn dll_path() -> Option<PathBuf> {
     install_dir().ok().map(|d| d.join("PawnIOLib.dll"))
 }
 
+/// Pasta de instalação do PawnIO pelo registro. Sem fallback fixo: valor ausente, vazio ou
+/// relativo é erro (processo elevado não carrega DLL de caminho incerto). Só `REG_SZ` (o que o
+/// instalador grava): um `REG_EXPAND_SZ` seria recusado por `win::reg_sz` (o ambiente é herdado
+/// de quem abriu o wintop).
 fn install_dir() -> Result<PathBuf, String> {
-    let mut buf = [0u16; 520];
-    let mut len = (buf.len() * 2) as u32;
-    // SAFETY: buffer e tamanho em bytes consistentes; REG_EXPAND_SZ é expandido pela API.
-    unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO"),
-            w!("InstallLocation"),
-            // NOEXPAND: um REG_EXPAND_SZ é recusado (ERROR_UNSUPPORTED_TYPE), não expandido.
-            RRF_RT_REG_SZ | RRF_NOEXPAND,
-            None,
-            Some(buf.as_mut_ptr().cast::<c_void>()),
-            Some(&raw mut len),
-        )
-    }
-    .ok()
-    .map_err(|e| format!("PawnIO not installed (InstallLocation: {e})"))?;
-    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let dir = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+    let raw = crate::win::reg_sz(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO",
+        "InstallLocation",
+    )
+    .ok_or_else(|| "PawnIO not installed (InstallLocation missing)".to_string())?;
+    let dir = PathBuf::from(raw);
     if !crate::win::is_local_absolute(&dir) {
         return Err(format!(
             "invalid PawnIO InstallLocation: {:?}",

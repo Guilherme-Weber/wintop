@@ -12,7 +12,7 @@
 //! número de sequência; quem exibe só copia o que mudou. A parada é imediata: as esperas
 //! acordam pela `Condvar` (e pelo evento de parada, no pipe).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -41,9 +41,9 @@ const WARMUP: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 struct State {
-    fast: Option<Fast>,
-    slow: Option<Slow>,
-    fps: Option<Fps>,
+    fast: Option<Arc<Fast>>,
+    slow: Option<Arc<Slow>>,
+    fps: Option<Arc<Fps>>,
     /// Números de publicação de cada thread (quem exibe sabe o que mudou).
     fast_seq: u64,
     slow_seq: u64,
@@ -51,6 +51,10 @@ struct State {
     /// A última publicação do RTSS ainda não foi lida pela interface.
     fps_unread: bool,
     stop: bool,
+    /// Abas visíveis com coleta própria.
+    view: View,
+    /// Uma aba acabou de entrar em vista: a thread lenta coleta já, sem esperar o período.
+    kick: bool,
     /// Lista nova de ignorados do RTSS (o config mudou), aplicada pela thread do RTSS.
     rtss_ignored: Option<Vec<String>>,
 }
@@ -61,10 +65,6 @@ struct Shared {
     interval_ms: AtomicU64,
     /// Cópia de `State::stop` legível sem o lock (laços longos dos coletores).
     stopping: AtomicBool,
-    /// Abas visíveis com coleta própria (bit 0: processos; bit 1: GPU por processo).
-    view: AtomicU8,
-    /// Uma aba acabou de entrar em vista: a thread lenta coleta já, sem esperar o período.
-    kick: AtomicBool,
     /// PID do jogo em foco (0 = nenhum), publicado pela thread do RTSS para a thread lenta
     /// medir a RAM dele sem acoplar à UI.
     game_pid: AtomicU32,
@@ -101,13 +101,13 @@ impl Shared {
     /// Espera a próxima coleta: `base` é o instante agendado da anterior e o período é
     /// `intervalo × factor`. Um intervalo novo (teclas `+`/`-`) vale na hora: o prazo é refeito a
     /// partir de `base` (se já passou, coleta agora). Devolve a nova base, ou `None` = parar.
-    /// `kick`: com `Some`, um chute (aba aberta) encerra a espera na hora.
+    /// `allow_kick`: com `true`, um chute (`State::kick`, aba aberta) encerra a espera na hora.
     fn wait_tick(
         &self,
         base: Instant,
         factor: u32,
         floor: Duration,
-        kick: Option<&AtomicBool>,
+        allow_kick: bool,
     ) -> Option<Instant> {
         let period = |ms: u64| (Duration::from_millis(ms) * factor).max(floor);
         let mut st = self.lock();
@@ -119,7 +119,7 @@ impl Shared {
             if st.stop {
                 return None;
             }
-            if kick.is_some_and(|k| k.swap(false, Ordering::Relaxed)) {
+            if allow_kick && std::mem::take(&mut st.kick) {
                 return Some(Instant::now());
             }
             let ms = self.interval_ms.load(Ordering::Relaxed);
@@ -138,6 +138,43 @@ impl Shared {
                 .0;
         }
     }
+
+    /// Publica um snapshot de FPS/RTSS, coalescendo `peak_ms` com a publicação anterior se a UI
+    /// ainda não a leu (tela ocupada > 250 ms).
+    fn publish_fps(&self, mut snap: Fps) {
+        self.game_pid
+            .store(snap.game.as_ref().map_or(0, |g| g.pid), Ordering::Relaxed);
+        let mut st = self.lock();
+        if st.fps_unread
+            && let (Some(Ok(prev)), Ok(cur)) = (st.fps.as_ref().map(|f| &f.game), &mut snap.game)
+            && prev.pid == cur.pid
+            && let Some(p) = prev.peak_ms
+        {
+            cur.peak_ms = Some(cur.peak_ms.map_or(p, |c| c.max(p)));
+        }
+        st.fps = Some(Arc::new(snap));
+        st.fps_seq += 1;
+        st.fps_unread = true;
+    }
+
+    fn updates(&self, seen: &mut Seen) -> Updates {
+        let mut st = self.lock();
+        let mut u = Updates::default();
+        if st.fast_seq != seen.fast {
+            seen.fast = st.fast_seq;
+            u.fast.clone_from(&st.fast);
+        }
+        if st.slow_seq != seen.slow {
+            seen.slow = st.slow_seq;
+            u.slow.clone_from(&st.slow);
+        }
+        if st.fps_seq != seen.fps {
+            seen.fps = st.fps_seq;
+            u.fps.clone_from(&st.fps);
+            st.fps_unread = false;
+        }
+        u
+    }
 }
 
 /// Últimas publicações já vistas por quem exibe.
@@ -148,12 +185,12 @@ pub struct Seen {
     fps: u64,
 }
 
-/// Dados novos desde a última consulta.
+/// Dados novos desde a última consulta (compartilhados por `Arc`: sem clonar snapshots sob lock).
 #[derive(Default)]
 pub struct Updates {
-    pub fast: Option<Fast>,
-    pub slow: Option<Slow>,
-    pub fps: Option<Fps>,
+    pub fast: Option<Arc<Fast>>,
+    pub slow: Option<Arc<Slow>>,
+    pub fps: Option<Arc<Fps>>,
 }
 
 pub struct Engine {
@@ -182,8 +219,6 @@ impl Engine {
             wake: Condvar::new(),
             interval_ms: AtomicU64::new(clamp_interval(interval_ms)),
             stopping: AtomicBool::new(false),
-            view: AtomicU8::new(0),
-            kick: AtomicBool::new(false),
             game_pid: AtomicU32::new(0),
         });
         // Um NVML para as duas threads (iniciado aqui, antes delas: sem nvmlInit simultâneo).
@@ -212,10 +247,10 @@ impl Engine {
                             crate::debug::log_fast(&snap);
                             {
                                 let mut st = sh.lock();
-                                st.fast = Some(snap);
+                                st.fast = Some(Arc::new(snap));
                                 st.fast_seq += 1;
                             }
-                            match sh.wait_tick(next, 1, Duration::ZERO, None) {
+                            match sh.wait_tick(next, 1, Duration::ZERO, false) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -225,7 +260,7 @@ impl Engine {
                     if r.is_err() {
                         crate::debug::log("panic", "fast collection thread panicked");
                         let mut st = sh.lock();
-                        st.fast = Some(Fast::failed("fast collection thread panicked"));
+                        st.fast = Some(Arc::new(Fast::failed("fast collection thread panicked")));
                         st.fast_seq += 1;
                     }
                 })
@@ -261,16 +296,18 @@ impl Engine {
                             if sh.stopping.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let view = view_from_bits(sh.view.load(Ordering::Relaxed));
+                            let view = sh.lock().view;
                             let game_pid = sh.game_pid.load(Ordering::Relaxed);
-                            let snap = c.collect(&sh.stopping, view, game_pid);
+                            let Some(snap) = c.collect(&sh.stopping, view, game_pid) else {
+                                return;
+                            };
                             crate::debug::log_slow(&snap);
                             {
                                 let mut st = sh.lock();
-                                st.slow = Some(snap);
+                                st.slow = Some(Arc::new(snap));
                                 st.slow_seq += 1;
                             }
-                            match sh.wait_tick(next, SLOW_FACTOR, SLOW_FLOOR, Some(&sh.kick)) {
+                            match sh.wait_tick(next, SLOW_FACTOR, SLOW_FLOOR, true) {
                                 Some(t) => next = t,
                                 None => break,
                             }
@@ -280,7 +317,7 @@ impl Engine {
                     if r.is_err() {
                         crate::debug::log("panic", "slow collection thread panicked");
                         let mut st = sh.lock();
-                        st.slow = Some(Slow::failed("slow collection thread panicked"));
+                        st.slow = Some(Arc::new(Slow::failed("slow collection thread panicked")));
                         st.slow_seq += 1;
                     }
                 })
@@ -295,34 +332,19 @@ impl Engine {
 
     /// Últimos resultados e o número da coleta rápida (testes).
     #[cfg(test)]
-    pub fn latest(&self) -> (Option<Fast>, Option<Slow>, u64) {
+    pub fn latest(&self) -> (Option<Arc<Fast>>, Option<Arc<Slow>>, u64) {
         let st = self.shared.lock();
         (st.fast.clone(), st.slow.clone(), st.fast_seq)
     }
 
-    /// O que mudou desde `seen` (e atualiza `seen`). Só clona o que é novo.
+    /// O que mudou desde `seen` (e atualiza `seen`). Só incrementa refcount (`Arc::clone`).
     pub fn updates(&self, seen: &mut Seen) -> Updates {
-        let mut st = self.shared.lock();
-        let mut u = Updates::default();
-        if st.fast_seq != seen.fast {
-            seen.fast = st.fast_seq;
-            u.fast.clone_from(&st.fast);
-        }
-        if st.slow_seq != seen.slow {
-            seen.slow = st.slow_seq;
-            u.slow.clone_from(&st.slow);
-        }
-        if st.fps_seq != seen.fps {
-            seen.fps = st.fps_seq;
-            u.fps.clone_from(&st.fps);
-            st.fps_unread = false;
-        }
-        u
+        self.shared.updates(seen)
     }
 
     /// Último estado do RTSS e do jogo.
     #[cfg(test)]
-    pub fn fps(&self) -> Option<Fps> {
+    pub fn fps(&self) -> Option<Arc<Fps>> {
         self.shared.lock().fps.clone()
     }
 
@@ -333,15 +355,15 @@ impl Engine {
     /// Abas visíveis. Uma aba que entra em vista acorda a thread lenta na hora; uma que sai
     /// para a coleta dela no ciclo seguinte.
     pub fn set_view(&self, v: View) {
-        let bits = u8::from(v.procs) | (u8::from(v.gpu) << 1);
         // O chute é gravado com o lock: a thread lenta lê o chute com o lock e só o solta ao
         // começar a esperar, então o aviso não se perde entre a leitura e a espera.
         let kicked = {
-            let _st = self.shared.lock();
-            let old = self.shared.view.swap(bits, Ordering::Relaxed);
-            let kicked = bits & !old != 0;
+            let mut st = self.shared.lock();
+            let old = st.view;
+            st.view = v;
+            let kicked = (v.procs && !old.procs) || (v.gpu && !old.gpu);
             if kicked {
-                self.shared.kick.store(true, Ordering::Relaxed);
+                st.kick = true;
             }
             kicked
         };
@@ -387,23 +409,9 @@ impl Drop for Engine {
 /// Thread do RTSS: amostra a cada 250 ms com jogo (1 s sem) e atende o pipe no meio. Um pânico
 /// publica a falha (a interface não fica parada no último valor) e encerra a thread.
 fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
-    let publish = |mut snap: Fps| {
+    let publish = |snap: Fps| {
         crate::debug::log_fps(&snap);
-        sh.game_pid
-            .store(snap.game.as_ref().map_or(0, |g| g.pid), Ordering::Relaxed);
-        let mut st = sh.lock();
-        // A interface não leu a publicação anterior (tela ocupada mais de 250 ms): o pior frame
-        // dela não se perde, entra no desta (o gráfico de frametime mostra o pior do tick).
-        if st.fps_unread
-            && let (Some(Ok(prev)), Ok(cur)) = (st.fps.as_ref().map(|f| &f.game), &mut snap.game)
-            && prev.pid == cur.pid
-            && let Some(p) = prev.peak_ms
-        {
-            cur.peak_ms = Some(cur.peak_ms.map_or(p, |c| c.max(p)));
-        }
-        st.fps = Some(snap);
-        st.fps_seq += 1;
-        st.fps_unread = true;
+        sh.publish_fps(snap);
     };
     let Ok(mut c) = catch_unwind(AssertUnwindSafe(|| {
         RtssCollector::new(true, true).with_ignored(ignored)
@@ -425,6 +433,7 @@ fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
             c.set_ignored(list);
         }
         let Ok(snap) = catch_unwind(AssertUnwindSafe(|| c.sample())) else {
+            crate::debug::log("panic", "RTSS collector panicked in sample");
             publish(rtss::failed("RTSS collector panicked"));
             return;
         };
@@ -446,17 +455,11 @@ fn rtss_thread(sh: &Shared, stop: HANDLE, ignored: Vec<String>) {
             Ok(false) => {}
             Ok(true) => return,
             Err(_) => {
+                crate::debug::log("panic", "RTSS collector panicked in pump");
                 publish(rtss::failed("RTSS collector panicked"));
                 return;
             }
         }
-    }
-}
-
-fn view_from_bits(b: u8) -> View {
-    View {
-        procs: b & 1 != 0,
-        gpu: b & 2 != 0,
     }
 }
 
@@ -513,8 +516,6 @@ mod tests {
             wake: Condvar::new(),
             interval_ms: AtomicU64::new(interval_ms),
             stopping: AtomicBool::new(false),
-            view: AtomicU8::new(0),
-            kick: AtomicBool::new(false),
             game_pid: AtomicU32::new(0),
         })
     }
@@ -524,7 +525,7 @@ mod tests {
         let s = Arc::clone(sh);
         std::thread::spawn(move || {
             let t = Instant::now();
-            let r = s.wait_tick(Instant::now(), SLOW_FACTOR, SLOW_FLOOR, Some(&s.kick));
+            let r = s.wait_tick(Instant::now(), SLOW_FACTOR, SLOW_FLOOR, true);
             (r.is_some(), t.elapsed())
         })
     }
@@ -534,13 +535,60 @@ mod tests {
         let sh = shared(10_000); // período de 20 s
         let t = waiting(&sh);
         std::thread::sleep(Duration::from_millis(50));
-        {
-            let _st = sh.lock();
-            sh.kick.store(true, Ordering::Relaxed);
-        }
+        sh.lock().kick = true;
         sh.wake.notify_all();
         let (ok, took) = t.join().expect("thread");
         assert!(ok && took < Duration::from_millis(500), "{took:?}");
+    }
+
+    #[test]
+    fn coalesce_peak_ms_enquanto_nao_lido_e_reseta_apos_leitura() {
+        use crate::model::{FrameSource, Game, neutral};
+        let make = |pid: u32, peak_ms: Option<f64>| Fps {
+            rtss: Ok("2.18".into()),
+            pipe: Ok((1, 1)),
+            etw: Ok("ETW"),
+            game: Ok(Game {
+                pid,
+                name: "game.exe".into(),
+                api: "D3D12",
+                resolution: Ok((1920, 1080)),
+                source: FrameSource::Etw,
+                fps: Ok(120.0),
+                framegen: None,
+                frametime: Ok((8.3, 7.0, 12.0)),
+                lows: neutral("waiting"),
+                gpu_time: neutral("waiting"),
+                bound: neutral("waiting"),
+                peak_ms,
+            }),
+            hooked: vec![pid],
+        };
+        let sh = shared(1000);
+        let mut seen = Seen::default();
+        // Duas publicações antes da UI ler: o maior peak_ms (42.0) sobrevive.
+        sh.publish_fps(make(100, Some(42.0)));
+        sh.publish_fps(make(100, Some(15.0)));
+        let u = sh.updates(&mut seen);
+        let g = u.fps.as_ref().unwrap().game.as_ref().unwrap();
+        assert_eq!(g.peak_ms, Some(42.0));
+        // Sem nova publicação: updates devolve None.
+        assert!(sh.updates(&mut seen).fps.is_none());
+        // Depois da leitura, um novo peak menor não herda o 42.0 antigo.
+        sh.publish_fps(make(100, Some(9.5)));
+        let u = sh.updates(&mut seen);
+        assert_eq!(
+            u.fps.as_ref().unwrap().game.as_ref().unwrap().peak_ms,
+            Some(9.5)
+        );
+        // Troca de PID não mistura peak_ms do jogo anterior.
+        sh.publish_fps(make(100, Some(80.0)));
+        sh.publish_fps(make(200, Some(11.0)));
+        let u = sh.updates(&mut seen);
+        assert_eq!(
+            u.fps.as_ref().unwrap().game.as_ref().unwrap().peak_ms,
+            Some(11.0)
+        );
     }
 
     #[test]

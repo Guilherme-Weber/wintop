@@ -1,20 +1,41 @@
 //! Estado da interface: últimas coletas, histórico dos gráficos, extremos da sessão e seleção.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
 use super::disks::pool_folded;
 use super::gpu::busiest_engine;
-use super::tabs::{self, Cursor, ProcSort};
-use crate::model::{Fast, Fps, GpuProc, Metric, Missing, Proc, Slow, View};
+use super::gpu_tab::{self, GpuSort};
+use super::procs_tab::{self, ProcSort};
+use super::table::TableState;
+use crate::model::{Fast, Fps, GpuProc, Metric, Proc, Slow, View};
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
 const HISTORY: usize = 1000;
-/// Estado de uma leitura de runtimes em andamento.
-const READING: &str = "reading modules...";
 
-fn is_reading<T>(r: &crate::model::Metric<T>) -> bool {
-    matches!(r, Err(Missing::Neutral(m)) if m == READING)
+/// Sobreposição ativa que captura o teclado (exclusivas por construção).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Modal {
+    #[default]
+    None,
+    /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
+    Filter,
+    /// Janela de ajuda aberta (tecla `?`; qualquer tecla fecha).
+    Help,
+    /// Encerrar processo pedido (tecla Del na aba Processos), à espera da confirmação.
+    ConfirmEnd { pid: u32, name: String, create: u64 },
+    /// Pergunta de atualização (versão nova encontrada) ou atualização em andamento.
+    Update(UpdateUi),
+}
+
+/// Estado dos runtimes pedidos sob demanda para um processo na aba GPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeStatus {
+    /// Leitura em andamento em thread dedicada.
+    Reading,
+    /// Resultado pronto (lista de runtimes ou motivo).
+    Ready(Metric<Vec<&'static str>>),
 }
 
 /// Aba visível.
@@ -39,14 +60,17 @@ impl Series {
         // NaN = coleta sem valor: lacuna no gráfico (um 0 falso pareceria uso zero).
         self.0
             .push_back(if v.is_finite() || v.is_nan() { v } else { 0.0 });
+        // Mantém a fatia única contígua na escrita (1×/tick) para o desenho ler via `&self`.
+        self.0.make_contiguous();
     }
 
-    pub(super) fn values(&mut self) -> &[f64] {
-        self.0.make_contiguous()
+    pub(super) fn values(&self) -> &[f64] {
+        debug_assert!(self.0.as_slices().1.is_empty());
+        self.0.as_slices().0
     }
 
     /// Maior valor entre as últimas `n` amostras.
-    pub(super) fn max_of(&mut self, n: usize) -> f64 {
+    pub(super) fn max_of(&self, n: usize) -> f64 {
         let v = self.values();
         v[v.len().saturating_sub(n)..]
             .iter()
@@ -113,9 +137,9 @@ pub(super) struct Session {
 /// Estado da interface: os últimos dados, o histórico dos gráficos e os extremos da sessão.
 #[derive(Default)]
 pub struct State {
-    pub fast: Option<Fast>,
-    pub slow: Option<Slow>,
-    pub fps: Option<Fps>,
+    pub fast: Option<Arc<Fast>>,
+    pub slow: Option<Arc<Slow>>,
+    pub fps: Option<Arc<Fps>>,
     pub interval_ms: u64,
     pub tab: Tab,
     /// Membros do Storage Space recolhidos: `None` = automático (recolhe se não couberem).
@@ -145,10 +169,7 @@ pub struct State {
     pub(super) session: Session,
     /// Aba Processos: a última lista (só chega com a aba visível), cursor, ordem e filtro.
     pub procs: Option<Metric<Vec<Proc>>>,
-    pub proc_cursor: Cursor,
-    pub proc_sort: ProcSort,
-    /// Inverte a ordem natural da coluna (tecla `i`).
-    pub proc_reverse: bool,
+    pub proc_table: TableState<ProcSort>,
     /// Árvore de processos (tecla `e`), sem filtro.
     pub proc_tree: bool,
     /// Áreas clicáveis do último desenho (mouse).
@@ -160,24 +181,15 @@ pub struct State {
     pub sensor_offset: usize,
     pub sensor_overflow: bool,
     pub filter: String,
-    /// Digitando o filtro (tecla `/`): as teclas vão para o texto.
-    pub filtering: bool,
-    /// Aba GPU: processos da 1ª GPU, cursor e os runtimes pedidos (tecla Enter), por PID.
+    /// Aba GPU: processos da GPU exibida, cursor, ordem e runtimes pedidos (Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,
-    pub gpu_cursor: Cursor,
+    pub gpu_table: TableState<GpuSort>,
     /// GPU exibida nas abas Geral e GPU (tecla `g`; posição na lista, 1ª se sumir).
     pub gpu_sel: usize,
-    pub gpu_sort: tabs::GpuSort,
-    pub gpu_reverse: bool,
     /// Tela congelada (tecla `p` ou Espaço): as coletas continuam, mas não entram na tela.
     pub paused: bool,
-    /// Janela de ajuda aberta (tecla `?`; qualquer tecla fecha).
-    pub help: bool,
-    /// Encerrar processo pedido (tecla Del na aba Processos): (PID, nome, criação), à espera
-    /// da confirmação.
-    pub confirm_end: Option<(u32, String, u64)>,
-    /// Pergunta de atualização (versão nova encontrada) ou atualização em andamento.
-    pub update: Option<UpdateUi>,
+    /// Sobreposição ativa que captura o teclado (filtro, ajuda, confirmação ou atualização).
+    pub modal: Modal,
     /// Mensagem curta de uma ação (fim de processo): texto, se é erro, quando apareceu.
     pub toast: Option<(String, bool, std::time::Instant)>,
     /// Do config (valem na hora quando o arquivo muda).
@@ -190,7 +202,7 @@ pub struct State {
     /// Aviso da configuração (arquivo com erro, gravação recusada), no rodapé.
     pub notice: Option<String>,
     /// Por PID, com o nome do processo lido (PID reaproveitado por outro não herda o resultado).
-    pub runtimes: HashMap<u32, (String, Metric<Vec<&'static str>>)>,
+    pub runtimes: HashMap<u32, (String, RuntimeStatus)>,
 }
 
 impl State {
@@ -200,6 +212,28 @@ impl State {
             frametime_alert_ms: crate::config::DEFAULT_FRAMETIME_ALERT_MS,
             ..Default::default()
         }
+    }
+
+    /// Digitando o filtro (`/`): o teclado vai para o texto do filtro.
+    pub fn is_filtering(&self) -> bool {
+        matches!(self.modal, Modal::Filter)
+    }
+
+    /// Expira a mensagem curta (`toast`) depois de `TOAST_FOR`; devolve `true` se ela sumiu
+    /// (pede redesenho mesmo com a tela pausada).
+    pub fn expire_toast(&mut self, now: std::time::Instant) -> bool {
+        if let Some((_, _, at)) = &self.toast
+            && now.saturating_duration_since(*at) >= TOAST_FOR
+        {
+            self.toast = None;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(in crate::ui) fn session_sensor(&self, key: &str) -> Option<(f64, f64)> {
+        self.session.sensors.get(key).copied().and_then(MinMax::get)
     }
 
     /// Tecla `d`: inverte o recolhimento do pool que está na tela (no automático com mais de 12
@@ -251,7 +285,7 @@ impl State {
                 None => {}
             }
         }
-        self.gpu_cursor = Cursor::default();
+        self.gpu_table.cursor = super::table::Cursor::default();
         self.runtimes.clear();
     }
 
@@ -281,9 +315,6 @@ impl State {
         }
     }
 
-    /// Zera os extremos da sessão (tecla `r`).
-    /// O histórico do jogo também: só o `r` o zera (jogos trocam de executável e congelam ao
-    /// carregar, e isso não deve apagar o gráfico).
     /// Abas com coleta própria visíveis (o motor só coleta o que aparece).
     pub fn view(&self) -> View {
         View {
@@ -299,7 +330,9 @@ impl State {
             self.tab = t;
             self.procs = None;
             self.gpu_procs = None;
-            self.filtering = false;
+            if matches!(self.modal, Modal::Filter) {
+                self.modal = Modal::None;
+            }
             // A última coleta lenta já trouxe a falha das abas (a thread parou): ela aparece
             // em vez de "waiting" (dado novo, se vier, substitui).
             // Só nas abas que mostram a lista: na Geral nada a limparia (a coleta para) e a
@@ -319,7 +352,8 @@ impl State {
     }
 
     /// Nova coleta da thread lenta.
-    pub fn push_slow(&mut self, s: Slow) {
+    pub fn push_slow(&mut self, s: impl Into<Arc<Slow>>) {
+        let s = s.into();
         if let Some(p) = &s.procs
             && self.tab == Tab::Processes
         {
@@ -374,10 +408,15 @@ impl State {
         let Some(Ok(list)) = &self.gpu_procs else {
             return None;
         };
-        let rows = tabs::sorted_gpu(list, self.gpu_sort, self.gpu_reverse, &self.filter);
+        let rows = gpu_tab::sorted_gpu(
+            list,
+            self.gpu_table.sort,
+            self.gpu_table.reverse,
+            &self.filter,
+        );
         let pids: Vec<u32> = rows.iter().map(|p| p.pid).collect();
-        let page = self.gpu_cursor.page();
-        let (Some(i), _) = self.gpu_cursor.resolve(&pids, page) else {
+        let page = self.gpu_table.cursor.page();
+        let (Some(i), _) = self.gpu_table.cursor.resolve(&pids, page) else {
             return None;
         };
         let (pid, name) = (rows[i].pid, rows[i].name.clone());
@@ -386,7 +425,7 @@ impl State {
         if self
             .runtimes
             .get(&pid)
-            .is_some_and(|(n, r)| *n == name && is_reading(r))
+            .is_some_and(|(n, r)| *n == name && matches!(r, RuntimeStatus::Reading))
         {
             return None;
         }
@@ -399,15 +438,15 @@ impl State {
                 pid,
                 (
                     name,
-                    crate::model::neutral(
+                    RuntimeStatus::Ready(crate::model::neutral(
                         "skipped: waiting for RTSS to list the hooked apps (anticheat safety)",
-                    ),
+                    )),
                 ),
             );
             return None;
         };
         self.runtimes
-            .insert(pid, (name.clone(), crate::model::neutral(READING)));
+            .insert(pid, (name.clone(), RuntimeStatus::Reading));
         Some(RuntimeJob {
             pid,
             name,
@@ -419,7 +458,7 @@ impl State {
     /// Resultado de uma leitura de runtimes (vale se o processo da linha ainda é o mesmo).
     pub fn finish_runtimes(&mut self, pid: u32, name: String, r: Metric<Vec<&'static str>>) {
         if self.runtimes.get(&pid).is_some_and(|(n, _)| *n == name) {
-            self.runtimes.insert(pid, (name, r));
+            self.runtimes.insert(pid, (name, RuntimeStatus::Ready(r)));
         }
     }
 
@@ -428,11 +467,16 @@ impl State {
         let Some(Ok(list)) = &self.procs else {
             return None;
         };
-        let rows = tabs::proc_rows(self, list);
+        let rows = procs_tab::proc_rows(self, list);
         let pids: Vec<u32> = rows.iter().map(|(p, _)| p.pid).collect();
-        self.proc_cursor.peek(&pids).map(|i| rows[i].0.clone())
+        self.proc_table
+            .cursor
+            .peek(&pids)
+            .map(|i| rows[i].0.clone())
     }
 
+    /// Zera os extremos da sessão (tecla `r`). O histórico do jogo também: só o `r` o zera
+    /// (jogos trocam de executável e congelam ao carregar, e isso não deve apagar o gráfico).
     pub fn reset_session(&mut self) {
         self.session = Session::default();
         self.game_fps = Series::default();
@@ -444,7 +488,8 @@ impl State {
 
     /// Nova coleta da thread rápida: guarda, alimenta os históricos (inclusive os do jogo, no
     /// mesmo ritmo) e os extremos da sessão.
-    pub fn push_fast(&mut self, f: Fast) {
+    pub fn push_fast(&mut self, f: impl Into<Arc<Fast>>) {
+        let f = f.into();
         let usage = |m: &Metric<f64>| m.as_ref().map_or(f64::NAN, |v| v / 100.0);
         if let Ok(c) = &f.cpu {
             self.cpu.push(usage(&c.usage));
@@ -600,7 +645,8 @@ impl State {
 
     /// Novo estado do RTSS (a cada 250 ms com jogo): o número de FPS atualiza na hora; os
     /// gráficos esperam o tick da UI.
-    pub fn push_fps(&mut self, s: Fps) {
+    pub fn push_fps(&mut self, s: impl Into<Arc<Fps>>) {
+        let s = s.into();
         if let Ok(g) = &s.game {
             if let Ok(v) = &g.fps {
                 self.pending_fps = Some(*v);
@@ -618,11 +664,118 @@ impl State {
         self.fps = Some(s);
     }
 
-    /// Extremos da sessão de cada sensor numérico (aba Sensores), com os dados atuais.
+    /// Extremos da sessão de cada sensor numérico (aba Sensores), atualizados direto das
+    /// leituras atuais sem montar a lista de linhas de texto a cada tick.
     fn update_sensors(&mut self) {
-        for r in tabs::sensor_rows(self) {
-            if let (Some(key), tabs::SensorValue::Num(Ok(v), ..)) = (r.key(), &r.value) {
-                self.session.sensors.entry(key).or_default().update(*v);
+        let Some(f) = self.fast.as_deref() else {
+            return;
+        };
+        let sensors = &mut self.session.sensors;
+        let mut bump = |key: &str, v: f64| {
+            if let Some(m) = sensors.get_mut(key) {
+                m.update(v);
+            } else {
+                let mut m = MinMax::default();
+                m.update(v);
+                sensors.insert(key.to_string(), m);
+            }
+        };
+        if let Ok(s) = &f.cpu_sensors {
+            if let Ok(v) = s.tctl {
+                bump("CPU/Tctl", v);
+            }
+            if let Ok(list) = &s.ccds {
+                for (n, t) in list {
+                    bump(&format!("CPU/CCD{n}"), *t);
+                }
+            }
+            if let Ok(v) = s.package_power {
+                bump("CPU/Package power", v);
+            }
+        }
+        if let Ok(c) = &f.cpu
+            && let Ok(v) = c.freq_mhz
+        {
+            bump("CPU/Clock", v);
+        }
+        let slow_gpus = self.slow.as_deref().and_then(|s| s.gpus.as_ref().ok());
+        if let Ok(list) = &f.gpus {
+            for g in list {
+                if g.no_nvml.is_some() {
+                    continue;
+                }
+                let idx = g.index;
+                if let Ok(v) = g.temp {
+                    bump(&format!("GPU {idx}/Temperature"), f64::from(v));
+                }
+                if let Ok(v) = g.temp_slowdown {
+                    bump(&format!("GPU {idx}/Slowdown limit"), f64::from(v));
+                }
+                if let Ok((p, l)) = g.power {
+                    bump(&format!("GPU {idx}/Power"), p);
+                    if l > 0.0 {
+                        bump(&format!("GPU {idx}/Power limit"), l);
+                    }
+                }
+                if let Ok((a, _)) = g.clock_graphics {
+                    bump(&format!("GPU {idx}/Graphics clock"), f64::from(a));
+                }
+                if let Ok((a, _)) = g.clock_sm {
+                    bump(&format!("GPU {idx}/SM clock"), f64::from(a));
+                }
+                if let Ok((a, _)) = g.clock_mem {
+                    bump(&format!("GPU {idx}/Memory clock"), f64::from(a));
+                }
+                if let Ok((a, _)) = g.clock_video {
+                    bump(&format!("GPU {idx}/Video clock"), f64::from(a));
+                }
+                if let Ok(fans) = &g.fans {
+                    for (i, fan) in fans.iter().enumerate() {
+                        if let Ok(v) = fan.percent {
+                            bump(&format!("GPU {idx}/Fan {} speed", i + 1), f64::from(v));
+                        }
+                        if let Ok(v) = fan.rpm {
+                            bump(&format!("GPU {idx}/Fan {} RPM", i + 1), f64::from(v));
+                        }
+                    }
+                }
+                if let Some(s) = slow_gpus.and_then(|l| l.iter().find(|x| x.index == idx)) {
+                    if let Ok(v) = s.pcie_tx {
+                        bump(&format!("GPU {idx}/PCIe TX"), v as f64 / 1e6);
+                    }
+                    if let Ok(v) = s.pcie_rx {
+                        bump(&format!("GPU {idx}/PCIe RX"), v as f64 / 1e6);
+                    }
+                }
+            }
+        }
+        if let Some(Ok(list)) = self.slow.as_deref().map(|s| &s.disk_temps) {
+            for t in list {
+                let present = f
+                    .disks
+                    .as_ref()
+                    .map_or(true, |l| l.iter().any(|d| d.number == t.number));
+                if !present {
+                    continue;
+                }
+                let model = f
+                    .disks
+                    .as_ref()
+                    .ok()
+                    .and_then(|l| l.iter().find(|d| d.number == t.number))
+                    .and_then(|d| d.model.as_ref().ok());
+                let changed = t.model.is_some()
+                    && model.is_some()
+                    && t.model.as_deref() != model.map(String::as_str);
+                if !changed && let Ok(c) = t.celsius {
+                    let key = match model {
+                        Some(m) => {
+                            format!("Disks/Disk {} {}", t.number, crate::win::printable(m))
+                        }
+                        None => format!("Disks/Disk {}", t.number),
+                    };
+                    bump(&key, f64::from(c));
+                }
             }
         }
     }
@@ -630,6 +783,7 @@ impl State {
 
 /// Leitura de runtimes pedida pela interface, feita numa thread à parte (abrir um processo
 /// travado não congela a tela).
+#[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeJob {
     pub pid: u32,
     pub name: String,
@@ -640,18 +794,6 @@ pub struct RuntimeJob {
 impl RuntimeJob {
     pub fn run(&self) -> Metric<Vec<&'static str>> {
         crate::collect::modules::runtimes(self.pid, &self.name, self.create, &self.protected)
-    }
-}
-
-impl Series {
-    /// `max_of` sem exigir `&mut` (para o cálculo da escala antes do gráfico).
-    pub(super) fn max_of_ref(&self, n: usize) -> f64 {
-        let len = self.0.len();
-        self.0
-            .iter()
-            .skip(len.saturating_sub(n))
-            .copied()
-            .fold(0.0, f64::max)
     }
 }
 

@@ -63,10 +63,15 @@ HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_suppor
 | Métrica | Fonte | Elev. | Estado neutro | Prova |
 | --- | --- | --- | --- | --- |
 | Em uso / total / % | `GlobalMemoryStatusEx` | | | E1 |
-| Confirmada / limite | `GetPerformanceInfo` (CommitTotal, CommitLimit) | | | E1 |
-| Em cache (Standby + Modified, igual ao Task Manager) | PDH `\Memory\Standby Cache Core Bytes`, `...Normal Priority Bytes`, `...Reserve Bytes`, `\Memory\Modified Page List Bytes` | | | E1 |
-| Pool paginado / não paginado | `GetPerformanceInfo` (KernelPaged, KernelNonpaged) | | | E1 |
-| Arquivo de paginação (uso) | PDH `\Paging File(_Total)\% Usage` | | | E1 |
+| Comprimida em RAM e tamanho original estimado | `NtQuerySystemInformation(SystemStoreInformation = 109, sub = 22, ver = 3)`: `WorkingSetSize` e estimativa `WorkingSetSize × (TotalDataCompressed / TotalCompressedSize)` | | "disabled" (compressão desligada); "not supported by Windows"; "needs elevation" | 1.4.0 (= `Memory Compression` WorkingSet64) |
+| Confirmada / limite / pico desde o boot | `GetPerformanceInfo` (`CommitTotal`, `CommitLimit`, `CommitPeak`) | | | E1 / 1.4.0 |
+| Em cache (Standby + Modified, igual ao Task Manager) | `NtQuerySystemInformation(SystemMemoryListInformation = 80)`: soma de `PageCountByPriority[0..8]` (Standby) + `ModifiedPageCount + ModifiedNoWritePageCount` (Modified) × `PageSize` | | "needs elevation"; "not supported by Windows" | 1.4.0 (= PDH `\Memory\Standby Cache *` + `Modified Page List Bytes`) |
+| Pool paginado / não paginado | `GetPerformanceInfo` (`KernelPaged`, `KernelNonpaged`) | | | E1 |
+| Arquivo de paginação (uso) | `NtQuerySystemInformation(SystemPagefileInformation = 18)`: soma de `TotalInUse` / `TotalSize` × `PageSize` | | "no page file"; "needs elevation" | 1.4.0 (= PDH `\Paging File(_Total)\% Usage`) |
+| Paginação real em disco (páginas lidas/gravadas por segundo) | `NtQuerySystemInformation(SystemPerformanceInformation = 2)`: Δ`PageReadCount` / Δ`DirtyPagesWriteCount` por segundo | | "waiting for a second sample" (1ª coleta); "needs elevation" | 1.4.0 (= PDH `\Memory\Pages Input/sec`, `Pages Output/sec`) |
+| Hardware de RAM (geração, velocidade, slots, formato) | SMBIOS Type 17 via `GetSystemFirmwareTable('RSMB')` (lido uma vez na abertura) | | "not reported by firmware" | 1.4.0 |
+| Reservada para hardware | `GetPhysicallyInstalledSystemMemory` − `ullTotalPhys` (lido uma vez na abertura) | | "not reported by firmware" | 1.4.0 |
+| Páginas defeituosas (alerta silencioso se > 0) | `NtQuerySystemInformation(SystemMemoryListInformation = 80)` (`BadPageCount`) | | "needs elevation"; "not supported by Windows" | 1.4.0 |
 
 ## Discos (um painel por disco físico; membros do Storage Space sob o disco virtual)
 
@@ -192,7 +197,7 @@ aberto antes do wintop)"** até o jogo reiniciar.
 Todas as leituras físicas já coletadas para a aba geral, numa tabela com valor atual, mínimo e
 máximo da sessão (`r` zera): CPU (Tctl, CCDs, potência do pacote, clock), GPU (temperatura,
 limite de slowdown, potência e limite, clocks, fans em % e RPM, P-state, throttling, link PCIe) e
-temperatura de cada disco. Temperaturas só número, sem cor. Mesmas fontes e estados neutros das
+temperatura de cada disco. Temperaturas coloridas conforme a proximidade do limite (como na aba Geral). Mesmas fontes e estados neutros das
 seções acima; nenhuma fonte nova. Prova: E6 (aba conferida em tela cheia).
 
 ## Diagnóstico

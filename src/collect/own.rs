@@ -14,6 +14,8 @@ use crate::win::filetime;
 pub struct OwnCollector {
     /// (tempo do processo, tempo total do sistema) da leitura anterior, em 100 ns.
     last: Option<(u64, u64)>,
+    /// Buffer reaproveitado no fallback do Windows 10 (alocado só se EX2 falhar).
+    win10_buf: Vec<u64>,
 }
 
 /// CPU do processo em % do sistema: Δprocesso / Δ(kernel + user do sistema). O tempo do
@@ -26,7 +28,10 @@ fn share(prev: (u64, u64), now: (u64, u64)) -> Option<f64> {
 
 impl OwnCollector {
     pub fn new() -> Self {
-        Self { last: None }
+        Self {
+            last: None,
+            win10_buf: Vec::new(),
+        }
     }
 
     fn times() -> Result<(u64, u64), String> {
@@ -98,9 +103,9 @@ impl OwnCollector {
                 };
                 match r {
                     // Windows 10: o working set privado sai da lista de processos (sem abrir
-                    // nada; ~1 ms por coleta).
+                    // nada e reaproveitando o buffer).
                     Ok(()) => (
-                        super::procs::private_ws_of(std::process::id())
+                        super::procs::private_ws_in_buf(&mut self.win10_buf, std::process::id())
                             .map_err(|e| Missing::Fail(format!("{e} (EX2: {e2})"))),
                         Ok(ex.PrivateUsage as u64),
                     ),

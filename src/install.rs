@@ -14,7 +14,6 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
@@ -22,7 +21,7 @@ use windows::Win32::Security::{
 };
 use windows::core::PCWSTR;
 
-use crate::win::{known_folder, sid_string, wide};
+use crate::win::{SecurityDescriptor, known_folder, sid_string, wide};
 
 const TASK: &str = "wintop";
 
@@ -112,64 +111,46 @@ fn check_tree(path: &Path) -> Result<(), String> {
 /// ele cria pode ser o próprio usuário (e o CREATOR OWNER herdado de Program Files daria a ele
 /// controle total: processos sem elevação poderiam trocar o executável).
 fn secure(path: &Path, dacl: bool) -> Result<(), String> {
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-        SetNamedSecurityInfoW,
-    };
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows::Win32::Security::{
         GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    let sddl = wide("O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &raw mut sd,
-            None,
-        )
-    }
-    .map_err(|e| format!("SDDL: {e}"))?;
+    let sd = SecurityDescriptor::from_sddl(
+        "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+    )?;
     let mut owner = PSID::default();
     let mut acl: *mut ACL = std::ptr::null_mut();
     let (mut present, mut defaulted) = (windows::core::BOOL(0), windows::core::BOOL(0));
-    // SAFETY: descritor válido; os ponteiros apontam para dentro dele.
-    let r = unsafe {
-        GetSecurityDescriptorOwner(sd, &raw mut owner, &raw mut defaulted).and_then(|()| {
-            GetSecurityDescriptorDacl(sd, &raw mut present, &raw mut acl, &raw mut defaulted)
+    // SAFETY: descritor válido enquanto `sd` vive; os ponteiros apontam para dentro dele.
+    unsafe {
+        GetSecurityDescriptorOwner(sd.raw(), &raw mut owner, &raw mut defaulted).and_then(|()| {
+            GetSecurityDescriptorDacl(sd.raw(), &raw mut present, &raw mut acl, &raw mut defaulted)
         })
-    };
+    }
+    .map_err(|e| e.to_string())?;
     let w = wide(&path.to_string_lossy());
     let info = if dacl {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
     } else {
         OWNER_SECURITY_INFORMATION
     };
-    let set = r.map_err(|e| e.to_string()).and_then(|()| {
-        // SAFETY: caminho terminado em zero; dono e DACL válidos dentro do descritor.
-        let e = unsafe {
-            SetNamedSecurityInfoW(
-                PCWSTR(w.as_ptr()),
-                SE_FILE_OBJECT,
-                info,
-                Some(owner),
-                None,
-                dacl.then_some(acl.cast_const()),
-                None,
-            )
-        };
-        if e.is_ok() {
-            Ok(())
-        } else {
-            Err(format!("{}: set security: {e:?}", path.display()))
-        }
-    });
-    // SAFETY: descritor alocado pela API; liberado uma vez.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    // SAFETY: caminho terminado em zero; dono e DACL válidos dentro de `sd`.
+    let e = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(w.as_ptr()),
+            SE_FILE_OBJECT,
+            info,
+            Some(owner),
+            None,
+            dacl.then_some(acl.cast_const()),
+            None,
+        )
+    };
+    if e.is_ok() {
+        Ok(())
+    } else {
+        Err(format!("{}: set security: {e:?}", path.display()))
     }
-    set
 }
 
 /// Cria `path` novo (exclusivo) já com dono Administradores e controle total só de SYSTEM e
@@ -179,37 +160,22 @@ fn secure(path: &Path, dacl: bool) -> Result<(), String> {
 /// (o XML da tarefa).
 fn create_protected(path: &Path, data: &[u8], users_read: bool) -> Result<(), String> {
     use std::io::Write;
-    use std::os::windows::io::FromRawHandle;
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
     };
-    let sddl = wide(if users_read {
+    let sd = SecurityDescriptor::from_sddl(if users_read {
         "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
     } else {
         "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
-    });
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &raw mut sd,
-            None,
-        )
-    }
-    .map_err(|e| format!("SDDL: {e}"))?;
+    })?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
+        lpSecurityDescriptor: sd.raw().0,
         bInheritHandle: false.into(),
     };
     let w = wide(&path.to_string_lossy());
-    // SAFETY: caminho terminado em zero; atributos válidos durante a chamada.
+    // SAFETY: caminho terminado em zero; atributos válidos enquanto `sd` vive.
     let h = unsafe {
         CreateFileW(
             PCWSTR(w.as_ptr()),
@@ -220,14 +186,11 @@ fn create_protected(path: &Path, data: &[u8], users_read: bool) -> Result<(), St
             FILE_ATTRIBUTE_NORMAL,
             None,
         )
-    };
-    // SAFETY: descritor alocado pela API; liberado uma vez (o arquivo já tem a cópia dele).
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
-    let h = h.map_err(|e| format!("{}: {e}", path.display()))?;
-    // SAFETY: handle recém-criado, só nosso; o File passa a ser o dono.
-    let mut f = unsafe { std::fs::File::from_raw_handle(h.0) };
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    drop(sd);
+    // SAFETY: handle recém-criado, só nosso; `own` o fecha se algo falhar.
+    let mut f = std::fs::File::from(unsafe { crate::win::own(h) });
     f.write_all(data)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -296,8 +259,10 @@ pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
     if r.is_err() {
         return Err(format!("{}: security info: {r:?}", path.display()));
     }
+    // SAFETY: descritor alocado por GetNamedSecurityInfoW; liberado no Drop.
+    let _sd = unsafe { SecurityDescriptor::from_raw(sd) };
     let mut problems = Vec::new();
-    // SAFETY: `owner` aponta para dentro do descritor, vivo até o LocalFree.
+    // SAFETY: `owner` aponta para dentro do descritor, vivo até o fim da função.
     let owner_s = unsafe { sid_string(owner) }.unwrap_or_default();
     if !OWNERS.contains(&owner_s.as_str()) {
         problems.push(format!(
@@ -351,10 +316,6 @@ pub fn unsafe_acl(path: &Path) -> Result<Vec<String>, String> {
                 problems.push(format!("{s} can write ({mask:#x})"));
             }
         }
-    }
-    // SAFETY: descritor alocado pela API; liberado uma vez.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
     Ok(problems)
 }
@@ -455,7 +416,42 @@ fn replace_exe(from: &Path, exe: &Path) -> Result<(), String> {
     }
     let _ = std::fs::remove_file(&new);
     std::fs::copy(from, &new).map_err(|e| format!("copy to {}: {e}", new.display()))?;
-    swap_in(&new, exe)
+    if swap_in(&new, exe)? {
+        println!("wintop is open: the new version starts the next time it opens");
+    }
+    Ok(())
+}
+
+/// Nome único de sobra `.old` quando `wintop.exe.old` ainda está em execução.
+pub(crate) fn unique_old_name() -> String {
+    format!("wintop.exe.{}.{}.old", std::process::id(), stamp())
+}
+
+/// Protocolo de troca atômica do exe (`exe.new` -> `exe`, atual -> `exe.old` com rollback em
+/// erro). Compartilhado entre a instalação (`Program Files`) e a atualização portátil (`userfile`).
+pub(crate) fn swap_exe(
+    free_old: impl FnOnce() -> Result<(), String>,
+    move_current_to_old: impl FnOnce() -> Result<(), String>,
+    move_new_to_current: impl FnOnce() -> Result<(), String>,
+    restore_old_to_current: impl FnOnce(),
+    remove_new: impl FnOnce(),
+    cleanup_old: impl FnOnce(),
+) -> Result<(), String> {
+    if let Err(e) = free_old() {
+        remove_new();
+        return Err(e);
+    }
+    if let Err(e) = move_current_to_old() {
+        remove_new();
+        return Err(e);
+    }
+    if let Err(e) = move_new_to_current() {
+        restore_old_to_current();
+        remove_new();
+        return Err(e);
+    }
+    cleanup_old();
+    Ok(())
 }
 
 /// Tira o `exe.old` do caminho: apagado se ninguém o usa; em uso (o processo que reabriu a
@@ -468,7 +464,10 @@ fn free_old(old: &Path) -> Result<(), String> {
     if !old.exists() || std::fs::remove_file(old).is_ok() {
         return Ok(());
     }
-    let unique = old.with_extension(format!("{}.{}.old", std::process::id(), stamp()));
+    let unique = old.parent().map_or_else(
+        || PathBuf::from(unique_old_name()),
+        |d| d.join(unique_old_name()),
+    );
     std::fs::rename(old, &unique).map_err(|e| format!("{}: {e}", old.display()))
 }
 
@@ -510,51 +509,39 @@ pub fn remove_stale_old() {
 }
 
 /// `exe.new` (já gravado) assume o lugar de `exe`; o atual vira `exe.old` (apagado se não estiver
-/// em uso). Em erro, o `.new` não fica para trás.
-fn swap_in(new: &Path, exe: &Path) -> Result<(), String> {
+/// em uso). Devolve `true` se havia uma instância rodando a partir de `exe`.
+fn swap_in(new: &Path, exe: &Path) -> Result<bool, String> {
     let old = exe.with_extension("exe.old");
-    if let Err(e) = free_old(&old) {
-        let _ = std::fs::remove_file(new);
-        return Err(e);
-    }
-    if exe.exists() {
-        if let Err(e) = std::fs::rename(exe, &old) {
+    let mut was_running = false;
+    swap_exe(
+        || free_old(&old),
+        || {
+            if exe.exists() {
+                std::fs::rename(exe, &old).map_err(|e| format!("{}: {e}", exe.display()))?;
+                was_running = running_from(exe);
+            }
+            Ok(())
+        },
+        || std::fs::rename(new, exe).map_err(|e| format!("{}: {e}", exe.display())),
+        || {
+            let _ = std::fs::rename(&old, exe);
+        },
+        || {
             let _ = std::fs::remove_file(new);
-            return Err(format!("{}: {e}", exe.display()));
-        }
-        if running_from(exe) && !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
-            println!("wintop is open: the new version starts the next time it opens");
-        }
-    }
-    if let Err(e) = std::fs::rename(new, exe) {
-        // Sem o exe novo no lugar: o antigo volta (melhor esforço).
-        let _ = std::fs::rename(&old, exe);
-        let _ = std::fs::remove_file(new);
-        return Err(format!("{}: {e}", exe.display()));
-    }
-    let _ = std::fs::remove_file(&old);
-    Ok(())
+        },
+        || {
+            let _ = std::fs::remove_file(&old);
+        },
+    )?;
+    Ok(was_running)
 }
 
-/// Atualização pela TUI: sem mensagens no console (a tela é da interface).
-static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Atualização automática da cópia instalada (o processo elevado roda dela): o exe e os módulos
-/// novos (já conferidos pela assinatura) são gravados protegidos na própria pasta e trocados no
-/// lugar; a tarefa e o atalho não mudam. A ACL da pasta é conferida antes e depois.
-pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Result<(), String> {
-    QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
-    let dir = install_dir()?;
-    check_tree(&dir)?;
-    let exe = dir.join("wintop.exe");
-    let new = exe.with_extension("exe.new");
-    let mdir = dir.join("modules");
-    if is_link(&mdir) {
+/// Grava a lista de módulos na pasta `mdir` protegida, cada um via arquivo exclusivo + rename.
+fn write_protected_modules(mdir: &Path, modules: &[(String, Vec<u8>)]) -> Result<(), String> {
+    if is_link(mdir) {
         return Err(format!("{} is a link (refused)", mdir.display()));
     }
-    std::fs::create_dir_all(&mdir).map_err(|e| format!("{}: {e}", mdir.display()))?;
-    // Módulos antes do exe: um módulo novo com o exe antigo é inofensivo (mesmo formato), o
-    // contrário pode não ser.
+    std::fs::create_dir_all(mdir).map_err(|e| format!("{}: {e}", mdir.display()))?;
     for (name, data) in modules {
         if !MODULE_FILES.contains(&name.as_str()) {
             continue;
@@ -575,11 +562,25 @@ pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Resu
         }
         r?;
     }
+    Ok(())
+}
+
+/// Atualização automática da cópia instalada (o processo elevado roda dela): o exe e os módulos
+/// novos (já conferidos pela assinatura) são gravados protegidos na própria pasta e trocados no
+/// lugar; a tarefa e o atalho não mudam. A ACL da pasta é conferida antes e depois.
+pub fn update_installed(exe_bytes: &[u8], modules: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let dir = install_dir()?;
+    check_tree(&dir)?;
+    let exe = dir.join("wintop.exe");
+    let new = exe.with_extension("exe.new");
+    // Módulos antes do exe: um módulo novo com o exe antigo é inofensivo (mesmo formato), o
+    // contrário pode não ser.
+    write_protected_modules(&dir.join("modules"), modules)?;
     if new.exists() || is_link(&new) {
         std::fs::remove_file(&new).map_err(|e| format!("{}: {e}", new.display()))?;
     }
     create_protected(&new, exe_bytes, true)?;
-    swap_in(&new, &exe)?;
+    let _ = swap_in(&new, &exe)?;
     secure_owner_tree(&dir)?;
     check_tree(&dir)
 }
@@ -591,44 +592,39 @@ fn running_from(exe: &Path) -> bool {
     old.exists() && std::fs::OpenOptions::new().write(true).open(&old).is_err()
 }
 
-/// A pasta `modules\` de origem: não é link, tem o módulo, e cada arquivo da lista que existe
-/// é um arquivo comum.
-fn check_modules(from: &Path) -> Result<(), String> {
-    if is_link(from) {
-        return Err(format!("{} is a link (refused)", from.display()));
-    }
-    if !from.join(MODULE_FILES[0]).is_file() {
-        return Err(format!(
-            "{} not found: extract the whole zip next to wintop.exe",
-            from.join(MODULE_FILES[0]).display()
-        ));
-    }
-    for f in MODULE_FILES {
-        let src = from.join(f);
-        if src.exists() && (is_link(&src) || !src.is_file()) {
-            return Err(format!("{} is not a plain file (refused)", src.display()));
-        }
-    }
-    Ok(())
-}
-
 /// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
 pub const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
 
-/// Copia só a lista fechada de `modules\`, sem seguir links: a pasta de origem (ex.: o zip
-/// extraído em Downloads) é do usuário, e uma junction nela faria o instalador elevado copiar
-/// arquivos protegidos para uma pasta que Usuários leem. O módulo é obrigatório.
-fn copy_modules(from: &Path, to: &Path) -> Result<(), String> {
-    check_modules(from)?;
-    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
-    for f in MODULE_FILES {
-        let src = from.join(f);
-        if !src.exists() {
-            continue;
+/// Teto de tamanho de cada arquivo de `modules\` lido da pasta de origem.
+const MAX_MODULE_BYTES: u64 = 16 << 20;
+
+/// Lê a lista fechada de `modules\` na memória pelo `userfile` (sem seguir links nem hardlinks,
+/// ancorando a pasta contra troca entre a validação e a leitura). O módulo é obrigatório.
+fn read_modules(from: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let src = crate::userfile::UserDir::open_exe_dir(from).map_err(|e| {
+        if from.exists() {
+            e
+        } else {
+            format!(
+                "{} not found: extract the whole zip next to wintop.exe",
+                from.join(MODULE_FILES[0]).display()
+            )
         }
-        std::fs::copy(&src, to.join(f)).map_err(|e| format!("{}: {e}", src.display()))?;
+    })?;
+    let mut out = Vec::new();
+    for (i, f) in MODULE_FILES.iter().enumerate() {
+        match src.read_bytes(f, MAX_MODULE_BYTES)? {
+            Some(data) => out.push(((*f).to_string(), data)),
+            None if i == 0 => {
+                return Err(format!(
+                    "{} not found: extract the whole zip next to wintop.exe",
+                    from.join(f).display()
+                ));
+            }
+            None => {}
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
@@ -639,16 +635,28 @@ fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
     use windows::core::Interface;
+
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            // SAFETY: pareado com o `CoInitializeEx` bem-sucedido nesta thread.
+            unsafe { CoUninitialize() };
+        }
+    }
+
     let schtasks = crate::win::system_dir()
         .ok_or("System32 not found")?
         .join("schtasks.exe");
     let w = |s: &str| wide(s);
-    // SAFETY: COM iniciado nesta thread só para criar o atalho; objetos liberados no Drop.
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-            .ok()
-            .map_err(|e| format!("COM: {e}"))?;
-        let r = (|| -> windows::core::Result<()> {
+    // SAFETY: COM iniciado nesta thread só para criar o atalho; `ComGuard` desfaz no Drop.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .map_err(|e| format!("COM: {e}"))?;
+    let _com = ComGuard;
+    let r = (|| -> windows::core::Result<()> {
+        // SAFETY: COM inicializado; strings UTF-16 vivas durante cada chamada; objetos liberados
+        // no Drop antes do `_com`.
+        unsafe {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             let target = w(&schtasks.to_string_lossy());
             link.SetPath(PCWSTR(target.as_ptr()))?;
@@ -663,10 +671,9 @@ fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
             let file: IPersistFile = link.cast()?;
             let p = w(&lnk.to_string_lossy());
             file.Save(PCWSTR(p.as_ptr()), true)
-        })();
-        CoUninitialize();
-        r.map_err(|e| format!("shortcut {}: {e}", lnk.display()))
-    }
+        }
+    })();
+    r.map_err(|e| format!("shortcut {}: {e}", lnk.display()))
 }
 
 /// `wintop --install`: copia para `<Program Files>\wintop`, confere a ACL, cria a tarefa e o
@@ -707,12 +714,12 @@ pub fn install() -> Result<(), String> {
     secure(&dir, true)?;
     check_tree(&dir)?;
     if !same_file(&me, &exe) {
-        // A origem é conferida antes de qualquer cópia: uma falha não deixa o exe novo pela
-        // metade da instalação.
-        check_modules(&here.join("modules"))?;
+        // Os módulos são lidos na memória pelo `userfile` antes de tocar o destino: sem TOCTOU
+        // entre a validação e a cópia, e sem deixar a instalação pela metade em caso de erro.
+        let modules = read_modules(&here.join("modules"))?;
         let before = installed_version(&exe);
+        write_protected_modules(&dir.join("modules"), &modules)?;
         replace_exe(&me, &exe)?;
-        copy_modules(&here.join("modules"), &dir.join("modules"))?;
         match before {
             Some(v) => println!(
                 "updated {} ({v} -> {})",
@@ -785,6 +792,8 @@ pub fn uninstall() -> Result<(), String> {
             "{} is in use by this process: delete it after closing wintop",
             dir.display()
         );
+    } else if is_link(&dir) || dir.parent().is_some_and(is_link) {
+        return Err(format!("{} is a link: refusing to remove", dir.display()));
     } else if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         println!("{} removed", dir.display());

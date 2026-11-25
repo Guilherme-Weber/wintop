@@ -15,7 +15,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::model::{Counts, Cpu, Metric, Topology, fail};
-use crate::pdh::{self, Query, Slot};
+use crate::pdh::{self, PdhError, Query, Slot};
 use crate::win::filetime;
 
 /// Quantas coletas seguidas toleram um erro transitório de cálculo do PDH (`0x800007D6..D8`,
@@ -24,7 +24,7 @@ use crate::win::filetime;
 const TRANSIENT_LIMIT: u8 = 3;
 
 pub struct CpuCollector {
-    query: Result<Query, String>,
+    query: Result<Query, PdhError>,
     per: Slot,
     per_kernel: Slot,
     perf: Slot,
@@ -84,7 +84,7 @@ impl CpuCollector {
     }
 
     /// `PdhCollectQueryData` desta consulta (chamado antes de `read`).
-    pub fn sample(&mut self) -> Result<(), String> {
+    pub fn sample(&mut self) -> Result<(), PdhError> {
         match &self.query {
             Ok(q) => q.collect(),
             Err(e) => Err(e.clone()),
@@ -96,9 +96,9 @@ impl CpuCollector {
         // Um contador só: a instância `_Total` vem junto com as dos lógicos.
         let array = match &sampled {
             Err(e) => Err(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.per),
+            Ok(()) => read_cpu_array(&self.query, &self.per),
         };
-        let (usage, per_logical) = resolve_cpu_array(
+        let (usage, per_logical) = resolve_cpu_parsed(
             "usage",
             array,
             100.0,
@@ -109,9 +109,9 @@ impl CpuCollector {
         // Antes de `per_logical` já está resolvido; agora o kernel por lógico.
         let kernel_array = match &sampled {
             Err(e) => Err(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.per_kernel),
+            Ok(()) => read_cpu_array(&self.query, &self.per_kernel),
         };
-        let (_, kernel_per_logical) = resolve_cpu_array(
+        let (_, kernel_per_logical) = resolve_cpu_parsed(
             "kernel",
             kernel_array,
             100.0,
@@ -127,9 +127,9 @@ impl CpuCollector {
         // com o turbo.
         let perf_array = match &sampled {
             Err(e) => Err(e.clone()),
-            Ok(()) => pdh::read_array_all(&self.query, &self.perf),
+            Ok(()) => read_cpu_array(&self.query, &self.perf),
         };
-        let (perf_total, perf_per_logical) = resolve_cpu_array(
+        let (perf_total, perf_per_logical) = resolve_cpu_parsed(
             "perf",
             perf_array,
             PERF_MAX,
@@ -206,26 +206,48 @@ fn kernel_share(prev: (u64, u64, u64), now: (u64, u64, u64)) -> Option<f64> {
     (total > 0).then(|| (dk.saturating_sub(di) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
 }
 
+/// Instâncias já decodificadas de um contador `\Processor Information(*)`: `(_Total, lógicos)`.
+type CpuArray = (Option<f64>, Vec<((u32, u32), f64)>);
+
+fn parse_logical(name: &str) -> Option<(u32, u32)> {
+    let (g, n) = name.split_once(',')?;
+    Some((g.parse().ok()?, n.parse().ok()?))
+}
+
+/// Lê um contador `\Processor Information(*)` sem alocar `String` por instância.
+fn read_cpu_array(q: &Result<Query, PdhError>, slot: &Slot) -> Result<CpuArray, PdhError> {
+    let mut total = None;
+    let mut logical = Vec::new();
+    pdh::for_each_array_all(q, slot, |name, val| {
+        if name == "_Total" {
+            total.get_or_insert(val);
+        } else if let Some(key) = parse_logical(name) {
+            logical.push((key, val));
+        }
+    })?;
+    Ok((total, logical))
+}
+
 /// Extrai `(_Total, por_lógico)` de uma leitura de contador por processador do PDH.
 ///
 /// Em erros transitórios de cálculo diferencial do PDH (`0x800007D6..D8`, ex.: ajuste de relógio
 /// ou delta negativo numa amostra isolada), repete a última leitura válida por até
 /// `TRANSIENT_LIMIT` coletas seguidas (registrando em `debug.log`) antes de expor a falha. Se só
 /// `_Total` vier `NaN` numa coleta com lógicos válidos, calcula a média dos lógicos.
-fn resolve_cpu_array(
+fn resolve_cpu_parsed(
     name: &str,
-    raw: Result<Vec<(String, f64)>, String>,
+    raw: Result<CpuArray, PdhError>,
     max: f64,
     last_per: &mut Vec<f64>,
     last_total: &mut Option<f64>,
     streak: &mut u8,
 ) -> (Metric<f64>, Metric<Vec<f64>>) {
     match raw {
-        Ok(items) => {
+        Ok((total_raw, logical)) => {
             *streak = 0;
             let per =
-                per_logical_raw(&items, max, last_per).map_or_else(|| fail("no instances"), Ok);
-            let total = match items.iter().find(|(n, _)| n == "_Total").map(|(_, v)| *v) {
+                per_logical_parsed(logical, max, last_per).map_or_else(|| fail("no instances"), Ok);
+            let total = match total_raw {
                 Some(v) if v.is_finite() => {
                     let clamped = v.clamp(0.0, max);
                     *last_total = Some(clamped);
@@ -255,7 +277,7 @@ fn resolve_cpu_array(
             (total, per)
         }
         Err(e) => {
-            if pdh::is_transient_calc(&e) && !last_per.is_empty() && *streak < TRANSIENT_LIMIT {
+            if e.is_transient_calc() && !last_per.is_empty() && *streak < TRANSIENT_LIMIT {
                 *streak += 1;
                 crate::debug::log(
                     "cpu",
@@ -264,18 +286,46 @@ fn resolve_cpu_array(
                         *streak
                     ),
                 );
-                let total = last_total.map_or_else(|| fail(e.clone()), Ok);
+                let total = last_total.map_or_else(|| fail(e.message.clone()), Ok);
                 return (total, Ok(last_per.clone()));
             }
-            (fail(e.clone()), fail(e))
+            (fail(e.message.clone()), fail(e.message))
         }
     }
+}
+
+#[cfg(test)]
+fn resolve_cpu_array(
+    name: &str,
+    raw: Result<Vec<(String, f64)>, PdhError>,
+    max: f64,
+    last_per: &mut Vec<f64>,
+    last_total: &mut Option<f64>,
+    streak: &mut u8,
+) -> (Metric<f64>, Metric<Vec<f64>>) {
+    let parsed = raw.map(|items| {
+        let mut total = None;
+        let mut logical = Vec::new();
+        for (n, v) in items {
+            if n == "_Total" {
+                total.get_or_insert(v);
+            } else if let Some(key) = parse_logical(&n) {
+                logical.push((key, v));
+            }
+        }
+        (total, logical)
+    });
+    resolve_cpu_parsed(name, parsed, max, last_per, last_total, streak)
 }
 
 /// Uso por processador lógico, ordenado por (grupo, número); ignora as instâncias `_Total`.
 #[cfg(test)]
 fn per_logical(items: &[(String, f64)], last: &mut Vec<f64>) -> Option<Vec<f64>> {
-    per_logical_raw(items, 100.0, last)
+    let logical: Vec<((u32, u32), f64)> = items
+        .iter()
+        .filter_map(|(n, v)| Some((parse_logical(n)?, *v)))
+        .collect();
+    per_logical_parsed(logical, 100.0, last)
 }
 
 /// Teto do `% Processor Performance` (turbo passa de 100%; acima disto é contador corrompido).
@@ -283,14 +333,11 @@ const PERF_MAX: f64 = 1000.0;
 
 /// Valores por lógico em 0..=`max`, ordenados por (grupo, número). Lógico sem dado válido
 /// (NaN) repete o valor de `last` na mesma posição (ou 0); `last` guarda o resultado.
-fn per_logical_raw(items: &[(String, f64)], max: f64, last: &mut Vec<f64>) -> Option<Vec<f64>> {
-    let mut v: Vec<((u32, u32), f64)> = items
-        .iter()
-        .filter_map(|(name, val)| {
-            let (g, n) = name.split_once(',')?;
-            Some(((g.parse().ok()?, n.parse().ok()?), *val))
-        })
-        .collect();
+fn per_logical_parsed(
+    mut v: Vec<((u32, u32), f64)>,
+    max: f64,
+    last: &mut Vec<f64>,
+) -> Option<Vec<f64>> {
     if v.is_empty() {
         return None;
     }
@@ -551,10 +598,12 @@ mod tests {
         assert_eq!(streak, 0);
 
         // Até TRANSIENT_LIMIT falhas transitórias seguidas (0x800007D6..D8) repetem a última leitura.
+        let transient =
+            PdhError::from_code(windows::Win32::System::Performance::PDH_CALC_NEGATIVE_DENOMINATOR);
         for expected in 1..=TRANSIENT_LIMIT {
             let (u, p) = resolve_cpu_array(
                 "usage",
-                Err("PDH negative denominator".into()),
+                Err(transient.clone()),
                 100.0,
                 &mut last_per,
                 &mut last_total,
@@ -567,7 +616,7 @@ mod tests {
         // Acima do limite, a falha aparece normalmente.
         let (u, p) = resolve_cpu_array(
             "usage",
-            Err("PDH negative denominator".into()),
+            Err(transient),
             100.0,
             &mut last_per,
             &mut last_total,
@@ -588,7 +637,9 @@ mod tests {
         assert_eq!(streak, 0);
         let (u, p) = resolve_cpu_array(
             "usage",
-            Err("PDH object not found".into()),
+            Err(PdhError::from_code(
+                windows::Win32::System::Performance::PDH_CSTATUS_NO_OBJECT,
+            )),
             100.0,
             &mut last_per,
             &mut last_total,

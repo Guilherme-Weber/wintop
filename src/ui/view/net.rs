@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 
 use super::state::{MinMax, Series, State};
 use super::{
-    boxed, empty_box, failed, label, line, metric, metric_styled, missing, put, text, wrap,
+    boxed, empty_box, faded, failed, label, line, metric_styled, missing, put, raw_text, wrap,
 };
 use crate::fmt::{bits, bytes};
 use crate::model::{Missing, Nic};
@@ -34,13 +34,12 @@ fn net_rate(st: &State, bits_per_s: f64) -> String {
 /// Rede compacta: por placa, 1 linha de identificação (nome, descrição, link, erros) e 1 de
 /// taxas (↓/↑ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
 /// sobrando (download em cima, upload embaixo). Placas desconectadas numa linha só.
-pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
+pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let nics = st.fast.as_ref().map(|f| &f.nics);
     let Some(Ok(list)) = nics else {
         empty_box(frame, area, "net", nics);
         return;
     };
-    let list: Vec<Nic> = list.clone();
     let block = boxed("net", "↓ receive  ↑ send");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -61,7 +60,10 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ),
         ] {
             spans.push(Span::styled(arrow, Style::new().fg(color)));
-            spans.push(metric(m, |v| net_rate(st, *v)));
+            spans.push(faded(
+                metric_styled(m, color, |v| net_rate(st, *v)),
+                m.as_ref().is_ok_and(|v| *v < 1.0),
+            ));
             if let Some((_, hi)) = mm.copied().and_then(MinMax::get) {
                 spans.push(label(&format!(" max {}", net_rate(st, hi))));
             }
@@ -97,7 +99,7 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         0
     };
     let mut y = inner.y;
-    for (k, (n, (_, rates))) in up.iter().zip(&fixed).take(shown).enumerate() {
+    for (k, (n, (_, rates))) in up.iter().zip(fixed).take(shown).enumerate() {
         if gap && k > 0 {
             y += 1;
         }
@@ -120,8 +122,11 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         line(
             frame,
             vec![
-                text(printable(&n.alias)).add_modifier(Modifier::BOLD),
-                label(&format!("  {}", printable(&n.description))),
+                raw_text(printable(&n.alias)).add_modifier(Modifier::BOLD),
+                Span::styled(
+                    format!("  {}", printable(&n.description)),
+                    Style::new().fg(th().label),
+                ),
             ],
             inner.x,
             y,
@@ -135,7 +140,7 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             inner,
         );
         y += 1;
-        for l in rates.clone() {
+        for l in rates {
             put(
                 frame,
                 Paragraph::new(l),
@@ -146,18 +151,30 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
         if graph_h >= 2 {
             let n_samples = usize::from(inner.width) * 2;
-            let peak = |m: &HashMap<String, Series>| {
-                m.get(&n.alias).map_or(0.0, |s| s.max_of_ref(n_samples))
-            };
+            let peak =
+                |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of(n_samples));
             let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
-            let top_h = graph_h.div_ceil(2);
+            // Com ≥ 3 linhas, a escala ganha linha própria acima do gráfico (nunca sobrescreve
+            // os picos mais recentes) e download/upload ficam com alturas exatamente simétricas.
+            let (graph_y, half) = if graph_h >= 3 {
+                put(
+                    frame,
+                    Paragraph::new(label(&format!("scale {}", net_rate(st, scale))))
+                        .right_aligned(),
+                    Rect::new(inner.x, y, inner.width, 1),
+                    inner,
+                );
+                (y + 1, (graph_h - 1) / 2)
+            } else {
+                (y, graph_h / 2)
+            };
             for (series, color, top, h, inverted) in [
-                (st.recv.get_mut(&n.alias), th().net_recv, y, top_h, false),
+                (st.recv.get(&n.alias), th().net_recv, graph_y, half, false),
                 (
-                    st.send.get_mut(&n.alias),
+                    st.send.get(&n.alias),
                     th().net_send,
-                    y + top_h,
-                    graph_h - top_h,
+                    graph_y + half,
+                    half,
                     true,
                 ),
             ] {
@@ -172,17 +189,6 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                         Rect::new(inner.x, top, inner.width, h).intersection(inner),
                     );
                 }
-            }
-            // Escala por cima do canto do gráfico, depois de desenhá-lo (com uma linha só ela
-            // cobriria o gráfico de download inteiro).
-            if top_h >= 2 {
-                put(
-                    frame,
-                    Paragraph::new(label(&format!("scale {} ", net_rate(st, scale))))
-                        .right_aligned(),
-                    Rect::new(inner.x, y, inner.width, 1),
-                    inner,
-                );
             }
             y += graph_h;
         }

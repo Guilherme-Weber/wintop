@@ -67,6 +67,33 @@ fn state() -> &'static Mutex<State> {
     S.get_or_init(|| Mutex::new(State::default()))
 }
 
+/// Serializa apenas o append no arquivo (fora do mutex de `State`), evitando contention nas
+/// coletas quando o modo debug grava em disco e impedindo violação de compartilhamento entre
+/// threads gravando ao mesmo tempo.
+fn io_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
+struct WriteTarget {
+    #[cfg(test)]
+    dir: Option<(PathBuf, String)>,
+}
+
+fn write_target(st: &State) -> WriteTarget {
+    #[cfg(test)]
+    {
+        WriteTarget {
+            dir: st.test_dir.clone(),
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = st;
+        WriteTarget {}
+    }
+}
+
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
@@ -82,13 +109,16 @@ pub fn set_enabled(on: bool) {
     if on == prev {
         return;
     }
-    let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-    st.active.clear();
-    st.direct = DirectLimit::default();
+    let target = {
+        let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+        st.active.clear();
+        st.direct = DirectLimit::default();
+        write_target(&st)
+    };
     if on {
         let where_ = log_path().map_or_else(|| LOG_FILE.to_string(), |p| p.display().to_string());
         write_line(
-            &st,
+            &target,
             "info",
             &format!(
                 "debug logging enabled (wintop {}, file: {where_})",
@@ -96,7 +126,7 @@ pub fn set_enabled(on: bool) {
             ),
         );
     } else {
-        write_line(&st, "info", "debug logging disabled");
+        write_line(&target, "info", "debug logging disabled");
     }
 }
 
@@ -106,57 +136,60 @@ pub fn log(source: &str, message: &str) {
     if !is_enabled() {
         return;
     }
-    let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-    let now = Instant::now();
-    let mut prefix = String::new();
-    if now.duration_since(st.direct.window_start) >= Duration::from_secs(60) {
-        if st.direct.window_suppressed > 0 {
-            prefix = format!(
-                "[{}] [info] suppressed {} excess debug log events in the last minute\r\n",
-                timestamp(),
-                st.direct.window_suppressed
-            );
-        }
-        st.direct.window_start = now;
-        st.direct.window_count = 0;
-        st.direct.window_suppressed = 0;
-        st.direct
-            .recent
-            .retain(|_, (at, _)| now.duration_since(*at) < LOG_COOLDOWN * 2);
-    }
-    let key = (source.to_string(), message.to_string());
-    let repeated_note = if let Some((at, sup)) = st.direct.recent.get_mut(&key) {
-        if now.duration_since(*at) < LOG_COOLDOWN {
-            *sup = sup.saturating_add(1);
-            return;
-        }
-        let prev = std::mem::take(sup);
-        *at = now;
-        (prev > 0).then(|| format!(" (repeated {prev}x while suppressed)"))
-    } else {
-        if st.direct.recent.len() >= MAX_RECENT_KEYS {
+    let (target, payload) = {
+        let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let mut prefix = String::new();
+        if now.duration_since(st.direct.window_start) >= Duration::from_secs(60) {
+            if st.direct.window_suppressed > 0 {
+                prefix = format!(
+                    "[{}] [info] suppressed {} excess debug log events in the last minute\r\n",
+                    timestamp(),
+                    st.direct.window_suppressed
+                );
+            }
+            st.direct.window_start = now;
+            st.direct.window_count = 0;
+            st.direct.window_suppressed = 0;
             st.direct
                 .recent
-                .retain(|_, (at, _)| now.duration_since(*at) < LOG_COOLDOWN);
+                .retain(|_, (at, _)| now.duration_since(*at) < LOG_COOLDOWN * 2);
         }
-        if st.direct.recent.len() < MAX_RECENT_KEYS {
-            st.direct.recent.insert(key, (now, 0));
+        let key = (source.to_string(), message.to_string());
+        let repeated_note = if let Some((at, sup)) = st.direct.recent.get_mut(&key) {
+            if now.duration_since(*at) < LOG_COOLDOWN {
+                *sup = sup.saturating_add(1);
+                return;
+            }
+            let prev = std::mem::take(sup);
+            *at = now;
+            (prev > 0).then(|| format!(" (repeated {prev}x while suppressed)"))
+        } else {
+            if st.direct.recent.len() >= MAX_RECENT_KEYS {
+                st.direct
+                    .recent
+                    .retain(|_, (at, _)| now.duration_since(*at) < LOG_COOLDOWN);
+            }
+            if st.direct.recent.len() < MAX_RECENT_KEYS {
+                st.direct.recent.insert(key, (now, 0));
+            }
+            None
+        };
+        if st.direct.window_count >= MAX_DIRECT_PER_MIN {
+            st.direct.window_suppressed = st.direct.window_suppressed.saturating_add(1);
+            return;
         }
-        None
+        st.direct.window_count += 1;
+        let suffix = repeated_note.as_deref().unwrap_or("");
+        prefix.push_str(&format!(
+            "[{}] [{}] {}{suffix}\r\n",
+            timestamp(),
+            clean(source),
+            clean(message)
+        ));
+        (write_target(&st), prefix)
     };
-    if st.direct.window_count >= MAX_DIRECT_PER_MIN {
-        st.direct.window_suppressed = st.direct.window_suppressed.saturating_add(1);
-        return;
-    }
-    st.direct.window_count += 1;
-    let suffix = repeated_note.as_deref().unwrap_or("");
-    prefix.push_str(&format!(
-        "[{}] [{}] {}{suffix}\r\n",
-        timestamp(),
-        clean(source),
-        clean(message)
-    ));
-    write_raw(&st, prefix.as_bytes());
+    write_raw(&target, payload.as_bytes());
 }
 
 fn timestamp() -> String {
@@ -173,25 +206,26 @@ fn clean(s: &str) -> String {
     crate::win::printable(&one_line)
 }
 
-fn write_line(st: &State, source: &str, message: &str) {
+fn write_line(target: &WriteTarget, source: &str, message: &str) {
     let line = format!(
         "[{}] [{}] {}\r\n",
         timestamp(),
         clean(source),
         clean(message)
     );
-    write_raw(st, line.as_bytes());
+    write_raw(target, line.as_bytes());
 }
 
-fn write_raw(st: &State, bytes: &[u8]) {
+fn write_raw(target: &WriteTarget, bytes: &[u8]) {
+    let _io = io_lock().lock().unwrap_or_else(PoisonError::into_inner);
     #[cfg(test)]
-    if let Some((base, name)) = &st.test_dir {
+    if let Some((base, name)) = &target.dir {
         if let Ok(Some(dir)) = crate::userfile::UserDir::open(base, name, true) {
             let _ = dir.append_rotating(LOG_FILE, LOG_BACKUP, MAX_LOG_BYTES, bytes);
         }
         return;
     }
-    let _ = st;
+    let _ = target;
     if let Ok(Some(dir)) = crate::config::open_home_dir(true) {
         let _ = dir.append_rotating(LOG_FILE, LOG_BACKUP, MAX_LOG_BYTES, bytes);
     }
@@ -250,48 +284,51 @@ pub fn log_fast(f: &Fast) {
     if !is_enabled() {
         return;
     }
-    let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-    let mut b = Batch::new(&mut st.active);
-    b.metric("cpu", &f.cpu);
-    if let Ok(c) = &f.cpu {
-        c.visit_metrics(|name, e| b.status(&format!("cpu.{name}"), e));
-    }
-    b.metric("cpu_sensors", &f.cpu_sensors);
-    if let Ok(s) = &f.cpu_sensors {
-        s.visit_metrics(|name, e| b.status(&format!("cpu_sensors.{name}"), e));
-    }
-    b.metric("memory", &f.memory);
-    if let Ok(m) = &f.memory {
-        m.visit_metrics(|name, e| b.status(&format!("memory.{name}"), e));
-    }
-    b.metric("disks", &f.disks);
-    if let Ok(list) = &f.disks {
-        for d in list {
-            let p = format!("disk.{}", d.number);
-            d.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+    let (target, out) = {
+        let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+        let mut b = Batch::new(&mut st.active);
+        b.metric("cpu", &f.cpu);
+        if let Ok(c) = &f.cpu {
+            c.visit_metrics(|name, e| b.status(&format!("cpu.{name}"), e));
         }
-    }
-    b.metric("nics", &f.nics);
-    if let Ok(list) = &f.nics {
-        for n in list {
-            let p = format!("nic.{}", n.alias);
-            n.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+        b.metric("cpu_sensors", &f.cpu_sensors);
+        if let Ok(s) = &f.cpu_sensors {
+            s.visit_metrics(|name, e| b.status(&format!("cpu_sensors.{name}"), e));
         }
-    }
-    b.metric("gpus", &f.gpus);
-    if let Ok(list) = &f.gpus {
-        for g in list {
-            let p = format!("gpu.{}", g.index);
-            g.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+        b.metric("memory", &f.memory);
+        if let Ok(m) = &f.memory {
+            m.visit_metrics(|name, e| b.status(&format!("memory.{name}"), e));
         }
-    }
-    b.metric("own", &f.own);
-    if let Ok(o) = &f.own {
-        o.visit_metrics(|name, e| b.status(&format!("own.{name}"), e));
-    }
-    let out = b.buf;
+        b.metric("disks", &f.disks);
+        if let Ok(list) = &f.disks {
+            for d in list {
+                let p = format!("disk.{}", d.number);
+                d.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+            }
+        }
+        b.metric("nics", &f.nics);
+        if let Ok(list) = &f.nics {
+            for n in list {
+                let p = format!("nic.{}", n.alias);
+                n.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+            }
+        }
+        b.metric("gpus", &f.gpus);
+        if let Ok(list) = &f.gpus {
+            for g in list {
+                let p = format!("gpu.{}", g.index);
+                g.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+            }
+        }
+        b.metric("own", &f.own);
+        if let Ok(o) = &f.own {
+            o.visit_metrics(|name, e| b.status(&format!("own.{name}"), e));
+        }
+        let out = b.buf;
+        (write_target(&st), out)
+    };
     if !out.is_empty() {
-        write_raw(&st, out.as_bytes());
+        write_raw(&target, out.as_bytes());
     }
 }
 
@@ -300,45 +337,31 @@ pub fn log_slow(s: &Slow) {
     if !is_enabled() {
         return;
     }
-    let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-    let mut b = Batch::new(&mut st.active);
-    b.metric("slow.gpus", &s.gpus);
-    if let Ok(list) = &s.gpus {
-        for g in list {
-            let p = format!("gpu.{}", g.index);
-            b.metric(&format!("{p}.pcie_tx"), &g.pcie_tx);
-            b.metric(&format!("{p}.pcie_rx"), &g.pcie_rx);
-            b.metric(&format!("{p}.vram"), &g.vram);
-            if let Some(procs) = &g.procs {
-                b.metric(&format!("{p}.procs"), procs);
-                if let Ok(pl) = procs {
-                    let eng: Metric<()> = pl
-                        .iter()
-                        .find_map(|x| {
-                            x.engines
-                                .as_ref()
-                                .err()
-                                .filter(|e| matches!(e, Missing::Fail(_)))
-                        })
-                        .map_or(Ok(()), |e| Err(e.clone()));
-                    b.metric(&format!("{p}.engines"), &eng);
-                }
+    let (target, out) = {
+        let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+        let mut b = Batch::new(&mut st.active);
+        b.metric("slow.gpus", &s.gpus);
+        if let Ok(list) = &s.gpus {
+            for g in list {
+                let p = format!("gpu.{}", g.index);
+                g.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
             }
         }
-    }
-    b.metric("slow.disk_temps", &s.disk_temps);
-    if let Ok(list) = &s.disk_temps {
-        for t in list {
-            b.metric(&format!("disk.{}.temp", t.number), &t.celsius);
-            b.metric(&format!("disk.{}.health", t.number), &t.health);
+        b.metric("slow.disk_temps", &s.disk_temps);
+        if let Ok(list) = &s.disk_temps {
+            for t in list {
+                let p = format!("disk.{}", t.number);
+                t.visit_metrics(|name, e| b.status(&format!("{p}.{name}"), e));
+            }
         }
-    }
-    if let Some(procs) = &s.procs {
-        b.metric("slow.procs", procs);
-    }
-    let out = b.buf;
+        if let Some(procs) = &s.procs {
+            b.metric("slow.procs", procs);
+        }
+        let out = b.buf;
+        (write_target(&st), out)
+    };
     if !out.is_empty() {
-        write_raw(&st, out.as_bytes());
+        write_raw(&target, out.as_bytes());
     }
 }
 
@@ -347,18 +370,21 @@ pub fn log_fps(f: &Fps) {
     if !is_enabled() {
         return;
     }
-    let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-    let mut b = Batch::new(&mut st.active);
-    b.metric("rtss", &f.rtss);
-    b.metric("rtss.pipe", &f.pipe);
-    b.metric("rtss.etw", &f.etw);
-    b.metric("rtss.game", &f.game);
-    if let Ok(g) = &f.game {
-        g.visit_metrics(|name, e| b.status(&format!("game.{name}"), e));
-    }
-    let out = b.buf;
+    let (target, out) = {
+        let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+        let mut b = Batch::new(&mut st.active);
+        b.metric("rtss", &f.rtss);
+        b.metric("rtss.pipe", &f.pipe);
+        b.metric("rtss.etw", &f.etw);
+        b.metric("rtss.game", &f.game);
+        if let Ok(g) = &f.game {
+            g.visit_metrics(|name, e| b.status(&format!("game.{name}"), e));
+        }
+        let out = b.buf;
+        (write_target(&st), out)
+    };
     if !out.is_empty() {
-        write_raw(&st, out.as_bytes());
+        write_raw(&target, out.as_bytes());
     }
 }
 
@@ -367,12 +393,25 @@ mod tests {
     use super::*;
     use crate::model::{DiskTemp, fail, neutral};
 
+    /// Restaura o estado global de debug e remove a pasta de teste no `Drop`.
+    struct DebugGuard(PathBuf);
+    impl Drop for DebugGuard {
+        fn drop(&mut self) {
+            ENABLED.store(false, Ordering::SeqCst);
+            let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
+            st.test_dir = None;
+            st.active.clear();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn registra_transicoes_e_recuperacoes_sem_repetir() {
         let base = crate::config::roaming().expect("Roaming");
         let dir_name = format!("wintop_test_{}_debug", std::process::id());
         let dir_path = base.join(&dir_name);
         let _ = std::fs::remove_dir_all(&dir_path);
+        let _guard = DebugGuard(dir_path.clone());
 
         {
             let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
@@ -420,13 +459,8 @@ mod tests {
         log_slow(&slow_ok);
 
         set_enabled(false);
-        {
-            let mut st = state().lock().unwrap_or_else(PoisonError::into_inner);
-            st.test_dir = None;
-        }
 
         let text = std::fs::read_to_string(dir_path.join(LOG_FILE)).expect("log gravado");
-        let _ = std::fs::remove_dir_all(&dir_path);
 
         assert!(!text.contains("nao deve aparecer"), "{text}");
         assert!(text.contains("[info] debug logging enabled"), "{text}");

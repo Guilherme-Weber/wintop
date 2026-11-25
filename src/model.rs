@@ -74,11 +74,39 @@ pub struct Cpu {
     pub uptime: Duration,
 }
 
+/// Compressão de memória do Windows (`SystemStoreInformation`, subclasse 22):
+/// bytes físicos em RAM ocupados pelo store e estimativa do tamanho original antes da compressão.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressedMemory {
+    /// Bytes físicos em RAM ocupados pela memória comprimida (`WorkingSetSize`).
+    pub compressed: u64,
+    /// Estimativa do tamanho original (descomprimido) dos dados comprimidos em RAM.
+    pub uncompressed: u64,
+}
+
+/// Hardware de RAM lido do SMBIOS (Type 17, estático por boot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryHardware {
+    /// Geração (ex.: "DDR4", "DDR5", "LPDDR5").
+    pub kind: &'static str,
+    /// Velocidade configurada (ou máxima, se a configurada não for informada), em MT/s.
+    pub speed_mt: Option<u32>,
+    /// Slots ocupados e total de slots na placa-mãe.
+    pub slots_used: u32,
+    pub slots_total: u32,
+    /// Formato (ex.: "DIMM", "SODIMM").
+    pub form_factor: Option<&'static str>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Memory {
     pub total: Metric<u64>,
     pub used: Metric<u64>,
     pub commit: Metric<(u64, u64)>,
+    /// Pico de memória confirmada desde o boot (`GetPerformanceInfo.CommitPeak`), bytes.
+    pub commit_peak: Metric<u64>,
+    /// Memória comprimida em RAM e tamanho original (descomprimido) estimado.
+    pub compressed: Metric<CompressedMemory>,
     /// Standby + Modified (igual ao "Em cache" do Gerenciador de Tarefas).
     pub cached: Metric<u64>,
     /// As duas partes do "em cache": standby (livre para reuso) e modificada (a gravar).
@@ -88,6 +116,14 @@ pub struct Memory {
     pub nonpaged_pool: Metric<u64>,
     /// Arquivo de paginação (usado e total, em bytes).
     pub pagefile_usage: Metric<(u64, u64)>,
+    /// Paginação real em disco: `(páginas lidas/s, páginas gravadas/s)`.
+    pub paging: Metric<(f64, f64)>,
+    /// Hardware de RAM (SMBIOS Type 17, estático por boot).
+    pub hardware: Metric<MemoryHardware>,
+    /// RAM reservada pelo hardware (`GetPhysicallyInstalledSystemMemory - total`, bytes).
+    pub hardware_reserved: Metric<u64>,
+    /// Páginas defeituosas marcadas pelo kernel (`SystemMemoryListInformation.BadPageCount`).
+    pub bad_pages: Metric<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,12 +595,18 @@ impl Memory {
         f("total", self.total.as_ref().err());
         f("used", self.used.as_ref().err());
         f("commit", self.commit.as_ref().err());
+        f("commit_peak", self.commit_peak.as_ref().err());
+        f("compressed", self.compressed.as_ref().err());
         f("cached", self.cached.as_ref().err());
         f("standby", self.standby.as_ref().err());
         f("modified", self.modified.as_ref().err());
         f("paged_pool", self.paged_pool.as_ref().err());
         f("nonpaged_pool", self.nonpaged_pool.as_ref().err());
         f("pagefile_usage", self.pagefile_usage.as_ref().err());
+        f("paging", self.paging.as_ref().err());
+        f("hardware", self.hardware.as_ref().err());
+        f("hardware_reserved", self.hardware_reserved.as_ref().err());
+        f("bad_pages", self.bad_pages.as_ref().err());
     }
 
     pub fn has_failure(&self) -> bool {
@@ -670,5 +712,32 @@ impl Game {
 
     pub fn has_failure(&self) -> bool {
         any_fail(|f| self.visit_metrics(f))
+    }
+}
+
+impl GpuSlow {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("pcie_tx", self.pcie_tx.as_ref().err());
+        f("pcie_rx", self.pcie_rx.as_ref().err());
+        f("vram", self.vram.as_ref().err());
+        if let Some(procs) = &self.procs {
+            f("procs", procs.as_ref().err());
+            if let Ok(pl) = procs {
+                let eng = pl.iter().find_map(|x| {
+                    x.engines
+                        .as_ref()
+                        .err()
+                        .filter(|e| matches!(e, Missing::Fail(_)))
+                });
+                f("engines", eng);
+            }
+        }
+    }
+}
+
+impl DiskTemp {
+    pub fn visit_metrics(&self, mut f: impl FnMut(&str, Option<&Missing>)) {
+        f("temp", self.celsius.as_ref().err());
+        f("health", self.health.as_ref().err());
     }
 }

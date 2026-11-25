@@ -39,6 +39,7 @@ pub struct Theme {
     pub encode: Color,
     pub decode: Color,
     pub ram_in_use: Color,
+    pub ram_compressed: Color,
     pub ram_modified: Color,
     pub ram_standby: Color,
     pub game: Color,
@@ -77,11 +78,12 @@ pub const DEFAULT: Theme = Theme {
     fps: rgb(0x108981),
     frametime: rgb(0x8386F1),
     frametime_spike: rgb(0xFF8A65),
-    fps_over: rgb(0x1E1B4B),
+    fps_over: rgb(0x60A5FA),
     fps_low: rgb(0xFF8A65),
     encode: Color::Rgb(86, 194, 214),
     decode: Color::Rgb(176, 132, 224),
     ram_in_use: Color::Rgb(78, 184, 176),
+    ram_compressed: Color::Rgb(157, 124, 216),
     ram_modified: rgb(0xD4B85A),
     ram_standby: Color::Rgb(92, 120, 170),
     game: Color::Rgb(224, 138, 60),
@@ -120,6 +122,7 @@ const NORD: Theme = Theme {
     encode: rgb(0x8fbcbb),
     decode: rgb(0xb48ead),
     ram_in_use: rgb(0x88c0d0),
+    ram_compressed: rgb(0xb48ead),
     ram_modified: rgb(0xebcb8b),
     ram_standby: rgb(0x5e81ac),
     game: rgb(0xd08770),
@@ -156,6 +159,7 @@ const GRUVBOX: Theme = Theme {
     encode: rgb(0x8ec07c),
     decode: rgb(0xd3869b),
     ram_in_use: rgb(0x8ec07c),
+    ram_compressed: rgb(0xd3869b),
     ram_modified: rgb(0xd79921),
     ram_standby: rgb(0x458588),
     game: rgb(0xfe8019),
@@ -192,6 +196,7 @@ const DRACULA: Theme = Theme {
     encode: rgb(0x8be9fd),
     decode: rgb(0xbd93f9),
     ram_in_use: rgb(0x8be9fd),
+    ram_compressed: rgb(0xbd93f9),
     ram_modified: rgb(0xf1fa8c),
     ram_standby: rgb(0x6272a4),
     game: rgb(0xffb86c),
@@ -229,6 +234,7 @@ const MONO: Theme = Theme {
     encode: rgb(0xc0c0c0),
     decode: rgb(0x909090),
     ram_in_use: rgb(0xc8c8c8),
+    ram_compressed: rgb(0xb4b4b4),
     ram_modified: rgb(0xa0a0a0),
     ram_standby: rgb(0x787878),
     game: rgb(0xffffff),
@@ -262,6 +268,11 @@ pub fn exists(name: &str) -> bool {
     ALL.iter().any(|t| t.name == name)
 }
 
+/// `NO_COLOR` (https://no-color.org/): presente e não vazio pede paleta monocromática.
+pub fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
 /// Tema pelo nome (padrão se não existir), com as cores avulsas do config aplicadas.
 pub fn build(name: &str, overrides: &[(String, String)]) -> Theme {
     let mut t = ALL
@@ -275,6 +286,15 @@ pub fn build(name: &str, overrides: &[(String, String)]) -> Theme {
         }
     }
     t
+}
+
+/// Como `build`, mas com `no_color` ativo usa o tema `mono` (respeita `NO_COLOR`).
+pub fn build_with_no_color(name: &str, overrides: &[(String, String)], no_color: bool) -> Theme {
+    if no_color {
+        MONO
+    } else {
+        build(name, overrides)
+    }
 }
 
 /// Próximo tema da lista (tecla `t`).
@@ -294,7 +314,42 @@ pub fn parse_hex(s: &str) -> Option<Color> {
 }
 
 pub fn is_color_name(name: &str) -> bool {
-    slot(&mut DEFAULT.clone(), name).is_some()
+    matches!(
+        name,
+        "border"
+            | "title"
+            | "text"
+            | "label"
+            | "accent"
+            | "ok"
+            | "warn"
+            | "neutral"
+            | "fail"
+            | "selected"
+            | "dim"
+            | "net_send"
+            | "net_recv"
+            | "fps"
+            | "frametime"
+            | "frametime_spike"
+            | "fps_over"
+            | "fps_low"
+            | "encode"
+            | "decode"
+            | "ram_in_use"
+            | "ram_compressed"
+            | "ram_modified"
+            | "ram_standby"
+            | "game"
+            | "vram_app"
+            | "vram_compositor"
+            | "vram_browser"
+            | "vram_system"
+            | "vram_kernel"
+            | "low"
+            | "mid"
+            | "high"
+    )
 }
 
 fn slot<'a>(t: &'a mut Theme, name: &str) -> Option<&'a mut Color> {
@@ -320,6 +375,7 @@ fn slot<'a>(t: &'a mut Theme, name: &str) -> Option<&'a mut Color> {
         "encode" => &mut t.encode,
         "decode" => &mut t.decode,
         "ram_in_use" => &mut t.ram_in_use,
+        "ram_compressed" => &mut t.ram_compressed,
         "ram_modified" => &mut t.ram_modified,
         "ram_standby" => &mut t.ram_standby,
         "game" => &mut t.game,
@@ -374,5 +430,53 @@ mod tests {
             };
             assert!(r > 180 && g < 120 && b < 120, "{}", t.name);
         }
+        // `NO_COLOR` impõe paleta monocromática mesmo sobre tema colorido e overrides.
+        assert_eq!(
+            build_with_no_color("dracula", &[("border".into(), "#ff0000".into())], true),
+            MONO
+        );
+        assert_eq!(build_with_no_color("nord", &[], false), NORD);
+        // `is_color_name` coincide com `slot`.
+        let mut dummy = DEFAULT;
+        for name in [
+            "border",
+            "title",
+            "text",
+            "label",
+            "accent",
+            "ok",
+            "warn",
+            "neutral",
+            "fail",
+            "selected",
+            "dim",
+            "net_send",
+            "net_recv",
+            "fps",
+            "frametime",
+            "frametime_spike",
+            "fps_over",
+            "fps_low",
+            "encode",
+            "decode",
+            "ram_in_use",
+            "ram_compressed",
+            "ram_modified",
+            "ram_standby",
+            "game",
+            "vram_app",
+            "vram_compositor",
+            "vram_browser",
+            "vram_system",
+            "vram_kernel",
+            "low",
+            "mid",
+            "high",
+        ] {
+            assert!(is_color_name(name), "{name}");
+            assert!(slot(&mut dummy, name).is_some(), "{name}");
+        }
+        assert!(!is_color_name("desconhecida"));
+        assert!(slot(&mut dummy, "desconhecida").is_none());
     }
 }

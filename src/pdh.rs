@@ -6,15 +6,17 @@
 
 use std::cell::RefCell;
 
+#[cfg(test)]
+use windows::Win32::System::Performance::PdhGetFormattedCounterValue;
 use windows::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_COUNTER,
     PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_NO_OBJECT, PDH_CSTATUS_VALID_DATA, PDH_FMT,
     PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
     PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
-    PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
+    PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::win::wide;
 
@@ -37,20 +39,83 @@ pub fn status_text(code: u32) -> String {
     }
 }
 
-/// Erro transitório de cálculo diferencial do PDH (ajuste de relógio/NTP, delta negativo ou
-/// denominador zerado numa amostra isolada de `% Processor Time`, por exemplo).
-pub fn is_transient_calc(err: &str) -> bool {
-    matches!(
-        err,
-        "PDH negative denominator" | "PDH negative timebase" | "PDH negative value"
-    )
+/// Erro tipado do PDH: preserva o código numérico de status (quando veio da API) para distinguir
+/// falhas transitórias de cálculo diferencial sem comparar strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdhError {
+    pub code: Option<u32>,
+    pub message: String,
 }
 
-fn check(code: u32) -> Result<(), String> {
+impl PdhError {
+    pub fn from_code(code: u32) -> Self {
+        Self {
+            code: Some(code),
+            message: status_text(code),
+        }
+    }
+
+    pub fn other(msg: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: msg.into(),
+        }
+    }
+
+    /// Erro transitório de cálculo diferencial do PDH (ajuste de relógio/NTP, delta negativo ou
+    /// denominador zerado numa amostra isolada de `% Processor Time`, por exemplo).
+    pub fn is_transient_calc(&self) -> bool {
+        matches!(
+            self.code,
+            Some(
+                PDH_CALC_NEGATIVE_DENOMINATOR
+                    | PDH_CALC_NEGATIVE_TIMEBASE
+                    | PDH_CALC_NEGATIVE_VALUE
+            )
+        )
+    }
+
+    fn with_path(mut self, path: &str) -> Self {
+        self.message = format!("{} ({path})", self.message);
+        self
+    }
+}
+
+impl std::fmt::Display for PdhError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<PdhError> for String {
+    fn from(e: PdhError) -> Self {
+        e.message
+    }
+}
+
+fn check(code: u32) -> Result<(), PdhError> {
     if code == 0 {
         Ok(())
     } else {
-        Err(status_text(code))
+        Err(PdhError::from_code(code))
+    }
+}
+
+/// Decodifica uma string UTF-16 terminada em zero para `out`, reaproveitando a capacidade do
+/// buffer (zero alocações por instância nas iterações de arrays do PDH).
+///
+/// # Safety
+/// `p` deve ser nulo ou apontar para uma string UTF-16 válida terminada em zero dentro do buffer
+/// preenchido pelo PDH.
+unsafe fn decode_pcwstr_into(p: PWSTR, out: &mut String) {
+    out.clear();
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: pré-condição desta função; `as_wide` lê até o primeiro 0.
+    let wide = unsafe { p.as_wide() };
+    for ch in char::decode_utf16(wide.iter().copied()) {
+        out.push(ch.unwrap_or(char::REPLACEMENT_CHARACTER));
     }
 }
 
@@ -65,6 +130,8 @@ pub struct Query {
     /// Buffer das leituras de arrays, reaproveitado entre as coletas (cresce até o maior
     /// tamanho pedido; sem alocar a cada leitura).
     buf: RefCell<Vec<u64>>,
+    /// Buffer de texto reaproveitado para decodificar `szName` sem alocar `String` por item.
+    name_buf: RefCell<String>,
 }
 
 // SAFETY: os handles do PDH podem ser usados de outra thread, desde que não simultaneamente; a
@@ -78,7 +145,7 @@ pub struct Counter(u64, usize);
 static NEXT_QUERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Query {
-    pub fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, PdhError> {
         let mut h = PDH_HQUERY::default();
         // SAFETY: fonte nula = dados ao vivo; `h` recebe o handle.
         check(unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut h) })?;
@@ -87,33 +154,34 @@ impl Query {
             handle: h,
             counters: RefCell::new(Vec::new()),
             buf: RefCell::new(Vec::new()),
+            name_buf: RefCell::new(String::new()),
         })
     }
 
-    /// Adiciona um contador pelo caminho em inglês (ex.: `\Memory\Modified Page List Bytes`).
-    pub fn add(&self, path: &str) -> Result<Counter, String> {
+    /// Adiciona um contador pelo caminho em inglês (ex.: `\Processor Information(*)\% Processor Time`).
+    pub fn add(&self, path: &str) -> Result<Counter, PdhError> {
         let w = wide(path);
         let mut c = PDH_HCOUNTER::default();
         // SAFETY: consulta aberta; caminho terminado em zero; `c` recebe o handle.
         check(unsafe { PdhAddEnglishCounterW(self.handle, PCWSTR(w.as_ptr()), 0, &raw mut c) })
-            .map_err(|e| format!("{e} ({path})"))?;
+            .map_err(|e| e.with_path(path))?;
         let mut list = self.counters.borrow_mut();
         list.push(c);
         Ok(Counter(self.id, list.len() - 1))
     }
 
-    fn counter(&self, c: Counter) -> Result<PDH_HCOUNTER, String> {
+    fn counter(&self, c: Counter) -> Result<PDH_HCOUNTER, PdhError> {
         if c.0 != self.id {
-            return Err("PDH counter from another query".into());
+            return Err(PdhError::other("PDH counter from another query"));
         }
         self.counters
             .borrow()
             .get(c.1)
             .copied()
-            .ok_or_else(|| "PDH counter index out of range".into())
+            .ok_or_else(|| PdhError::other("PDH counter index out of range"))
     }
 
-    pub fn collect(&self) -> Result<(), String> {
+    pub fn collect(&self) -> Result<(), PdhError> {
         // SAFETY: consulta aberta.
         check(unsafe { PdhCollectQueryData(self.handle) })
     }
@@ -128,7 +196,8 @@ impl Drop for Query {
 
 impl Query {
     /// Valor de um contador de instância única.
-    pub fn value(&self, c: Counter) -> Result<f64, String> {
+    #[cfg(test)]
+    pub fn value(&self, c: Counter) -> Result<f64, PdhError> {
         let h = self.counter(c)?;
         let mut v = PDH_FMT_COUNTERVALUE::default();
         // SAFETY: contador de uma consulta aberta; `v` local.
@@ -138,17 +207,31 @@ impl Query {
 
     /// Valores de um contador com curinga (`(*)`): `(instância, valor)`, na ordem do PDH.
     /// Instâncias sem dado válido nesta coleta ficam de fora.
-    pub fn array(&self, c: Counter) -> Result<Vec<(String, f64)>, String> {
-        self.array_with(c, false)
+    #[cfg(test)]
+    pub fn array(&self, c: Counter) -> Result<Vec<(String, f64)>, PdhError> {
+        let mut out = Vec::new();
+        self.for_each_array(c, |name, v| out.push((name.to_string(), v)))?;
+        Ok(out)
     }
 
-    /// Como `array`, mas instâncias sem dado válido nesta coleta vêm com NaN (a lista mantém
-    /// as mesmas instâncias a cada coleta: quem indexa por posição não perde o alinhamento).
-    pub fn array_all(&self, c: Counter) -> Result<Vec<(String, f64)>, String> {
-        self.array_with(c, true)
+    /// Percorre as instâncias válidas de um contador com curinga (`(*)`) sem alocar `String`
+    /// por item (reaproveita um buffer UTF-8 interno).
+    pub fn for_each_array(&self, c: Counter, f: impl FnMut(&str, f64)) -> Result<(), PdhError> {
+        self.for_each_array_with(c, false, f)
     }
 
-    fn array_with(&self, c: Counter, keep_invalid: bool) -> Result<Vec<(String, f64)>, String> {
+    /// Como `for_each_array`, mas instâncias sem dado válido nesta coleta chegam com `f64::NAN`
+    /// (preserva o alinhamento posicional de todas as instâncias).
+    pub fn for_each_array_all(&self, c: Counter, f: impl FnMut(&str, f64)) -> Result<(), PdhError> {
+        self.for_each_array_with(c, true, f)
+    }
+
+    fn for_each_array_with(
+        &self,
+        c: Counter,
+        keep_invalid: bool,
+        mut f: impl FnMut(&str, f64),
+    ) -> Result<(), PdhError> {
         let h = self.counter(c)?;
         let mut size = 0u32;
         let mut count = 0u32;
@@ -157,7 +240,7 @@ impl Query {
             unsafe { PdhGetFormattedCounterArrayW(h, FMT, &raw mut size, &raw mut count, None) };
         if r != PDH_MORE_DATA {
             check(r)?;
-            return Ok(Vec::new());
+            return Ok(());
         }
         // Buffer alinhado a 8 (os itens têm ponteiro e f64); os nomes ficam no mesmo buffer.
         let mut buf = self.buf.borrow_mut();
@@ -173,65 +256,90 @@ impl Query {
         })?;
         let fits = words * 8 / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         let n = (count as usize).min(fits);
-        let mut out = Vec::with_capacity(n);
+        let mut name = self.name_buf.borrow_mut();
+        let mut any_valid = false;
         let mut first_err = None;
         for i in 0..n {
             // SAFETY: `i < count` itens escritos pelo PDH, dentro do buffer (`fits`).
             let item = unsafe { &*items.add(i) };
-            // SAFETY: o PDH aponta o nome para uma string terminada em zero dentro do buffer.
-            let name = unsafe { item.szName.to_string() }.unwrap_or_default();
             match valid(&item.FmtValue) {
-                Ok(v) => out.push((name, v)),
+                Ok(v) => {
+                    any_valid = true;
+                    // SAFETY: `szName` aponta para UTF-16 terminado em zero dentro de `buf`.
+                    unsafe { decode_pcwstr_into(item.szName, &mut name) };
+                    f(&name, v);
+                }
                 Err(e) => {
                     first_err.get_or_insert(e);
                     if keep_invalid {
-                        out.push((name, f64::NAN));
+                        // SAFETY: `szName` aponta para UTF-16 terminado em zero dentro de `buf`.
+                        unsafe { decode_pcwstr_into(item.szName, &mut name) };
+                        f(&name, f64::NAN);
                     }
                 }
             }
         }
         // Instâncias existem, mas nenhuma com dado válido (ex.: reset do driver): o status real,
         // não uma lista vazia que pareceria "nenhuma instância".
-        let any_valid = out.iter().any(|(_, v)| !v.is_nan());
         match first_err {
             Some(e) if !any_valid => Err(e),
-            _ => Ok(out),
+            _ => Ok(()),
         }
     }
 }
 
-fn valid(v: &PDH_FMT_COUNTERVALUE) -> Result<f64, String> {
+fn valid(v: &PDH_FMT_COUNTERVALUE) -> Result<f64, PdhError> {
     if v.CStatus != PDH_CSTATUS_VALID_DATA && v.CStatus != PDH_CSTATUS_NEW_DATA {
-        return Err(status_text(v.CStatus));
+        return Err(PdhError::from_code(v.CStatus));
     }
     // SAFETY: formato pedido = PDH_FMT_DOUBLE.
     let d = unsafe { v.Anonymous.doubleValue };
     if d.is_finite() {
         Ok(d)
     } else {
-        Err("PDH returned a non-finite value".into())
+        Err(PdhError::other("PDH returned a non-finite value"))
     }
 }
 
 /// Contador opcional: guarda o erro de `add` para mostrar como causa.
-pub type Slot = Result<Counter, String>;
+pub type Slot = Result<Counter, PdhError>;
 
 /// Lê um contador simples guardado em `Slot`.
-pub fn read(q: &Result<Query, String>, slot: &Slot) -> Result<f64, String> {
+#[cfg(test)]
+pub fn read(q: &Result<Query, PdhError>, slot: &Slot) -> Result<f64, PdhError> {
     q.as_ref().map_err(Clone::clone)?.value(slot.clone()?)
 }
 
 /// Lê um contador com curinga guardado em `Slot`.
-pub fn read_array(q: &Result<Query, String>, slot: &Slot) -> Result<Vec<(String, f64)>, String> {
+#[cfg(test)]
+pub fn read_array(
+    q: &Result<Query, PdhError>,
+    slot: &Slot,
+) -> Result<Vec<(String, f64)>, PdhError> {
     q.as_ref().map_err(Clone::clone)?.array(slot.clone()?)
 }
 
-/// `Query::array_all` (instâncias sem dado válido com NaN).
-pub fn read_array_all(
-    q: &Result<Query, String>,
+/// Percorre as instâncias válidas de um contador com curinga guardado em `Slot` sem alocar
+/// `String` por item.
+pub fn for_each_array(
+    q: &Result<Query, PdhError>,
     slot: &Slot,
-) -> Result<Vec<(String, f64)>, String> {
-    q.as_ref().map_err(Clone::clone)?.array_all(slot.clone()?)
+    f: impl FnMut(&str, f64),
+) -> Result<(), PdhError> {
+    q.as_ref()
+        .map_err(Clone::clone)?
+        .for_each_array(slot.clone()?, f)
+}
+
+/// Como `for_each_array`, entregando `f64::NAN` para instâncias sem dado válido.
+pub fn for_each_array_all(
+    q: &Result<Query, PdhError>,
+    slot: &Slot,
+    f: impl FnMut(&str, f64),
+) -> Result<(), PdhError> {
+    q.as_ref()
+        .map_err(Clone::clone)?
+        .for_each_array_all(slot.clone()?, f)
 }
 
 #[cfg(test)]
@@ -256,6 +364,14 @@ mod tests {
         assert!(other.value(total.expect("contador")).is_err());
         let a = read_array(&q, &per).expect("valores por processador");
         assert!(a.iter().any(|(n, _)| n == "_Total"), "{a:?}");
+        let mut saw_total = false;
+        for_each_array(&q, &per, |name, _| {
+            if name == "_Total" {
+                saw_total = true;
+            }
+        })
+        .expect("for_each_array");
+        assert!(saw_total);
     }
 
     #[test]
@@ -265,10 +381,11 @@ mod tests {
             PDH_CALC_NEGATIVE_TIMEBASE,
             PDH_CALC_NEGATIVE_VALUE,
         ] {
-            let msg = status_text(code);
-            assert!(is_transient_calc(&msg), "{code:#X} -> {msg}");
+            let e = PdhError::from_code(code);
+            assert!(e.is_transient_calc(), "{code:#X} -> {e}");
         }
-        assert!(!is_transient_calc(&status_text(PDH_CSTATUS_NO_OBJECT)));
-        assert!(!is_transient_calc(&status_text(PDH_NO_DATA)));
+        assert!(!PdhError::from_code(PDH_CSTATUS_NO_OBJECT).is_transient_calc());
+        assert!(!PdhError::from_code(PDH_NO_DATA).is_transient_calc());
+        assert!(!PdhError::other("PDH negative denominator").is_transient_calc());
     }
 }

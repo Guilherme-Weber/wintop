@@ -122,6 +122,65 @@ pub(super) fn parse(b: &[u8], base: usize) -> Result<Vec<Raw>, String> {
     }
 }
 
+/// Percorre `SYSTEM_PROCESS_INFORMATION` procurando apenas o working set privado de `target_pid`
+/// (sem alocar `String` nem decodificar nomes UTF-16 dos demais processos).
+fn find_private_ws(b: &[u8], target_pid: u32) -> Result<Option<u64>, String> {
+    let oob = || "process list read out of bounds".to_string();
+    let mut off = 0usize;
+    loop {
+        let end = off.checked_add(ENTRY).ok_or_else(oob)?;
+        let e = b.get(off..end).ok_or_else(oob)?;
+        let pid = u64_at(e, PID).ok_or_else(oob)? as u32;
+        if pid == target_pid {
+            return Ok(Some(u64_at(e, WS_PRIVATE).ok_or_else(oob)?));
+        }
+        let next = u32_at(e, NEXT).ok_or_else(oob)? as usize;
+        if next == 0 {
+            return Ok(None);
+        }
+        if next < ENTRY {
+            return Err(format!("process entry of {next} bytes is too small"));
+        }
+        off = off.checked_add(next).ok_or_else(oob)?;
+    }
+}
+
+/// Executa `NtQuerySystemInformation(SystemProcessInformation)` reaproveitando `buf` e retorna a
+/// fatia de bytes válida.
+fn query_raw_buf(buf: &mut Vec<u64>) -> Result<&[u8], String> {
+    if buf.is_empty() {
+        *buf = vec![0; (512 << 10) / 8];
+    }
+    loop {
+        let bytes = buf.len() * 8;
+        let mut need = 0u32;
+        // SAFETY: buffer próprio de `bytes` bytes; `need` local.
+        let st = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buf.as_mut_ptr().cast(),
+                bytes as u32,
+                &raw mut need,
+            )
+        };
+        if st == STATUS_INFO_LENGTH_MISMATCH {
+            // Folga para processos que surgem entre as duas chamadas.
+            let want = (need as usize).max(bytes) + (64 << 10);
+            if want > MAX_BUF {
+                return Err(format!("process list needs {want} bytes"));
+            }
+            *buf = vec![0; want.div_ceil(8)];
+            continue;
+        }
+        if st.is_err() {
+            return Err(format!("NtQuerySystemInformation: 0x{:08X}", st.0));
+        }
+        let len = (need as usize).min(bytes);
+        // SAFETY: `len` <= tamanho do buffer; u64 -> u8 sem requisito de alinhamento.
+        return Ok(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) });
+    }
+}
+
 /// Um processo da lista atual (sem abrir o processo).
 fn raw_of(pid: u32) -> Result<Option<Raw>, String> {
     let mut c = ProcCollector::new();
@@ -155,7 +214,8 @@ const CRITICAL: [&str; 8] = [
 /// o mesmo processo (nome e instante de criação: o PID pode ter sido reaproveitado), e recusa
 /// os críticos do sistema, o Idle/System e o próprio wintop. Abre só com `PROCESS_TERMINATE`.
 pub fn end_process(pid: u32, name: &str, create: u64) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
     if pid <= 4 || CRITICAL.contains(&name.to_ascii_lowercase().as_str()) {
         return Err(format!("{name} is a critical system process (not ended)"));
@@ -168,24 +228,28 @@ pub fn end_process(pid: u32, name: &str, create: u64) -> Result<(), String> {
         Some(_) => return Err(format!("PID {pid} is now another process (not ended)")),
         None => return Err(format!("{name} (PID {pid}) already exited")),
     }
-    // SAFETY: PID numérico; o handle é fechado logo abaixo.
+    // SAFETY: PID numérico; o handle passa a ter dono (`own`) logo abaixo.
     let h = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
         .map_err(|e| format!("open {name} (PID {pid}): {e}"))?;
+    // SAFETY: OpenProcess teve sucesso; handle válido e sem outro dono.
+    let h = unsafe { crate::win::own(h) };
     // SAFETY: handle com PROCESS_TERMINATE aberto acima.
-    let r = unsafe { TerminateProcess(h, 1) };
-    // SAFETY: handle aberto acima, fechado uma vez.
-    unsafe {
-        let _ = CloseHandle(h);
-    }
-    r.map_err(|e| format!("end {name} (PID {pid}): {e}"))
+    unsafe { TerminateProcess(HANDLE(h.as_raw_handle()), 1) }
+        .map_err(|e| format!("end {name} (PID {pid}): {e}"))
 }
 
-/// Working set privado do processo `pid` (o do próprio wintop no Windows 10, onde o
-/// `PROCESS_MEMORY_COUNTERS_EX2` não existe).
+/// Working set privado do processo `pid` reaproveitando `buf` (sem alocar nomes de todos os
+/// processos; usado pelo `OwnCollector` no Windows 10, onde `PROCESS_MEMORY_COUNTERS_EX2` não
+/// existe).
+pub(super) fn private_ws_in_buf(buf: &mut Vec<u64>, pid: u32) -> Result<u64, String> {
+    let b = query_raw_buf(buf)?;
+    find_private_ws(b, pid)?.ok_or_else(|| format!("process {pid} not in the process list"))
+}
+
+#[cfg(test)]
 pub(super) fn private_ws_of(pid: u32) -> Result<u64, String> {
-    raw_of(pid)?
-        .map(|r| r.mem)
-        .ok_or_else(|| format!("process {pid} not in the process list"))
+    let mut buf = Vec::new();
+    private_ws_in_buf(&mut buf, pid)
 }
 
 fn system_time() -> Result<u64, String> {
@@ -242,49 +306,17 @@ impl ProcCollector {
         }
     }
 
-    /// Working set privado de `pid` reaproveitando o buffer (sem abrir o processo: seguro para
-    /// anticheat). Usado na aba Geral para mostrar a RAM do jogo na barra da memória.
+    /// Working set privado de `pid` reaproveitando o buffer (sem abrir o processo nem alocar
+    /// nomes de todos os processos: seguro para anticheat). Usado na aba Geral para mostrar a RAM
+    /// do jogo na barra da memória.
     pub(super) fn private_ws_cached(&mut self, pid: u32) -> Option<u64> {
-        self.query()
-            .ok()?
-            .into_iter()
-            .find(|r| r.pid == pid)
-            .map(|r| r.mem)
+        let b = query_raw_buf(&mut self.buf).ok()?;
+        find_private_ws(b, pid).ok()?
     }
 
     fn query(&mut self) -> Result<Vec<Raw>, String> {
-        if self.buf.is_empty() {
-            self.buf = vec![0; (512 << 10) / 8];
-        }
-        loop {
-            let bytes = self.buf.len() * 8;
-            let mut need = 0u32;
-            // SAFETY: buffer próprio de `bytes` bytes; `need` local.
-            let st = unsafe {
-                NtQuerySystemInformation(
-                    SystemProcessInformation,
-                    self.buf.as_mut_ptr().cast(),
-                    bytes as u32,
-                    &raw mut need,
-                )
-            };
-            if st == STATUS_INFO_LENGTH_MISMATCH {
-                // Folga para processos que surgem entre as duas chamadas.
-                let want = (need as usize).max(bytes) + (64 << 10);
-                if want > MAX_BUF {
-                    return Err(format!("process list needs {want} bytes"));
-                }
-                self.buf = vec![0; want.div_ceil(8)];
-                continue;
-            }
-            if st.is_err() {
-                return Err(format!("NtQuerySystemInformation: 0x{:08X}", st.0));
-            }
-            let len = (need as usize).min(bytes);
-            // SAFETY: `len` <= tamanho do buffer; u64 -> u8 sem requisito de alinhamento.
-            let b = unsafe { std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), len) };
-            return parse(b, self.buf.as_ptr() as usize);
-        }
+        let b = query_raw_buf(&mut self.buf)?;
+        parse(b, b.as_ptr() as usize)
     }
 
     pub(super) fn read(&mut self) -> Metric<Vec<Proc>> {

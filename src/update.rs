@@ -75,16 +75,6 @@ pub fn mode() -> Mode {
     }
 }
 
-/// Exe que a cópia em uso executa (para reabrir depois da atualização).
-pub fn exe_of(mode: &Mode) -> Option<PathBuf> {
-    match mode {
-        Mode::Installed => crate::install::install_dir()
-            .ok()
-            .map(|d| d.join("wintop.exe")),
-        Mode::Portable(d) | Mode::Undecided(d) => Some(d.join("wintop.exe")),
-    }
-}
-
 /// (maior, menor, correção) de "x.y.z".
 fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     let mut it = s.split('.');
@@ -150,27 +140,33 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let agent = wide(concat!("wintop/", env!("CARGO_PKG_VERSION")));
     let (h, p, get) = (wide(host), wide(path), wide("GET"));
-    // SAFETY: strings terminadas em zero vivas durante as chamadas; cada handle tem dono (Hi).
-    unsafe {
-        let session = Hi(WinHttpOpen(
+
+    // SAFETY: string UTF-16 terminada em zero; handle entregue ao `Hi` logo abaixo.
+    let session = Hi(unsafe {
+        WinHttpOpen(
             PCWSTR(agent.as_ptr()),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),
             0,
+        )
+    });
+    if session.0.is_null() {
+        return Err(format!(
+            "WinHttpOpen: {}",
+            windows::core::Error::from_thread()
         ));
-        if session.0.is_null() {
-            return Err(format!(
-                "WinHttpOpen: {}",
-                windows::core::Error::from_thread()
-            ));
-        }
-        WinHttpSetTimeouts(session.0, ms, ms, ms, ms).map_err(|e| e.to_string())?;
-        let conn = Hi(WinHttpConnect(session.0, PCWSTR(h.as_ptr()), 443, 0));
-        if conn.0.is_null() {
-            return Err(format!("{host}: {}", windows::core::Error::from_thread()));
-        }
-        let req = Hi(WinHttpOpenRequest(
+    }
+    // SAFETY: `session` é um handle WinHTTP válido.
+    unsafe { WinHttpSetTimeouts(session.0, ms, ms, ms, ms) }.map_err(|e| e.to_string())?;
+    // SAFETY: `session` válido e `host` terminado em zero; handle entregue ao `Hi`.
+    let conn = Hi(unsafe { WinHttpConnect(session.0, PCWSTR(h.as_ptr()), 443, 0) });
+    if conn.0.is_null() {
+        return Err(format!("{host}: {}", windows::core::Error::from_thread()));
+    }
+    // SAFETY: `conn` válido e strings UTF-16 terminadas em zero; handle entregue ao `Hi`.
+    let req = Hi(unsafe {
+        WinHttpOpenRequest(
             conn.0,
             PCWSTR(get.as_ptr()),
             PCWSTR(p.as_ptr()),
@@ -178,18 +174,27 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
             PCWSTR::null(),
             std::ptr::null(),
             WINHTTP_FLAG_SECURE,
-        ));
-        if req.0.is_null() {
-            return Err(format!("{url}: {}", windows::core::Error::from_thread()));
-        }
-        // Redirecionamentos seguidos à mão (só para HTTPS, com limite).
-        let off = WINHTTP_DISABLE_REDIRECTS.to_le_bytes();
-        WinHttpSetOption(Some(req.0), WINHTTP_OPTION_DISABLE_FEATURE, Some(&off))
-            .map_err(|e| e.to_string())?;
-        WinHttpSendRequest(req.0, None, None, 0, 0, 0).map_err(|e| format!("{host}: {e}"))?;
-        WinHttpReceiveResponse(req.0, std::ptr::null_mut()).map_err(|e| format!("{host}: {e}"))?;
-        let mut status = 0u32;
-        let mut len = 4u32;
+        )
+    });
+    if req.0.is_null() {
+        return Err(format!("{url}: {}", windows::core::Error::from_thread()));
+    }
+    // Redirecionamentos seguidos à mão (só para HTTPS, com limite).
+    let off = WINHTTP_DISABLE_REDIRECTS.to_le_bytes();
+    // SAFETY: `req` válido e slice `off` com tamanho de um u32.
+    unsafe { WinHttpSetOption(Some(req.0), WINHTTP_OPTION_DISABLE_FEATURE, Some(&off)) }
+        .map_err(|e| e.to_string())?;
+    // SAFETY: `req` válido, sem cabeçalhos extras nem corpo.
+    unsafe { WinHttpSendRequest(req.0, None, None, 0, 0, 0) }
+        .map_err(|e| format!("{host}: {e}"))?;
+    // SAFETY: `req` já enviado.
+    unsafe { WinHttpReceiveResponse(req.0, std::ptr::null_mut()) }
+        .map_err(|e| format!("{host}: {e}"))?;
+
+    let mut status = 0u32;
+    let mut len = 4u32;
+    // SAFETY: `req` com resposta pronta; buffer local de 4 bytes para `WINHTTP_QUERY_FLAG_NUMBER`.
+    unsafe {
         WinHttpQueryHeaders(
             req.0,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -198,12 +203,16 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
             &raw mut len,
             std::ptr::null_mut(),
         )
-        .map_err(|e| e.to_string())?;
-        let mut location = None;
-        if (300..400).contains(&status) {
-            let mut buf = vec![0u16; 2048];
-            let mut bytes = (buf.len() * 2) as u32;
-            if WinHttpQueryHeaders(
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut location = None;
+    if (300..400).contains(&status) {
+        let mut buf = vec![0u16; 2048];
+        let mut bytes = (buf.len() * 2) as u32;
+        // SAFETY: `req` válido; buffer local com tamanho em bytes informado.
+        if unsafe {
+            WinHttpQueryHeaders(
                 req.0,
                 WINHTTP_QUERY_LOCATION,
                 PCWSTR::null(),
@@ -211,49 +220,54 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
                 &raw mut bytes,
                 std::ptr::null_mut(),
             )
-            .is_ok()
-            {
-                location = Some(String::from_utf16_lossy(&buf[..bytes as usize / 2]));
-            }
-            return Ok(Response {
-                status,
-                location,
-                body: Vec::new(),
-            });
         }
-        // Erro (404 de um `.sig` ausente, 5xx): o corpo não interessa nem é baixado.
-        if status != 200 {
-            return Ok(Response {
-                status,
-                location: None,
-                body: Vec::new(),
-            });
+        .is_ok()
+        {
+            location = Some(String::from_utf16_lossy(
+                &buf[..(bytes as usize / 2).min(buf.len())],
+            ));
         }
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; 64 << 10];
-        loop {
-            let mut read = 0u32;
+        return Ok(Response {
+            status,
+            location,
+            body: Vec::new(),
+        });
+    }
+    // Erro (404 de um `.sig` ausente, 5xx): o corpo não interessa nem é baixado.
+    if status != 200 {
+        return Ok(Response {
+            status,
+            location: None,
+            body: Vec::new(),
+        });
+    }
+    let mut body = Vec::new();
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
+        let mut read = 0u32;
+        // SAFETY: `req` válido e buffer local com tamanho informado.
+        unsafe {
             WinHttpReadData(
                 req.0,
                 chunk.as_mut_ptr().cast(),
                 chunk.len() as u32,
                 &raw mut read,
             )
-            .map_err(|e| format!("{host}: {e}"))?;
-            if read == 0 {
-                break;
-            }
-            if body.len() + read as usize > max {
-                return Err(format!("{url}: larger than {max} bytes"));
-            }
-            body.extend_from_slice(&chunk[..read as usize]);
         }
-        Ok(Response {
-            status,
-            location,
-            body,
-        })
+        .map_err(|e| format!("{host}: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        if body.len().saturating_add(read as usize) > max {
+            return Err(format!("{url}: larger than {max} bytes"));
+        }
+        body.extend_from_slice(&chunk[..read as usize]);
     }
+    Ok(Response {
+        status,
+        location,
+        body,
+    })
 }
 
 /// GET seguindo até 5 redirecionamentos HTTPS; só 200 é sucesso.
@@ -336,11 +350,15 @@ pub fn verify(data: &[u8], sig: &[u8], key: &[u8; 32]) -> Result<(), String> {
 }
 
 fn u16_at(b: &[u8], i: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(i..i + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        b.get(i..i.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 
 fn u32_at(b: &[u8], i: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        b.get(i..i.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 /// Entrada do diretório central do zip: (nome, método, tamanho comprimido, tamanho final,
@@ -358,21 +376,23 @@ fn zip_entries(z: &[u8]) -> Result<Vec<Entry>, String> {
         .rev()
         .find(|&i| u32_at(z, i) == Some(EOCD))
         .ok_or_else(bad)?;
-    let count = u16_at(z, eocd + 10).ok_or_else(bad)? as usize;
-    let mut pos = u32_at(z, eocd + 16).ok_or_else(bad)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let count = u16_at(z, eocd.checked_add(10).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+    let mut pos = u32_at(z, eocd.checked_add(16).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+    let mut out = Vec::with_capacity(count.min(256));
     for _ in 0..count {
         if u32_at(z, pos) != Some(CEN) {
             return Err(bad());
         }
-        let method = u16_at(z, pos + 10).ok_or_else(bad)?;
-        let csize = u32_at(z, pos + 20).ok_or_else(bad)? as usize;
-        let usize_ = u32_at(z, pos + 24).ok_or_else(bad)? as usize;
-        let nlen = u16_at(z, pos + 28).ok_or_else(bad)? as usize;
-        let elen = u16_at(z, pos + 30).ok_or_else(bad)? as usize;
-        let clen = u16_at(z, pos + 32).ok_or_else(bad)? as usize;
-        let local = u32_at(z, pos + 42).ok_or_else(bad)? as usize;
-        let name = z.get(pos + 46..pos + 46 + nlen).ok_or_else(bad)?;
+        let method = u16_at(z, pos.checked_add(10).ok_or_else(bad)?).ok_or_else(bad)?;
+        let csize = u32_at(z, pos.checked_add(20).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let usize_ = u32_at(z, pos.checked_add(24).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let nlen = u16_at(z, pos.checked_add(28).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let elen = u16_at(z, pos.checked_add(30).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let clen = u16_at(z, pos.checked_add(32).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let local = u32_at(z, pos.checked_add(42).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+        let name_start = pos.checked_add(46).ok_or_else(bad)?;
+        let name_end = name_start.checked_add(nlen).ok_or_else(bad)?;
+        let name = z.get(name_start..name_end).ok_or_else(bad)?;
         out.push((
             String::from_utf8_lossy(name).into_owned(),
             method,
@@ -380,7 +400,10 @@ fn zip_entries(z: &[u8]) -> Result<Vec<Entry>, String> {
             usize_,
             local,
         ));
-        pos = pos + 46 + nlen + elen + clen;
+        pos = name_end
+            .checked_add(elen)
+            .and_then(|p| p.checked_add(clen))
+            .ok_or_else(bad)?;
     }
     Ok(out)
 }
@@ -398,10 +421,15 @@ fn zip_read(
     if u32_at(z, local) != Some(LOC) || size > MAX_ZIP {
         return Err(bad());
     }
-    let nlen = u16_at(z, local + 26).ok_or_else(bad)? as usize;
-    let elen = u16_at(z, local + 28).ok_or_else(bad)? as usize;
-    let start = local + 30 + nlen + elen;
-    let data = z.get(start..start + csize).ok_or_else(bad)?;
+    let nlen = u16_at(z, local.checked_add(26).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+    let elen = u16_at(z, local.checked_add(28).ok_or_else(bad)?).ok_or_else(bad)? as usize;
+    let start = local
+        .checked_add(30)
+        .and_then(|p| p.checked_add(nlen))
+        .and_then(|p| p.checked_add(elen))
+        .ok_or_else(bad)?;
+    let end = start.checked_add(csize).ok_or_else(bad)?;
+    let data = z.get(start..end).ok_or_else(bad)?;
     let out = match method {
         0 => data.to_vec(),
         8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, size).map_err(|_| bad())?,
@@ -452,15 +480,42 @@ pub fn download(version: &str) -> Result<Package, String> {
     unpack(&zip, version)
 }
 
-/// Pasta portátil e o exe novo travados entre a troca e o reinício (`relaunch`): a pasta é do
-/// usuário, e sem a trava um processo sem elevação trocaria o exe que o wintop elevado reabre.
-static HELD: std::sync::Mutex<Option<(crate::userfile::UserDir, crate::userfile::Held)>> =
-    std::sync::Mutex::new(None);
+/// Atualização aplicada no disco, pronta para reabrir a versão nova.
+///
+/// Na cópia portátil, mantém a pasta e o exe travados (sem escrita nem rename por processos sem
+/// elevação) até `relaunch` abrir o processo filho.
+pub struct PendingRestart {
+    exe: PathBuf,
+    _held: Option<(crate::userfile::UserDir, crate::userfile::Held)>,
+}
+
+impl std::fmt::Debug for PendingRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRestart")
+            .field("exe", &self.exe)
+            .field("held", &self._held.is_some())
+            .finish()
+    }
+}
+
+impl PendingRestart {
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
+
+    /// Reabre a versão nova no mesmo console e espera por ela. Na cópia portátil o exe segue
+    /// travado (e conferido) até o processo filho existir.
+    pub fn relaunch(self) -> std::io::Result<std::process::ExitStatus> {
+        let child = std::process::Command::new(&self.exe).spawn();
+        drop(self._held);
+        child?.wait()
+    }
+}
 
 /// Troca a cópia portátil em `dir` (pasta do usuário: tudo pelo `userfile`, sem seguir links).
 /// O exe novo é gravado inteiro como `.new` antes de mexer no atual: a pasta nunca fica sem
 /// `wintop.exe` além do instante entre os dois renames.
-fn apply_portable(dir: &Path, pkg: &Package) -> Result<(), String> {
+fn apply_portable(dir: &Path, pkg: &Package) -> Result<PendingRestart, String> {
     let d = crate::userfile::UserDir::open_exe_dir(dir)?;
     if !pkg.modules.is_empty() {
         let m = d
@@ -471,26 +526,26 @@ fn apply_portable(dir: &Path, pkg: &Package) -> Result<(), String> {
         }
     }
     d.write_bytes("wintop.exe.new", &pkg.exe)?;
-    let r = (|| {
-        free_old(&d)?;
-        d.rename("wintop.exe", "wintop.exe.old")?;
-        if let Err(e) = d.rename("wintop.exe.new", "wintop.exe") {
+    crate::install::swap_exe(
+        || free_old(&d),
+        || d.rename("wintop.exe", "wintop.exe.old").map(|_| ()),
+        || d.rename("wintop.exe.new", "wintop.exe").map(|_| ()),
+        || {
             let _ = d.rename("wintop.exe.old", "wintop.exe");
-            return Err(e);
-        }
-        Ok(())
-    })();
-    if let Err(e) = r {
-        let _ = d.remove("wintop.exe.new");
-        return Err(e);
-    }
-    // Apagado se ninguém o usa (o exe em execução fica até a próxima abertura).
-    let _ = d.remove("wintop.exe.old");
+        },
+        || {
+            let _ = d.remove("wintop.exe.new");
+        },
+        || {
+            // Apagado se ninguém o usa (o exe em execução fica até a próxima abertura).
+            let _ = d.remove("wintop.exe.old");
+        },
+    )?;
     let held = d.hold("wintop.exe", &pkg.exe)?;
-    *HELD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((d, held));
-    Ok(())
+    Ok(PendingRestart {
+        exe: dir.join("wintop.exe"),
+        _held: Some((d, held)),
+    })
 }
 
 /// Tira o `wintop.exe.old` do caminho (ver `install::free_old`): apagado, ou renomeado para um
@@ -499,14 +554,8 @@ fn free_old(d: &crate::userfile::UserDir) -> Result<(), String> {
     if d.remove("wintop.exe.old").is_ok() {
         return Ok(());
     }
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |t| t.as_nanos());
-    d.rename(
-        "wintop.exe.old",
-        &format!("wintop.exe.{}.{n}.old", std::process::id()),
-    )
-    .map(|_| ())
+    d.rename("wintop.exe.old", &crate::install::unique_old_name())
+        .map(|_| ())
 }
 
 /// Na partida: apaga (melhor esforço) as sobras `.old` de trocas anteriores que ninguém usa.
@@ -534,27 +583,21 @@ pub fn remove_stale_old(mode: &Mode) {
     }
 }
 
-/// Reabre a versão nova no mesmo console e espera por ela. Na cópia portátil o exe segue
-/// travado (e conferido) até o processo filho existir.
-pub fn relaunch(exe: &Path) -> std::io::Result<std::process::ExitStatus> {
-    let child = std::process::Command::new(exe).spawn();
-    HELD.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    child?.wait()
-}
-
 /// Baixa, confere e aplica `version` na cópia em uso.
-pub fn apply(version: &str, mode: &Mode) -> Result<(), String> {
+pub fn apply(version: &str, mode: &Mode) -> Result<PendingRestart, String> {
     let pkg = download(version)?;
     match mode {
-        Mode::Installed => crate::install::update_installed(&pkg.exe, &pkg.modules),
+        Mode::Installed => {
+            crate::install::update_installed(&pkg.exe, &pkg.modules)?;
+            let exe = crate::install::install_dir()?.join("wintop.exe");
+            Ok(PendingRestart { exe, _held: None })
+        }
         Mode::Portable(d) | Mode::Undecided(d) => apply_portable(d, &pkg),
     }
 }
 
 /// `apply` numa thread (a TUI segue desenhando).
-pub fn spawn_apply(version: String, mode: Mode) -> mpsc::Receiver<Result<(), String>> {
+pub fn spawn_apply(version: String, mode: Mode) -> mpsc::Receiver<Result<PendingRestart, String>> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("wintop-update".into())
@@ -776,12 +819,12 @@ mod tests {
             exe: b"MZnew".to_vec(),
             modules: vec![("AMDFamily17.bin".into(), b"mod".to_vec())],
         };
-        let release = || HELD.lock().unwrap().take();
         let r = apply_portable(&dir, &pkg);
         if r.is_err() {
             let _ = child.kill();
         }
-        r.unwrap();
+        let pending = r.unwrap();
+        assert_eq!(pending.exe(), dir.join("wintop.exe"));
         assert_eq!(std::fs::read(dir.join("wintop.exe")).unwrap(), b"MZnew");
         assert!(dir.join("wintop.exe.old").is_file());
         assert_eq!(
@@ -796,17 +839,16 @@ mod tests {
                 .is_err()
         );
         assert!(std::fs::rename(dir.join("wintop.exe"), dir.join("x.exe")).is_err());
-        release();
+        drop(pending);
         // Segunda troca com o .old ainda em execução.
         let pkg2 = Package {
             exe: b"MZnew2".to_vec(),
             modules: Vec::new(),
         };
         let r = apply_portable(&dir, &pkg2);
-        release();
         let _ = child.kill();
         let _ = child.wait();
-        r.unwrap();
+        drop(r.unwrap());
         assert_eq!(std::fs::read(dir.join("wintop.exe")).unwrap(), b"MZnew2");
         let names = || -> Vec<String> {
             std::fs::read_dir(&dir)

@@ -170,8 +170,8 @@ impl DiskTempCollector {
         let mut inv = Vec::with_capacity(self.disks.len());
         let mut states = Vec::with_capacity(self.disks.len());
         for (d, st) in self.disks.drain(..) {
-            if !d.lost {
-                states.push((d.number, st));
+            if !d.is_lost() {
+                states.push((d.number(), st));
             }
             inv.push(d);
         }
@@ -181,7 +181,7 @@ impl DiskTempCollector {
             .map(|d| {
                 let st = states
                     .iter()
-                    .position(|(n, _)| *n == d.number)
+                    .position(|(n, _)| *n == d.number())
                     .map_or_else(State::new, |i| states.swap_remove(i).1);
                 (d, st)
             })
@@ -189,7 +189,7 @@ impl DiskTempCollector {
     }
 
     pub fn read(&mut self, stop: &AtomicBool) -> Metric<Vec<DiskTemp>> {
-        if self.discovered.elapsed() >= REDISCOVER || self.disks.iter().any(|(d, _)| d.lost) {
+        if self.discovered.elapsed() >= REDISCOVER || self.disks.iter().any(|(d, _)| d.is_lost()) {
             self.rediscover();
         }
         if self.disks.is_empty() {
@@ -205,47 +205,42 @@ impl DiskTempCollector {
                 continue;
             }
             st.last = Some(now);
-            if d.bus == Ok(Bus::Spaces) {
+            if d.bus() == Some(Bus::Spaces) {
                 // O disco virtual não é lido; só confere que continua existindo.
-                if Handle::open(d.number, 0).is_none() {
-                    d.lost = true;
-                }
+                let _ = d.check_alive();
                 continue;
             }
-            read_one(d, st);
+            read_one(d, st, now);
         }
         let pools = self
             .disks
             .iter()
-            .filter(|(d, _)| d.bus == Ok(Bus::Spaces))
+            .filter(|(d, _)| d.bus() == Some(Bus::Spaces))
             .count();
         let members: Vec<&Metric<i16>> = self
             .disks
             .iter()
-            .filter(|(d, _)| d.pool_member == Ok(true))
+            .filter(|(d, _)| d.is_pool_member())
             .map(|(_, st)| &st.value)
             .collect();
         // Discos cujo layout ainda não foi lido porque estavam em repouso: podem ser membros.
-        let unknown_asleep = self
-            .disks
-            .iter()
-            .any(|(d, _)| matches!(d.pool_member, Err(Missing::Neutral(_))));
+        let unknown_asleep = self.disks.iter().any(|(d, _)| d.has_unknown_pool_status());
         Ok(self
             .disks
             .iter()
             .map(|(d, st)| {
-                if d.bus == Ok(Bus::Spaces) {
+                if d.bus() == Some(Bus::Spaces) {
                     DiskTemp {
-                        number: d.number,
-                        model: d.model.as_ref().ok().cloned(),
+                        number: d.number(),
+                        model: d.model().map(str::to_string),
                         celsius: pool_temp(pools, &members, unknown_asleep),
                         source: "pool members",
                         health: neutral("see the member disks"),
                     }
                 } else {
                     DiskTemp {
-                        number: d.number,
-                        model: d.model.as_ref().ok().cloned(),
+                        number: d.number(),
+                        model: d.model().map(str::to_string),
                         celsius: st.value.clone(),
                         source: st.source,
                         health: st.health.clone(),
@@ -274,67 +269,132 @@ fn pool_temp(pools: usize, members: &[&Metric<i16>], unknown_asleep: bool) -> Me
     fail("no member temperature")
 }
 
-fn read_one(d: &mut Inventory, st: &mut State) {
+/// Falha de acesso ao handle RW ou do IOCTL de SMART.
+enum RwError {
+    NoAccess,
+    Ioctl(String),
+}
+
+/// Fronteira de I/O da leitura de temperatura/SMART (testável sem hardware físico).
+trait DiskTempIo {
+    fn awake(&mut self) -> Option<bool>;
+    fn reread_if_asleep(&mut self);
+    fn native_temp(&mut self) -> Result<Vec<u8>, String>;
+    fn predict_failure(&mut self) -> Result<Vec<u8>, RwError>;
+    fn smart_rcv(&mut self, drive: u32) -> Result<Vec<u8>, RwError>;
+    /// Confere se o disco ainda é o mesmo e continua presente (marca perdido em caso negativo).
+    fn check_alive(&mut self) -> bool;
+}
+
+struct WinDiskTempIo<'a> {
+    inv: &'a mut Inventory,
+    meta: &'a Handle,
+    /// Handle de leitura/escrita aberto sob demanda e reaproveitado no fallback `SMART_RCV`.
+    rw: Option<Option<Handle>>,
+}
+
+impl<'a> WinDiskTempIo<'a> {
+    fn new(inv: &'a mut Inventory, meta: &'a Handle) -> Self {
+        Self {
+            inv,
+            meta,
+            rw: None,
+        }
+    }
+
+    fn rw_handle(&mut self) -> Option<&Handle> {
+        let num = self.inv.number();
+        self.rw
+            .get_or_insert_with(|| Handle::open(num, GENERIC_READ.0 | GENERIC_WRITE.0))
+            .as_ref()
+    }
+}
+
+impl DiskTempIo for WinDiskTempIo<'_> {
+    fn awake(&mut self) -> Option<bool> {
+        self.meta.awake()
+    }
+
+    fn reread_if_asleep(&mut self) {
+        self.inv.reread_if_was_asleep(self.meta);
+    }
+
+    fn native_temp(&mut self) -> Result<Vec<u8>, String> {
+        self.meta.property(PROP_TEMPERATURE)
+    }
+
+    fn predict_failure(&mut self) -> Result<Vec<u8>, RwError> {
+        let Some(rw) = self.rw_handle() else {
+            return Err(RwError::NoAccess);
+        };
+        rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE)
+            .map_err(RwError::Ioctl)
+    }
+
+    fn smart_rcv(&mut self, drive: u32) -> Result<Vec<u8>, RwError> {
+        let Some(rw) = self.rw_handle() else {
+            return Err(RwError::NoAccess);
+        };
+        let params = smart_rcv_params(drive);
+        rw.ioctl(SMART_RCV_DRIVE_DATA, Some(&params), SMART_RCV_OUT_SIZE)
+            .map_err(RwError::Ioctl)
+    }
+
+    fn check_alive(&mut self) -> bool {
+        // `meta` é o handle em uso; confere via propriedade do dispositivo ou reabertura.
+        if self.meta.property(0).is_ok() {
+            true
+        } else {
+            self.inv.mark_lost();
+            false
+        }
+    }
+}
+
+fn read_one(d: &mut Inventory, st: &mut State, now: Instant) {
     // Handle guardado morto (disco removido, talvez outro no mesmo número): não lê nada por
     // ele nem por um handle novo (seria o outro disco com o modelo antigo).
-    // Sem handle guardado (USB), `alive` confere o modelo: outro disco no mesmo número.
-    if !d.alive() {
-        d.lost = true;
-        d.handle = None;
+    // Sem handle guardado (USB), `check_alive` confere o modelo: outro disco no mesmo número.
+    if !d.check_alive() {
         st.value = fail("disk removed");
         return;
     }
-    // O handle guardado sai do inventário durante a leitura (para `d` poder ser alterado) e
-    // volta no fim; sem handle guardado (USB), abre só para esta leitura.
-    let held = d.handle.take();
-    let temp = if held.is_none() {
-        Handle::open(d.number, 0)
-    } else {
-        None
-    };
-    if let Some(meta) = held.as_ref().or(temp.as_ref()) {
-        read_with(d, st, meta);
-    } else {
-        d.lost = true;
+    let number = d.number();
+    let model = d.model().unwrap_or("?").to_string();
+    let opened = d.with_handle(|inv, meta| {
+        let mut io = WinDiskTempIo::new(inv, meta);
+        read_with_io(number, &model, st, &mut io, now);
+    });
+    if opened.is_none() {
         st.value = fail("disk not found");
     }
-    // Disco perdido: o handle velho não volta (a redescoberta abre outro).
-    d.handle = if d.lost { None } else { held };
 }
 
-fn read_with(d: &mut Inventory, st: &mut State, meta: &Handle) {
+fn read_with_io(number: u32, model: &str, st: &mut State, io: &mut impl DiskTempIo, now: Instant) {
     // Repouso primeiro: um HDD parado (ou SSD SATA em DevSleep/D3 informado pelo Windows) não
     // recebe consulta de temperatura nem SMART.
-    let awake = meta.awake();
+    let awake = io.awake();
     if awake == Some(false) {
         st.smart_fails = 0;
         st.value = neutral("asleep");
         return;
     }
-    let health_done = read_temp(d, st, meta, awake);
+    let (health_done, lost) = read_temp_io(number, model, st, io, awake, now);
     // Discos SATA já leram `PredictFailure` dentro do mesmo `IOCTL_STORAGE_PREDICT_FAILURE` da
     // temperatura (evita disparar o mesmo IOCTL duas vezes seguidas na controladora SATA). Só
     // discos com temperatura nativa precisam desta consulta separada.
-    if !health_done && !d.lost && st.health_at.is_none_or(|t| t.elapsed() >= SMART_EVERY) {
-        st.health_at = Some(Instant::now());
-        // Uma consulta recusada não apaga um "OK" já lido (o disco não ficou doente por isso);
-        // uma previsão de falha lida de verdade sempre aparece.
-        let h = predict_failure(d.number);
-        if h.is_ok() || st.health.is_err() {
-            st.health = h;
-        }
-    }
-}
-
-/// `PredictFailure` do `IOCTL_STORAGE_PREDICT_FAILURE` (o mesmo do SMART): o disco prevê uma
-/// falha próxima. Sem suporte do disco ou do driver: estado neutro.
-fn predict_failure(number: u32) -> Metric<bool> {
-    let Some(rw) = Handle::open(number, GENERIC_READ.0 | GENERIC_WRITE.0) else {
-        return fail("no read/write access (not elevated?)");
-    };
-    match rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE) {
-        Ok(b) => parse_predict(&b),
-        Err(_) => neutral("not reported by the drive"),
+    if !health_done
+        && !lost
+        && st
+            .health_at
+            .is_none_or(|t| now.duration_since(t) >= SMART_EVERY)
+    {
+        let h = match io.predict_failure() {
+            Ok(b) => parse_predict(&b),
+            Err(RwError::NoAccess) => fail("no read/write access (not elevated?)"),
+            Err(RwError::Ioctl(_)) => neutral("not reported by the drive"),
+        };
+        update_health(st, h, now);
     }
 }
 
@@ -344,39 +404,45 @@ fn parse_predict(b: &[u8]) -> Metric<bool> {
         .map_or_else(|| fail("response too short"), Ok)
 }
 
-/// Atualiza `st.health` sem apagar um "OK" já lido se a consulta falhou.
-fn update_health(st: &mut State, h: Metric<bool>) {
-    st.health_at = Some(Instant::now());
+/// Atualiza `st.health` sem apagar um "OK" já lido se a consulta falhou (o disco não ficou
+/// doente por uma consulta recusada; uma previsão de falha lida de verdade sempre aparece).
+fn update_health(st: &mut State, h: Metric<bool>, now: Instant) {
+    st.health_at = Some(now);
     if h.is_ok() || st.health.is_err() {
         st.health = h;
     }
 }
 
-/// Lê a temperatura; devolve `true` se o SMART (`PredictFailure`) já foi consultado aqui.
-fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<bool>) -> bool {
+/// Lê a temperatura; devolve `(smart_ja_consultado, disco_perdido)`.
+fn read_temp_io(
+    number: u32,
+    model: &str,
+    st: &mut State,
+    io: &mut impl DiskTempIo,
+    awake: Option<bool>,
+    now: Instant,
+) -> (bool, bool) {
     // Acordou depois de ter sido visto em repouso: relê o layout (membro do pool) agora.
-    d.reread_if_was_asleep(meta);
+    io.reread_if_asleep();
     if st.method != Method::Smart {
-        let native = meta.property(PROP_TEMPERATURE);
+        let native = io.native_temp();
         match native.as_deref().ok().and_then(native_temp) {
             Some(t) => {
                 st.method = Method::Native;
                 st.value = Ok(t);
                 st.source = "native";
-                return false;
+                return (false, false);
             }
             // Disco com sensor nativo que falhou agora: não cai no SMART (handle de escrita).
             None if st.method == Method::Native => {
-                if Handle::open(d.number, 0).is_none() {
-                    d.lost = true;
-                }
+                let lost = !io.check_alive();
                 let cause = native.err().unwrap_or_else(|| "no native reading".into());
                 crate::debug::log(
                     "disk_temp",
-                    &format!("disk {} native temp failed: {cause}", d.number),
+                    &format!("disk {number} native temp failed: {cause}"),
                 );
                 st.value = fail(cause);
-                return false;
+                return (false, lost);
             }
             None => {}
         }
@@ -385,33 +451,28 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<boo
     // `IOCTL_STORAGE_PREDICT_FAILURE` já traz tanto `PredictFailure` (bytes 0..4) quanto os
     // atributos SMART (bytes 4..516). Se ela falhar (ex.: 0x1F em SSD SATA / controladora
     // Marvell), tenta `SMART_RCV_DRIVE_DATA` (0x07C088) no mesmo handle.
-    let model = d.model.as_deref().unwrap_or("?");
-    let smart = match Handle::open(d.number, GENERIC_READ.0 | GENERIC_WRITE.0) {
-        None => {
-            update_health(st, fail("no read/write access (not elevated?)"));
+    let smart = match io.predict_failure() {
+        Err(RwError::NoAccess) => {
+            update_health(st, fail("no read/write access (not elevated?)"), now);
             Err("no read/write access (not elevated?)".to_string())
         }
-        Some(rw) => match rw.ioctl(IOCTL_STORAGE_PREDICT_FAILURE, None, PREDICT_SIZE) {
-            Ok(b) => {
-                update_health(st, parse_predict(&b));
-                b.get(4..)
-                    .and_then(smart_temp)
-                    .ok_or_else(|| "no temperature sensor (native or SMART 194/190)".to_string())
-            }
-            Err(e1) => {
-                update_health(st, neutral("not reported by the drive"));
-                let params = smart_rcv_params(d.number);
-                match rw
-                    .ioctl(SMART_RCV_DRIVE_DATA, Some(&params), SMART_RCV_OUT_SIZE)
-                    .and_then(|b| parse_smart_rcv(&b))
-                {
+        Ok(b) => {
+            update_health(st, parse_predict(&b), now);
+            b.get(4..)
+                .and_then(smart_temp)
+                .ok_or_else(|| "no temperature sensor (native or SMART 194/190)".to_string())
+        }
+        Err(RwError::Ioctl(e1)) => {
+            update_health(st, neutral("not reported by the drive"), now);
+            match io.smart_rcv(number) {
+                Ok(b) => match parse_smart_rcv(&b) {
                     Ok(t) => {
                         crate::debug::log(
                             "disk_temp",
                             &format!(
-                                "disk {} ({model}) PREDICT_FAILURE failed ({e1}, awake={awake:?}); \
+                                "disk {number} ({model}) PREDICT_FAILURE failed ({e1}, awake={awake:?}); \
                                  SMART_RCV_DRIVE_DATA fallback succeeded ({} °C)",
-                                d.number, t.1
+                                t.1
                             ),
                         );
                         Ok(t)
@@ -420,36 +481,44 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<boo
                         crate::debug::log(
                             "disk_temp",
                             &format!(
-                                "disk {} ({model}) SMART failed (awake={awake:?}): \
-                                 PREDICT_FAILURE=[{e1}], SMART_RCV=[{e2}]",
-                                d.number
+                                "disk {number} ({model}) SMART failed (awake={awake:?}): \
+                                 PREDICT_FAILURE=[{e1}], SMART_RCV=[{e2}]"
                             ),
                         );
                         Err(e1)
                     }
+                },
+                Err(RwError::NoAccess) => Err("no read/write access (not elevated?)".to_string()),
+                Err(RwError::Ioctl(e2)) => {
+                    crate::debug::log(
+                        "disk_temp",
+                        &format!(
+                            "disk {number} ({model}) SMART failed (awake={awake:?}): \
+                             PREDICT_FAILURE=[{e1}], SMART_RCV=[{e2}]"
+                        ),
+                    );
+                    Err(e1)
                 }
             }
-        },
+        }
     };
+    let mut lost = false;
     match smart {
         Ok((id, c)) => {
             st.method = Method::Smart;
             st.smart_fails = 0;
-            st.smart_ok_at = Some(Instant::now());
+            st.smart_ok_at = Some(now);
             st.value = Ok(i16::from(c));
             st.source = if id == 194 { "SMART 194" } else { "SMART 190" };
         }
         Err(e) => {
-            // O disco sumiu (o handle guardado não percebe): sai na redescoberta.
-            if Handle::open(d.number, 0).is_none() {
-                d.lost = true;
-            }
+            // O disco sumiu (ou foi trocado): sai na redescoberta.
+            lost = !io.check_alive();
             if st.method == Method::Unknown {
                 st.method = Method::None;
             }
             // Falha passageira depois de leituras boas: segura o último valor por enquanto.
-            let now = Instant::now();
-            if smart_tolerated(st, d.lost, now) {
+            if smart_tolerated(st, lost, now) {
                 st.smart_fails = st.smart_fails.saturating_add(1);
                 let age = st
                     .smart_ok_at
@@ -457,16 +526,16 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<boo
                 crate::debug::log(
                     "disk_temp",
                     &format!(
-                        "disk {} ({model}) SMART error tolerated (#{}, last ok {age}s ago, \
+                        "disk {number} ({model}) SMART error tolerated (#{}, last ok {age}s ago, \
                          awake={awake:?}): {e}",
-                        d.number, st.smart_fails
+                        st.smart_fails
                     ),
                 );
-                return true;
+                return (true, lost);
             }
             // Na partida (sem leitura boa ainda), tenta mais cedo nas primeiras falhas em vez
             // de esperar 60 s. Depois da janela de tolerância vencida, volta ao ritmo normal.
-            if st.method == Method::None && !d.lost && st.smart_fails < SMART_QUICK {
+            if st.method == Method::None && !lost && st.smart_fails < SMART_QUICK {
                 st.smart_fails = st.smart_fails.saturating_add(1);
             } else {
                 st.smart_fails = 0;
@@ -474,7 +543,7 @@ fn read_temp(d: &mut Inventory, st: &mut State, meta: &Handle, awake: Option<boo
             st.value = fail(format!("SMART: {e}"));
         }
     }
-    true
+    (true, lost)
 }
 
 /// Falha do SMART que não aparece: já houve leitura boa há menos de `SMART_GRACE` e o disco
@@ -605,5 +674,137 @@ mod tests {
         assert!(parse_smart_rcv(&out).unwrap_err().contains("0x3"));
         // Buffer curto demais.
         assert!(parse_smart_rcv(&[0u8; 3]).is_err());
+    }
+
+    struct FakeDiskIo {
+        awake: Option<bool>,
+        alive: bool,
+        reread_calls: u32,
+        native: Result<Vec<u8>, String>,
+        predict: Result<Vec<u8>, String>,
+        predict_no_access: bool,
+        smart_rcv: Result<Vec<u8>, String>,
+        predict_calls: u32,
+        smart_rcv_calls: u32,
+    }
+
+    impl FakeDiskIo {
+        fn new() -> Self {
+            Self {
+                awake: Some(true),
+                alive: true,
+                reread_calls: 0,
+                native: Err("not supported".into()),
+                predict: Err("IOCTL 0x2D1100: error 0x1F".into()),
+                predict_no_access: false,
+                smart_rcv: Err("not supported".into()),
+                predict_calls: 0,
+                smart_rcv_calls: 0,
+            }
+        }
+    }
+
+    impl DiskTempIo for FakeDiskIo {
+        fn awake(&mut self) -> Option<bool> {
+            self.awake
+        }
+        fn reread_if_asleep(&mut self) {
+            self.reread_calls += 1;
+        }
+        fn native_temp(&mut self) -> Result<Vec<u8>, String> {
+            self.native.clone()
+        }
+        fn predict_failure(&mut self) -> Result<Vec<u8>, RwError> {
+            self.predict_calls += 1;
+            if self.predict_no_access {
+                Err(RwError::NoAccess)
+            } else {
+                self.predict.clone().map_err(RwError::Ioctl)
+            }
+        }
+        fn smart_rcv(&mut self, _drive: u32) -> Result<Vec<u8>, RwError> {
+            self.smart_rcv_calls += 1;
+            self.smart_rcv.clone().map_err(RwError::Ioctl)
+        }
+        fn check_alive(&mut self) -> bool {
+            self.alive
+        }
+    }
+
+    fn native_buf(c: i16) -> Vec<u8> {
+        let mut b = vec![0u8; T_INFO + T_INFO_SIZE];
+        b[T_INFO_COUNT..T_INFO_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        b[T_INFO + T_TEMP..T_INFO + T_TEMP + 2].copy_from_slice(&c.to_le_bytes());
+        b
+    }
+
+    fn smart_rcv_buf(attr: u8, c: u8) -> Vec<u8> {
+        let mut b = vec![0u8; SMART_RCV_OUT_SIZE];
+        b[16 + 2] = attr;
+        b[16 + 2 + 5] = c;
+        b
+    }
+
+    #[test]
+    fn maquina_de_estados_nativa_smart_fallback_repouso_e_tolerancia() {
+        let t0 = Instant::now();
+        // 1) Disco em repouso: não consulta temperatura nem SMART.
+        let mut st = State::new();
+        let mut io = FakeDiskIo::new();
+        io.awake = Some(false);
+        read_with_io(0, "HDD", &mut st, &mut io, t0);
+        assert_eq!(st.value, neutral("asleep"));
+        assert_eq!(io.predict_calls, 0);
+        assert_eq!(io.reread_calls, 0);
+
+        // 2) Sensor nativo funciona e lê health separado; falha futura no nativo não cai no SMART.
+        let mut st = State::new();
+        let mut io = FakeDiskIo::new();
+        io.native = Ok(native_buf(43));
+        io.predict = Ok(vec![0u8; PREDICT_SIZE]); // PredictFailure = 0 (OK)
+        read_with_io(1, "NVMe", &mut st, &mut io, t0);
+        assert_eq!(st.value, Ok(43));
+        assert_eq!(st.source, "native");
+        assert_eq!(st.health, Ok(false));
+        assert_eq!(io.predict_calls, 1);
+
+        // Nativo falha: fica em erro sem chamar SMART/SMART_RCV, e health OK anterior sobrevive.
+        io.native = Err("IOCTL failed".into());
+        read_with_io(1, "NVMe", &mut st, &mut io, t0 + NATIVE_EVERY);
+        assert!(matches!(st.value, Err(Missing::Fail(_))));
+        assert_eq!(io.predict_calls, 1);
+        assert_eq!(io.smart_rcv_calls, 0);
+        assert_eq!(st.health, Ok(false));
+
+        // 3) SSD SATA onde PREDICT_FAILURE dá 0x1F, fallback SMART_RCV_DRIVE_DATA funciona;
+        //    falha passageira dentro de SMART_GRACE mantém última temperatura e reduz o ritmo.
+        let mut st = State::new();
+        let mut io = FakeDiskIo::new();
+        io.smart_rcv = Ok(smart_rcv_buf(194, 36));
+        read_with_io(2, "Netac SSD", &mut st, &mut io, t0);
+        assert_eq!(st.value, Ok(36));
+        assert_eq!(st.source, "SMART 194");
+        assert_eq!(io.smart_rcv_calls, 1);
+
+        io.smart_rcv = Err("busy".into());
+        let t1 = t0 + SMART_EVERY;
+        read_with_io(2, "Netac SSD", &mut st, &mut io, t1);
+        assert_eq!(st.value, Ok(36), "erro dentro de SMART_GRACE é tolerado");
+        assert_eq!(st.smart_fails, 1);
+
+        // Passou de SMART_GRACE: vira falha real.
+        read_with_io(2, "Netac SSD", &mut st, &mut io, t0 + SMART_GRACE);
+        assert!(matches!(st.value, Err(Missing::Fail(_))));
+
+        // 4) Disco removido durante erro SMART: não tolera, falha na hora.
+        let mut st = State::new();
+        let mut io = FakeDiskIo::new();
+        io.smart_rcv = Ok(smart_rcv_buf(190, 41));
+        read_with_io(3, "USB SSD", &mut st, &mut io, t0);
+        assert_eq!(st.value, Ok(41));
+        io.smart_rcv = Err("gone".into());
+        io.alive = false;
+        read_with_io(3, "USB SSD", &mut st, &mut io, t0 + Duration::from_secs(5));
+        assert!(matches!(st.value, Err(Missing::Fail(_))));
     }
 }

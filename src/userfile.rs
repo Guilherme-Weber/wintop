@@ -18,10 +18,10 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::path::{Component, Path, PathBuf};
 
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 use windows::Win32::Storage::FileSystem::{
@@ -191,11 +191,25 @@ fn verify(c: &Checked, path: &Path, dir: bool, single_name: bool) -> Result<(), 
     Ok(())
 }
 
+/// Confere que `name` é um único nome de arquivo ou pasta (sem separadores, letra de unidade,
+/// `.` ou `..`), impedindo escapar da pasta aberta pelo `UserDir`.
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains(['\\', '/']) {
+        return Err(format!("invalid file name {name:?} (refused)"));
+    }
+    let mut c = Path::new(name).components();
+    if matches!(c.next(), Some(Component::Normal(_))) && c.next().is_none() {
+        Ok(())
+    } else {
+        Err(format!("invalid file name {name:?} (refused)"))
+    }
+}
+
 /// Dono do objeto aberto, em texto.
 fn owner(c: &Checked) -> Result<String, String> {
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: handle válido; o descritor é liberado abaixo.
+    // SAFETY: handle válido; o descritor passa para `SecurityDescriptor` abaixo.
     let r = unsafe {
         GetSecurityInfo(
             c.raw(),
@@ -211,13 +225,10 @@ fn owner(c: &Checked) -> Result<String, String> {
     if r.is_err() {
         return Err(format!("owner: {r:?}"));
     }
-    // SAFETY: `owner` aponta para dentro do descritor, vivo até o LocalFree.
-    let s = unsafe { crate::win::sid_string(owner) };
-    // SAFETY: descritor alocado pela API; liberado uma vez.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
-    s.ok_or_else(|| "owner SID".into())
+    // SAFETY: descritor alocado por GetSecurityInfo; liberado no Drop.
+    let _sd = unsafe { crate::win::SecurityDescriptor::from_raw(sd) };
+    // SAFETY: `owner` aponta para dentro do descritor, vivo até o fim da função.
+    unsafe { crate::win::sid_string(owner) }.ok_or_else(|| "owner SID".into())
 }
 
 /// Administradores (dono padrão do que um processo elevado cria).
@@ -293,7 +304,8 @@ fn pin_file(dir: &Path) -> Result<Checked, String> {
 pub struct UserDir {
     /// A pasta acima (não há na pasta do exe aberta direto: `open_exe_dir`).
     _base: Option<Checked>,
-    dir: Checked,
+    /// Mantida aberta sem `FILE_SHARE_DELETE` durante toda a vida do `UserDir`.
+    _dir: Checked,
     /// Âncora: arquivo aberto dentro da pasta enquanto ela está aberta (apagado ao fechar).
     _pin: Checked,
     path: PathBuf,
@@ -303,6 +315,7 @@ impl UserDir {
     /// `base` (ex.: `AppData\Roaming`) precisa ser do usuário atual; `name` é criada se faltar
     /// (`create`). `Ok(None)`: sem criar, a subpasta não existe (a base passou em tudo).
     pub fn open(base: &Path, name: &str, create: bool) -> Result<Option<Self>, String> {
+        validate_name(name)?;
         // Sem FILE_SHARE_DELETE: ninguém renomeia nem troca a pasta enquanto ela está aberta.
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         let b =
@@ -333,7 +346,7 @@ impl UserDir {
         let pin = pin_file(dir)?;
         Ok(Self {
             _base: None,
-            dir: d,
+            _dir: d,
             _pin: pin,
             path: dir.to_path_buf(),
         })
@@ -341,6 +354,7 @@ impl UserDir {
 
     /// Subpasta `name` desta pasta (já conferida), como em `open`.
     pub fn sub(&self, name: &str, create: bool) -> Result<Option<Self>, String> {
+        validate_name(name)?;
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         let b = open(&self.path, GENERIC_READ.0, share, OPEN_EXISTING, true, true)
             .map_err(String::from)?;
@@ -349,6 +363,7 @@ impl UserDir {
 
     /// Segunda metade de `open`: `b` é a base já aberta e conferida.
     fn open_in(b: Checked, base: &Path, name: &str, create: bool) -> Result<Option<Self>, String> {
+        validate_name(name)?;
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         // A base também ancorada antes de criar a subpasta: um AppData redirecionado para uma
         // pasta vazia do usuário poderia virar junction e o CreateDirectoryW criaria a pasta no
@@ -374,7 +389,7 @@ impl UserDir {
         drop(base_pin);
         Ok(Some(Self {
             _base: Some(b),
-            dir,
+            _dir: dir,
             _pin: pin,
             path,
         }))
@@ -390,9 +405,14 @@ impl UserDir {
         self.path.join(name)
     }
 
-    /// Lê `name` (no máximo `max` bytes); `Ok(None)` se não existe.
-    pub fn read(&self, name: &str, max: u64) -> Result<Option<String>, String> {
-        let p = self.file(name);
+    fn checked_file(&self, name: &str) -> Result<PathBuf, String> {
+        validate_name(name)?;
+        Ok(self.path.join(name))
+    }
+
+    /// Lê `name` em bytes (no máximo `max` bytes); `Ok(None)` se não existe.
+    pub fn read_bytes(&self, name: &str, max: u64) -> Result<Option<Vec<u8>>, String> {
+        let p = self.checked_file(name)?;
         let c = match open(
             &p,
             GENERIC_READ.0,
@@ -405,19 +425,27 @@ impl UserDir {
             Err(OpenError::NotFound) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let _ = &self.dir;
-        // SAFETY: o handle conferido passa para o File (dono único).
-        let f = unsafe { File::from_raw_handle(c.handle.as_raw_handle()) };
-        std::mem::forget(c.handle);
-        let mut s = String::new();
+        let f = File::from(c.handle);
+        let mut buf = Vec::new();
         let n = f
             .take(max + 1)
-            .read_to_string(&mut s)
+            .read_to_end(&mut buf)
             .map_err(|e| format!("{}: {e}", p.display()))?;
         if n as u64 > max {
             return Err(format!("{} is larger than {} KB", p.display(), max >> 10));
         }
-        Ok(Some(s))
+        Ok(Some(buf))
+    }
+
+    /// Lê `name` como UTF-8 (no máximo `max` bytes); `Ok(None)` se não existe.
+    pub fn read(&self, name: &str, max: u64) -> Result<Option<String>, String> {
+        let Some(bytes) = self.read_bytes(name, max)? else {
+            return Ok(None);
+        };
+        let p = self.file(name);
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", p.display()))
     }
 
     /// Grava `name` atomicamente: temporário novo e exclusivo, trocado pelo próprio handle.
@@ -428,7 +456,7 @@ impl UserDir {
     /// Apaga `name` sem seguir links (um link no lugar é apagado como link). `Ok(false)`: não
     /// existia.
     pub fn remove(&self, name: &str) -> Result<bool, String> {
-        let p = self.file(name);
+        let p = self.checked_file(name)?;
         let c = match open(
             &p,
             DELETE.0,
@@ -450,7 +478,8 @@ impl UserDir {
     /// em execução (o Windows deixa renomear, não sobrescrever). `Ok(false)`: não existia.
     pub fn rename(&self, name: &str, to: &str) -> Result<bool, String> {
         use windows::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
-        let p = self.file(name);
+        let p = self.checked_file(name)?;
+        let dst = self.checked_file(to)?;
         let c = match open(
             &p,
             DELETE.0,
@@ -463,14 +492,14 @@ impl UserDir {
             Err(OpenError::NotFound) => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        rename_over(c.raw(), &self.file(to))?;
+        rename_over(c.raw(), &dst)?;
         Ok(true)
     }
 
     /// Abre `name` só para leitura sem compartilhar escrita nem exclusão (ninguém troca, renomeia
     /// ou apaga enquanto o `Held` existir) e confere que o conteúdo é `expect`.
     pub fn hold(&self, name: &str, expect: &[u8]) -> Result<Held, String> {
-        let p = self.file(name);
+        let p = self.checked_file(name)?;
         let c = open(
             &p,
             GENERIC_READ.0,
@@ -480,22 +509,25 @@ impl UserDir {
             true,
         )
         .map_err(String::from)?;
-        // SAFETY: handle conferido e só nosso; o File não o fecha (ManuallyDrop).
-        let mut f =
-            std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(c.handle.as_raw_handle()) });
+        let mut f = File::from(c.handle);
         let mut got = Vec::with_capacity(expect.len());
-        (&mut *f)
+        (&mut f)
             .take(expect.len() as u64 + 1)
             .read_to_end(&mut got)
             .map_err(|e| format!("{}: {e}", p.display()))?;
         if got != expect {
             return Err(format!("{} changed after it was written", p.display()));
         }
-        Ok(Held { _file: c })
+        Ok(Held {
+            _file: Checked {
+                handle: OwnedHandle::from(f),
+            },
+        })
     }
 
     pub fn write_bytes(&self, name: &str, data: &[u8]) -> Result<(), String> {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let target = self.checked_file(name)?;
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = self.file(&format!("{name}.{}.{n}.tmp", std::process::id()));
         let c = open(
@@ -507,19 +539,16 @@ impl UserDir {
             true,
         )
         .map_err(String::from)?;
+        let mut f = File::from(c.handle);
         let r = (|| -> Result<(), String> {
-            // SAFETY: handle conferido e só nosso; o File não o fecha (forget abaixo).
-            let mut f = std::mem::ManuallyDrop::new(unsafe {
-                File::from_raw_handle(c.handle.as_raw_handle())
-            });
             f.write_all(data).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
-            rename_over(c.raw(), &self.file(name))
+            rename_over(HANDLE(f.as_raw_handle()), &target)
         })();
         if r.is_err() {
             // Marca o temporário para apagar ao fechar o handle (melhor esforço: o erro que
             // vale é o da gravação).
-            let _ = delete_on_close(c.raw());
+            let _ = delete_on_close(HANDLE(f.as_raw_handle()));
         }
         r
     }
@@ -533,7 +562,8 @@ impl UserDir {
         max_bytes: u64,
         data: &[u8],
     ) -> Result<(), String> {
-        let p = self.file(name);
+        let p = self.checked_file(name)?;
+        let backup_path = self.checked_file(backup)?;
         let open_new = || {
             open(
                 &p,
@@ -561,7 +591,7 @@ impl UserDir {
                 let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
                 if size > 0 && size.saturating_add(data.len() as u64) > max_bytes {
                     // Renomeia pelo próprio handle conferido (sem janela de troca no nome).
-                    rename_over(existing.raw(), &self.file(backup))?;
+                    rename_over(existing.raw(), &backup_path)?;
                     drop(existing);
                     open_new()?
                 } else {
@@ -571,10 +601,7 @@ impl UserDir {
             Err(OpenError::NotFound) => open_new()?,
             Err(e) => return Err(e.into()),
         };
-        let _ = &self.dir;
-        // SAFETY: handle conferido e só nosso; ManuallyDrop não fecha (c.handle fecha no Drop).
-        let mut f =
-            std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(c.handle.as_raw_handle()) });
+        let mut f = File::from(c.handle);
         f.write_all(data)
             .map_err(|e| format!("{}: {e}", p.display()))
     }
@@ -887,10 +914,49 @@ mod tests {
         assert!(UserDir::open(&sys, "wintop", false).is_err());
     }
 
+    /// Remove a pasta de teste no `Drop`, mesmo se uma asserção falhar.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn nome_com_caminho_ou_subida_e_recusado() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            r"..\fora.txt",
+            "../fora.txt",
+            r"sub\a.txt",
+            "sub/a.txt",
+            r"C:\Windows\win.ini",
+            r"\\server\share\x",
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?} aceito");
+        }
+        assert!(validate_name("config.toml").is_ok());
+        assert!(validate_name("wintop.exe.12.345.old").is_ok());
+
+        let b = roaming();
+        let n = name("confinamento");
+        let _clean = Cleanup(b.join(&n));
+        let d = UserDir::create(&b, &n).expect("pasta");
+        assert!(d.read(r"C:\Windows\win.ini", 1024).is_err());
+        assert!(d.write(r"..\escape.txt", "x").is_err());
+        assert!(d.remove(r"..\escape.txt").is_err());
+        assert!(d.rename("a", r"..\escape.txt").is_err());
+        assert!(d.sub(r"..\sub", false).is_err());
+        assert!(UserDir::open(&b, r"..\sub", false).is_err());
+    }
+
     #[test]
     fn append_rotating_acrescenta_e_rotaciona_no_limite() {
         let b = roaming();
         let n = name("append_rot");
+        let _clean = Cleanup(b.join(&n));
         let d = UserDir::create(&b, &n).expect("pasta");
         d.append_rotating("debug.log", "debug.log.1", 20, b"linha 1\n")
             .expect("1ª escrita");
@@ -913,7 +979,5 @@ mod tests {
                 .as_deref(),
             Some("linha 1\nlinha 2\n")
         );
-        drop(d);
-        let _ = std::fs::remove_dir_all(b.join(&n));
     }
 }

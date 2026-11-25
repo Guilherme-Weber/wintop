@@ -322,24 +322,52 @@ type Activity = ((f64, f64, f64, f64), f64, u32);
 
 /// Inventário de um disco (lido na descoberta; capacidade e layout de novo se estava em repouso).
 pub(super) struct Inventory {
-    pub(super) number: u32,
-    pub(super) model: Metric<String>,
+    number: u32,
+    model: Metric<String>,
     /// Modelo do próprio descritor (`model` pode ser o nome do PnP, com outro texto): é o que
     /// `alive` compara para reconhecer outro disco no mesmo número.
     desc_model: Option<String>,
-    pub(super) bus: Metric<Bus>,
-    pub(super) ssd: Metric<bool>,
+    bus: Metric<Bus>,
+    ssd: Metric<bool>,
     capacity: Metric<u64>,
-    pub(super) pool_member: Metric<bool>,
+    pool_member: Metric<bool>,
     asleep_since: Option<Instant>,
     /// Handle de metadados mantido aberto; USB não (não impedir a remoção segura).
-    pub(super) handle: Option<Handle>,
+    handle: Option<Handle>,
     last: Option<PerfSample>,
     /// A última leitura falhou (disco removido?).
-    pub(super) lost: bool,
+    lost: bool,
 }
 
 impl Inventory {
+    pub(super) fn number(&self) -> u32 {
+        self.number
+    }
+
+    pub(super) fn model(&self) -> Option<&str> {
+        self.model.as_deref().ok()
+    }
+
+    pub(super) fn bus(&self) -> Option<Bus> {
+        self.bus.as_ref().ok().copied()
+    }
+
+    pub(super) fn is_pool_member(&self) -> bool {
+        self.pool_member == Ok(true)
+    }
+
+    pub(super) fn has_unknown_pool_status(&self) -> bool {
+        matches!(self.pool_member, Err(crate::model::Missing::Neutral(_)))
+    }
+
+    pub(super) fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    pub(super) fn mark_lost(&mut self) {
+        self.lost = true;
+        self.handle = None;
+    }
     /// `names`: nomes amigáveis do PnP (`friendly_names`), preferidos ao do descritor.
     fn discover(n: u32, names: &[(u32, String)]) -> Option<Self> {
         let meta = Handle::open(n, 0)?;
@@ -413,13 +441,11 @@ impl Inventory {
             .or_else(fail);
     }
 
-    /// Disco que estava em repouso e agora respondeu acordado: relê capacidade e layout com o
-    /// handle já aberto (sem esperar o `RETRY_ASLEEP`).
     /// O disco ainda é o mesmo e está presente. Com handle guardado: ele ainda responde (se
     /// outro disco pegou o número depois de uma remoção, o número abre, mas o handle velho não).
     /// Sem handle guardado (USB): o número ainda abre e é o mesmo modelo (outro disco USB
     /// ligado no mesmo número entre duas leituras é redescoberto, não lido com o nome antigo).
-    pub(super) fn alive(&self) -> bool {
+    fn alive(&self) -> bool {
         match &self.handle {
             Some(h) => h.property(PROP_DEVICE).is_ok(),
             None => Handle::open(self.number, 0).is_some_and(|h| {
@@ -432,6 +458,38 @@ impl Inventory {
         }
     }
 
+    /// Confere se o disco ainda é o mesmo; se não, marca como perdido e fecha o handle guardado.
+    pub(super) fn check_alive(&mut self) -> bool {
+        if self.alive() {
+            true
+        } else {
+            self.mark_lost();
+            false
+        }
+    }
+
+    /// Executa `f` com o handle de metadados (guardado ou aberto na hora para USB), devolvendo
+    /// `None` se o disco não puder ser aberto (já marcado como perdido). O handle guardado volta
+    /// ao inventário ao fim, a menos que o disco seja marcado como perdido durante `f`.
+    pub(super) fn with_handle<R>(&mut self, f: impl FnOnce(&mut Self, &Handle) -> R) -> Option<R> {
+        let held = self.handle.take();
+        let temp = if held.is_none() {
+            Handle::open(self.number, 0)
+        } else {
+            None
+        };
+        let out = if let Some(meta) = held.as_ref().or(temp.as_ref()) {
+            Some(f(self, meta))
+        } else {
+            self.lost = true;
+            None
+        };
+        self.handle = if self.lost { None } else { held };
+        out
+    }
+
+    /// Disco que estava em repouso e agora respondeu acordado: relê capacidade e layout com o
+    /// handle já aberto (sem esperar o `RETRY_ASLEEP`).
     pub(super) fn reread_if_was_asleep(&mut self, meta: &Handle) {
         if self.asleep_since.is_some() {
             self.read_details(meta);

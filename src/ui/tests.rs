@@ -6,10 +6,10 @@ use std::time::Duration;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use super::view::{self, State};
+use super::view::{self, SortCol, State};
 use crate::model::{
-    Bus, Counts, Cpu, CpuSensors, Disk, DiskTemp, Fan, Fast, Fps, Game, Gpu, GpuSlow, Memory,
-    Missing, Nic, OwnUsage, Slow, Topology, fail, neutral,
+    Bus, CompressedMemory, Counts, Cpu, CpuSensors, Disk, DiskTemp, Fan, Fast, Fps, Game, Gpu,
+    GpuSlow, Memory, MemoryHardware, Missing, Nic, OwnUsage, Slow, Topology, fail, neutral,
 };
 
 const GB: u64 = 1 << 30;
@@ -118,12 +118,27 @@ pub(super) fn fast(step: u32) -> Fast {
             total: Ok(32 * GB),
             used: Ok(21 * GB),
             commit: Ok((40 * GB, 48 * GB)),
+            commit_peak: Ok(48 * GB),
+            compressed: Ok(CompressedMemory {
+                compressed: 1843 * MB,
+                uncompressed: 5530 * MB,
+            }),
             cached: Ok(7 * GB),
             standby: Ok(6 * GB),
             modified: Ok(GB),
             paged_pool: Ok(GB),
             nonpaged_pool: Ok(889 * MB),
             pagefile_usage: Ok((131 * MB, 16 * GB)),
+            paging: Ok((0.0, 0.0)),
+            hardware: Ok(MemoryHardware {
+                kind: "DDR4",
+                speed_mt: Some(3600),
+                slots_used: 4,
+                slots_total: 4,
+                form_factor: Some("DIMM"),
+            }),
+            hardware_reserved: Ok(88 * MB),
+            bad_pages: Ok(0),
         }),
         disks: Ok(vec![
             disk(0, "Netac SSD 512GB", &["E:"], Bus::Sata, true, false),
@@ -247,7 +262,7 @@ fn filled() -> State {
         st.push_fast(fast(i));
         st.push_fps(game());
     }
-    st.slow = Some(slow());
+    st.slow = Some(slow().into());
     st
 }
 
@@ -405,7 +420,7 @@ fn temperatura_de_outro_disco_nao_aparece() {
     let mut st = filled();
     // Outro disco ocupou o número 7 (hot-plug): a temperatura lida do modelo antigo não vale.
     if let Some(s) = &mut st.slow
-        && let Ok(list) = &mut s.disk_temps
+        && let Ok(list) = &mut std::sync::Arc::make_mut(s).disk_temps
     {
         for t in list.iter_mut().filter(|t| t.number == 7) {
             t.model = Some("Outro disco".into());
@@ -493,7 +508,7 @@ fn troca_de_pid_do_jogo_nao_zera_o_historico() {
     st.push_fast(fast(0));
     st.push_fps(with(2, 200.0));
     st.push_fast(fast(1));
-    st.slow = Some(slow());
+    st.slow = Some(slow().into());
     let tela = render(&mut st, 160, 48);
     assert!(tela.contains("FPS 200  min 100 · max 200"), "{tela}");
     st.reset_session();
@@ -509,7 +524,7 @@ fn linhas_de_detalhe_nao_cortam_nada() {
         for want in [
             "free 5.0G",
             "kernel 4.0M",
-            "VBIOS 98.03.58.00.96",
+            "rx 250.0 MB/s",
             "(NVML)",
             "video 2220/3090 MHz",
             "182004 handles",
@@ -526,7 +541,7 @@ fn falha_de_temperatura_mostra_a_causa_inteira() {
     let mut st = filled();
     let cause = "SMART: IOCTL 0x2D1100: error 0x1F";
     if let Some(s) = &mut st.slow
-        && let Ok(list) = &mut s.disk_temps
+        && let Ok(list) = &mut std::sync::Arc::make_mut(s).disk_temps
     {
         for t in list.iter_mut().filter(|t| t.number == 0) {
             t.celsius = Err(Missing::Fail(cause.into()));
@@ -562,7 +577,7 @@ fn causa_longa_de_falha_quebra_sem_cortar() {
     let mut st = filled();
     let cause = "SMART: no temperature sensor (native or SMART 194/190)";
     if let Some(s) = &mut st.slow
-        && let Ok(list) = &mut s.disk_temps
+        && let Ok(list) = &mut std::sync::Arc::make_mut(s).disk_temps
     {
         for t in list.iter_mut().filter(|t| t.number == 0) {
             t.celsius = Err(Missing::Fail(cause.into()));
@@ -656,8 +671,13 @@ fn aba_processos() {
 #[test]
 fn aba_gpu() {
     let mut st = tab_state(view::Tab::Gpu);
-    st.runtimes
-        .insert(1784, ("dwm.exe".into(), Ok(vec!["D3D11", "D3D12"])));
+    st.runtimes.insert(
+        1784,
+        (
+            "dwm.exe".into(),
+            view::RuntimeStatus::Ready(Ok(vec!["D3D11", "D3D12"])),
+        ),
+    );
     insta::assert_snapshot!(render(&mut st, 160, 20));
 }
 
@@ -705,7 +725,7 @@ fn ordem_e_filtro_dos_processos() {
     assert!(pos("deadlock.exe") < pos("firefox.exe"));
     assert!(pos("firefox.exe") < pos("dwm.exe"));
     // Por nome (←), crescente.
-    st.proc_sort = view::ProcSort::Name;
+    st.proc_table.sort = view::ProcSort::Name;
     let out = render(&mut st, 140, 16);
     let pos = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s}\n{out}"));
     assert!(pos("Code.exe") < pos("deadlock.exe"));
@@ -723,10 +743,10 @@ fn ordem_e_filtro_dos_processos() {
 fn selecao_fica_na_linha_entre_coletas() {
     let mut st = tab_state(view::Tab::Processes);
     let _ = render(&mut st, 140, 16);
-    st.proc_cursor.down(1);
+    st.proc_table.cursor.down(1);
     let _ = render(&mut st, 140, 16);
     // 2º por CPU = firefox.
-    assert_eq!(st.proc_cursor.pid(), Some(9120));
+    assert_eq!(st.proc_table.cursor.pid(), Some(9120));
     // Nova coleta muda a ordem: a seleção fica na 2ª linha (a lista não pula atrás do
     // processo), agora com quem ocupa essa posição.
     let mut list = proc_list();
@@ -737,11 +757,11 @@ fn selecao_fica_na_linha_entre_coletas() {
     let _ = render(&mut st, 140, 16);
     let mut by_cpu = list;
     by_cpu.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
-    assert_eq!(st.proc_cursor.pid(), Some(by_cpu[1].pid));
-    assert_ne!(st.proc_cursor.pid(), Some(9120));
-    st.proc_cursor.end();
+    assert_eq!(st.proc_table.cursor.pid(), Some(by_cpu[1].pid));
+    assert_ne!(st.proc_table.cursor.pid(), Some(9120));
+    st.proc_table.cursor.end();
     let _ = render(&mut st, 140, 16);
-    assert_eq!(st.proc_cursor.pid(), Some(15000));
+    assert_eq!(st.proc_table.cursor.pid(), Some(15000));
 }
 
 #[test]
@@ -782,7 +802,10 @@ fn sem_lista_do_rtss_nenhum_processo_e_aberto() {
     );
     let (_, r) = st.runtimes.values().next().expect("resultado");
     assert!(
-        matches!(r, Err(Missing::Neutral(s)) if s.contains("waiting for RTSS")),
+        matches!(
+            r,
+            view::RuntimeStatus::Ready(Err(Missing::Neutral(s))) if s.contains("waiting for RTSS")
+        ),
         "{r:?}"
     );
 }
@@ -792,7 +815,7 @@ fn enter_usa_a_selecao_pendente() {
     let mut st = tab_state(view::Tab::Gpu);
     let _ = render(&mut st, 160, 20);
     // ↓ e Enter no mesmo lote de teclas (sem desenho no meio): vale o 2º da lista.
-    st.gpu_cursor.down(1);
+    st.gpu_table.cursor.down(1);
     let job = st.request_runtimes().expect("pedido de leitura");
     assert_eq!(job.pid, 9120);
     assert_eq!(
@@ -984,14 +1007,27 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         ("mem.commit", mem(|m, t| m.commit = f(t))),
+        ("mem.commit_peak", mem(|m, t| m.commit_peak = f(t))),
+        ("mem.compressed", mem(|m, t| m.compressed = f(t))),
         ("mem.used", mem(|m, t| m.used = f(t))),
         ("mem.total", mem(|m, t| m.total = f(t))),
         ("mem.standby", mem(|m, t| m.standby = f(t))),
+        ("mem.modified", mem(|m, t| m.modified = f(t))),
         ("mem.nonpaged", mem(|m, t| m.nonpaged_pool = f(t))),
         ("mem.paged", mem(|m, t| m.paged_pool = f(t))),
         ("mem.pagefile", mem(|m, t| m.pagefile_usage = f(t))),
+        ("mem.paging", mem(|m, t| m.paging = f(t))),
+        ("mem.hardware", mem(|m, t| m.hardware = f(t))),
+        (
+            "mem.hardware_reserved",
+            mem(|m, t| m.hardware_reserved = f(t)),
+        ),
+        ("mem.bad_pages", mem(|m, t| m.bad_pages = f(t))),
         ("disk.model", disk(|d, t| d.model = f(t))),
+        ("disk.bus", disk(|d, t| d.bus = f(t))),
+        ("disk.ssd", disk(|d, t| d.ssd = f(t))),
         ("disk.capacity", disk(|d, t| d.capacity = f(t))),
+        ("disk.pool_member", disk(|d, t| d.pool_member = f(t))),
         (
             "disk.io",
             disk(|d, t| {
@@ -1037,17 +1073,25 @@ fn injections() -> Vec<(&'static str, Inject)> {
         ),
         ("gpu.name", gpu(|g, t| g.name = f(t))),
         ("gpu.usage", gpu(|g, t| g.usage = f(t))),
+        ("gpu.mem_activity", gpu(|g, t| g.mem_activity = f(t))),
         ("gpu.dedicated", gpu(|g, t| g.dedicated = f(t))),
         ("gpu.shared", gpu(|g, t| g.shared = f(t))),
+        ("gpu.physical", gpu(|g, t| g.physical = f(t))),
         ("gpu.temp", gpu(|g, t| g.temp = f(t))),
         ("gpu.power", gpu(|g, t| g.power = f(t))),
         ("gpu.clock_graphics", gpu(|g, t| g.clock_graphics = f(t))),
+        ("gpu.clock_sm", gpu(|g, t| g.clock_sm = f(t))),
+        ("gpu.clock_video", gpu(|g, t| g.clock_video = f(t))),
         ("gpu.driver", gpu(|g, t| g.driver = f(t))),
+        ("gpu.vbios", gpu(|g, t| g.vbios = f(t))),
         ("gpu.temp_slowdown", gpu(|g, t| g.temp_slowdown = f(t))),
         ("gpu.encoder", gpu(|g, t| g.encoder = f(t))),
+        ("gpu.decoder", gpu(|g, t| g.decoder = f(t))),
         ("gpu.other_engine", gpu(|g, t| g.other_engine = f(t))),
         ("gpu.clock_mem", gpu(|g, t| g.clock_mem = f(t))),
         ("gpu.fans", gpu(|g, t| g.fans = f(t))),
+        ("gpu.pcie_link", gpu(|g, t| g.pcie_link = f(t))),
+        ("gpu.pstate", gpu(|g, t| g.pstate = f(t))),
         ("gpu.throttle", gpu(|g, t| g.throttle = f(t))),
         (
             "own.ws",
@@ -1066,6 +1110,14 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         (
+            "own.commit",
+            Box::new(|fa, _, _, t| {
+                if let Ok(o) = &mut fa.own {
+                    o.commit = f(t);
+                }
+            }),
+        ),
+        (
             "slow.vram",
             Box::new(|_, sl, _, t| {
                 if let Ok(l) = &mut sl.gpus {
@@ -1074,10 +1126,18 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         (
-            "slow.pcie",
+            "slow.pcie_tx",
             Box::new(|_, sl, _, t| {
                 if let Ok(l) = &mut sl.gpus {
                     l[0].pcie_tx = f(t);
+                }
+            }),
+        ),
+        (
+            "slow.pcie_rx",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.gpus {
+                    l[0].pcie_rx = f(t);
                 }
             }),
         ),
@@ -1192,7 +1252,7 @@ fn aviso_do_config_aparece_inteiro_sem_esconder_o_estado() {
 
 #[test]
 fn aba_gpu_ordena_por_coluna_e_filtra() {
-    use super::view::tabs::{GpuSort, sorted_gpu};
+    use super::view::gpu_tab::{GpuSort, sorted_gpu};
     let list = gpu_list();
     let pids = |v: Vec<&crate::model::GpuProc>| v.iter().map(|p| p.pid).collect::<Vec<_>>();
     // Padrão: GPU% decrescente.
@@ -1227,7 +1287,7 @@ fn aba_gpu_ordena_por_coluna_e_filtra() {
 #[test]
 fn ajuda_e_pausa_aparecem() {
     let mut st = filled();
-    st.help = true;
+    st.modal = view::Modal::Help;
     let out = render(&mut st, 160, 48);
     assert!(
         out.contains("any key closes") && out.contains("pause the screen"),
@@ -1236,7 +1296,7 @@ fn ajuda_e_pausa_aparecem() {
     // A ajuda inteira cabe num terminal de 120x30 (o conhost do atalho).
     let small = render(&mut st, 120, 30);
     assert!(small.contains("gray = expected state"), "{small}");
-    st.help = false;
+    st.modal = view::Modal::None;
     st.paused = true;
     let out = render(&mut st, 160, 48);
     assert!(
@@ -1258,7 +1318,11 @@ fn discos_com_iops_e_fila_em_tela_larga() {
 #[test]
 fn falha_prevista_do_smart_aparece_em_vermelho() {
     let mut st = filled();
-    if let Some(Ok(l)) = st.slow.as_mut().map(|s| &mut s.disk_temps) {
+    if let Some(Ok(l)) = st
+        .slow
+        .as_mut()
+        .map(|s| &mut std::sync::Arc::make_mut(s).disk_temps)
+    {
         l[0].health = Ok(true);
     }
     let out = render(&mut st, 200, 60);
@@ -1273,7 +1337,11 @@ fn confirmacao_de_encerrar_processo() {
     let mut st = tab_state(view::Tab::Processes);
     let _ = render(&mut st, 160, 48);
     let p = st.selected_proc().expect("linha selecionada");
-    st.confirm_end = Some((p.pid, p.name.clone(), p.create));
+    st.modal = view::Modal::ConfirmEnd {
+        pid: p.pid,
+        name: p.name.clone(),
+        create: p.create,
+    };
     let out = render(&mut st, 160, 48);
     assert!(
         out.contains(&format!("End {} (PID {})", p.name, p.pid)),
@@ -1283,8 +1351,8 @@ fn confirmacao_de_encerrar_processo() {
         out.contains("y end process") && out.contains("n / esc cancel"),
         "{out}"
     );
-    // A mensagem do resultado aparece e some sozinha.
-    st.confirm_end = None;
+    // A mensagem do resultado aparece e some ao expirar.
+    st.modal = view::Modal::None;
     st.toast = Some((
         "ended x.exe (PID 1)".into(),
         false,
@@ -1296,13 +1364,14 @@ fn confirmacao_de_encerrar_processo() {
         false,
         std::time::Instant::now() - view::TOAST_FOR,
     ));
+    assert!(st.expire_toast(std::time::Instant::now()));
     assert!(!render(&mut st, 160, 48).contains("old"));
 }
 
 #[test]
 fn pergunta_de_atualizacao() {
     let mut st = tab_state(view::Tab::Overview);
-    st.update = Some(view::UpdateUi::Offer("9.0.0".into()));
+    st.modal = view::Modal::Update(view::UpdateUi::Offer("9.0.0".into()));
     let out = render(&mut st, 160, 48);
     assert!(
         out.contains(&format!(
@@ -1312,14 +1381,14 @@ fn pergunta_de_atualizacao() {
         "{out}"
     );
     assert!(out.contains("y update and restart") && out.contains("n / esc not now"));
-    st.update = Some(view::UpdateUi::Applying("9.0.0".into()));
+    st.modal = view::Modal::Update(view::UpdateUi::Applying("9.0.0".into()));
     let out = render(&mut st, 160, 48);
     assert!(out.contains("Downloading wintop 9.0.0..."), "{out}");
     // Em pt-BR, tudo traduzido; e cabe numa tela de 80 colunas sem cortar.
-    crate::i18n::set(crate::i18n::Lang::PtBr);
-    st.update = Some(view::UpdateUi::Offer("9.0.0".into()));
+    let _lang = LangGuard::set(crate::i18n::Lang::PtBr);
+    st.modal = view::Modal::Update(view::UpdateUi::Offer("9.0.0".into()));
     let out = render(&mut st, 120, 30);
-    crate::i18n::set(crate::i18n::Lang::EnUs);
+    drop(_lang);
     assert!(
         out.contains("está disponível (esta é a") && out.contains("Atualizar agora?"),
         "{out}"
@@ -1329,7 +1398,7 @@ fn pergunta_de_atualizacao() {
 
 #[test]
 fn arvore_de_processos() {
-    use super::view::tabs::{ProcSort, tree};
+    use super::view::procs_tab::{ProcSort, tree};
     let p = |pid, parent, create, name: &str, cpu| crate::model::Proc {
         pid,
         parent,
@@ -1397,20 +1466,23 @@ fn mouse_abas_cabecalho_linhas_e_rodinha() {
         .expect("coluna Name");
     // Cabeçalho: Name ordena; de novo, inverte.
     let _ = super::on_mouse(&mut st, click(name_x, hy));
-    assert_eq!(st.proc_sort, view::ProcSort::from_index(1).expect("Name"));
+    assert_eq!(
+        st.proc_table.sort,
+        view::ProcSort::from_index(1).expect("Name")
+    );
     let _ = super::on_mouse(&mut st, click(name_x, hy));
-    assert!(st.proc_reverse);
+    assert!(st.proc_table.reverse);
     // Linha: a 3ª linha visível fica selecionada.
     let _ = super::on_mouse(&mut st, click(body.x + 2, body.y + 2));
     let _ = render(&mut st, 160, 48);
     let sel = st.selected_proc().expect("selecionado");
-    let rows = super::view::tabs::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
+    let rows = super::view::procs_tab::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
     assert_eq!(sel.pid, rows[2].0.pid);
     // Rodinha: desce 3 linhas.
     let _ = super::on_mouse(&mut st, ev(MouseEventKind::ScrollDown, 10, 10));
     let _ = render(&mut st, 160, 48);
     let after = st.selected_proc().expect("selecionado");
-    let rows = super::view::tabs::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
+    let rows = super::view::procs_tab::proc_rows(&st, st.procs.as_ref().unwrap().as_ref().unwrap());
     let pos = rows
         .iter()
         .position(|(p, _)| p.pid == after.pid)
@@ -1542,7 +1614,7 @@ fn aba_gpu_segunda_gpu() {
         .and_then(|l| l.get(1))
         .and_then(|g| g.procs.clone());
     assert_eq!(st.gpu_procs, expected);
-    let mut s = st.slow.clone().expect("coleta lenta");
+    let mut s = (*st.slow.clone().expect("coleta lenta")).clone();
     s.procs = Some(Ok(proc_list()));
     st.push_slow(s);
     insta::assert_snapshot!(render(&mut st, 160, 20));
@@ -1567,13 +1639,27 @@ fn uma_gpu_sem_seletor() {
     assert!(!out.contains("gpu 1/"));
 }
 
+/// Restaura `Lang::EnUs` no `Drop` mesmo em caso de pânico em teste de `pt-BR`.
+struct LangGuard;
+
+impl LangGuard {
+    fn set(lang: crate::i18n::Lang) -> Self {
+        crate::i18n::set(lang);
+        Self
+    }
+}
+
+impl Drop for LangGuard {
+    fn drop(&mut self) {
+        crate::i18n::set(crate::i18n::Lang::EnUs);
+    }
+}
+
 /// Interface em português do Brasil (`language = "pt-BR"`): textos traduzidos, vírgula decimal,
 /// nomes e números intactos.
 fn pt_br(mut st: State, w: u16, h: u16) -> String {
-    crate::i18n::set(crate::i18n::Lang::PtBr);
-    let out = render(&mut st, w, h);
-    crate::i18n::set(crate::i18n::Lang::EnUs);
-    out
+    let _lang = LangGuard::set(crate::i18n::Lang::PtBr);
+    render(&mut st, w, h)
 }
 
 #[test]
@@ -1601,7 +1687,7 @@ fn filtro_pt_br_sem_traducao() {
 #[test]
 fn ajuda_pt_br() {
     let mut st = filled();
-    st.help = true;
+    st.modal = view::Modal::Help;
     insta::assert_snapshot!(pt_br(st, 160, 40));
 }
 
@@ -1670,6 +1756,7 @@ fn tema_mono_continua_monocromatico_exceto_falha() {
         mono.neutral,
         mono.selected,
         mono.dim,
+        mono.ram_compressed,
     ] {
         let ratatui::style::Color::Rgb(r, g, b) = c else {
             panic!("esperava Rgb: {c:?}");
@@ -1757,4 +1844,105 @@ fn rede_download_em_cima_e_upload_embaixo() {
         max_recv_y < min_send_y,
         "download ({min_recv_y}..={max_recv_y}) deveria ficar acima do upload ({min_send_y})"
     );
+}
+
+#[test]
+fn extremos_dos_sensores_coincidem_com_sensor_rows() {
+    let st = tab_state(view::Tab::Sensors);
+    for r in view::sensors_tab::sensor_rows(&st) {
+        if let (Some(key), view::sensors_tab::SensorValue::Num(Ok(v), ..)) = (r.key(), &r.value) {
+            let mm = st
+                .session_sensor(&key)
+                .unwrap_or_else(|| panic!("sensor ausente em session.sensors: {key}"));
+            assert!(mm.0 <= *v && *v <= mm.1, "{key}: valor {v} fora de {mm:?}");
+        }
+    }
+}
+
+#[test]
+fn sensores_gpu_por_indice_e_smart_mascarado_ao_trocar_disco() {
+    let mut st = tab_state(view::Tab::Sensors);
+    // GPU com `index = 5` (não-sequencial) ainda encontra seu `GpuSlow` por `index == 5`.
+    let mut f = fast(1);
+    if let Ok(gpus) = &mut f.gpus {
+        gpus[0].index = 5;
+    }
+    let mut s = slow();
+    if let Ok(gpus) = &mut s.gpus {
+        gpus[0].index = 5;
+        gpus[0].pcie_tx = Ok(123 * MB);
+    }
+    // Hot-swap no disco 7: modelo diferente mascara TANTO temperatura quanto SMART.
+    if let Ok(temps) = &mut s.disk_temps {
+        for t in temps.iter_mut().filter(|t| t.number == 7) {
+            t.model = Some("Disco Antigo".into());
+            t.health = Ok(true);
+        }
+    }
+    st.push_fast(f);
+    st.push_slow(s);
+    let out = render(&mut st, 200, 50);
+    assert!(out.contains("GPU 5"), "{out}");
+    assert!(out.contains("PCIe TX"), "{out}");
+    assert!(!out.contains("FAILURE PREDICTED"), "{out}");
+    assert!(
+        out.contains("disk changed: waiting for a new reading"),
+        "{out}"
+    );
+}
+
+#[test]
+fn alias_de_rede_nao_e_traduzido_em_pt_br() {
+    let mut st = filled();
+    let mut f = fast(10);
+    if let Ok(nics) = &mut f.nics {
+        nics[1].alias = "game".into();
+        nics[1].description = "net adapter".into();
+    }
+    st.push_fast(f);
+    let out = pt_br(st, 160, 48);
+    assert!(out.contains("game  net adapter"), "{out}");
+}
+
+#[test]
+fn discos_80x24_nao_corta_falha_de_temperatura() {
+    let mut st = filled();
+    if let Some(s) = &mut st.slow
+        && let Ok(list) = &mut std::sync::Arc::make_mut(s).disk_temps
+    {
+        for t in list.iter_mut().filter(|t| t.number == 7) {
+            t.celsius = fail("SMART error");
+        }
+    }
+    // Com zoom ou sem notas de sobra: na linha do disco C: o "! failed" cabe inteiro em 80 cols.
+    st.zoom = Some(view::Zoom::Disks);
+    let out = render(&mut st, 80, 24);
+    assert!(out.contains("! failed"), "{out}");
+    bordas_intactas(&mut st, 80, 24);
+}
+
+#[test]
+fn memoria_comprimida_hardware_paging_e_alerta_bad_pages() {
+    let mut st = filled();
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("■ compressed 1.8G (5.4G raw)"), "{out}");
+    assert!(
+        out.contains("DDR4 · 3600 MT/s · 4/4 DIMM · 88.0 MB hw res"),
+        "{out}"
+    );
+    assert!(out.contains("boot peak 48.0 GB"), "{out}");
+    assert!(out.contains("paging in 0/s  out 0/s"), "{out}");
+    assert!(!out.contains("bad RAM pages"), "{out}");
+
+    // Alerta silencioso só aparece quando há páginas defeituosas (> 0).
+    let mut f = fast(1);
+    if let Ok(m) = &mut f.memory {
+        m.bad_pages = Ok(3);
+        m.paging = Ok((420.0, 12.0));
+    }
+    st.push_fast(f);
+    let out = render(&mut st, 160, 48);
+    assert!(out.contains("! bad RAM pages: 3 (hardware fault)"), "{out}");
+    assert!(out.contains("paging in 420/s  out 12/s"), "{out}");
+    bordas_intactas(&mut st, 160, 48);
 }

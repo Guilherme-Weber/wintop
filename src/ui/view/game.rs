@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use super::state::State;
 use super::{
     bar_sep, boxed, failed_span, label, line, metric, metric_styled, minmax, missing, put, sep,
-    waiting, wrap,
+    v_divider, waiting, wrap,
 };
 use crate::fmt::num;
 use crate::model::{FrameSource, Missing};
@@ -46,8 +46,8 @@ fn fps_ceiling(max: f64) -> f64 {
         .unwrap_or(FPS_STEPS[FPS_STEPS.len() - 1])
 }
 
-pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
-    let Some(fps) = st.fps.clone() else {
+pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &State) {
+    let Some(fps) = st.fps.as_deref() else {
         waiting(frame, area, boxed("game", ""));
         return;
     };
@@ -147,8 +147,13 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         ])
         .areas(inner);
     put(frame, Paragraph::new(lines), info, info);
-    let [fps_area, ft_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(graphs);
+    let [fps_area, sep_col, ft_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(graphs);
+    v_divider(frame, sep_col.x + 1, sep_col.y, sep_col.height, graphs);
 
     // FPS: teto na taxa do monitor (ou em degraus pelo máximo visível).
     let n = usize::from(fps_area.width) * 2;
@@ -156,7 +161,11 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let ceil = st
         .refresh_hz
         .map_or_else(|| fps_ceiling(st.game_fps.max_of(n)), f64::from);
-    let ceil_label = format!("{} ", num(ceil, 0));
+    let ceil_label = if st.refresh_hz.is_some() {
+        format!("{} Hz", num(ceil, 0))
+    } else {
+        format!("{} fps", num(ceil, 0))
+    };
     let mut fps_head = vec![
         label("FPS "),
         // Sem valor: marca curta (a causa inteira está nas linhas de baixo).
@@ -165,7 +174,7 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
                 let c = if *v < FPS_LOW {
                     th().fps_low
                 } else if *v > ceil {
-                    th().accent
+                    th().fps_over
                 } else {
                     th().fps
                 };
@@ -189,14 +198,14 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let head = head_fit(
         fps_head,
         minmax(st.session.fps, |v| num(v, 0)),
-        fps_area.width.saturating_sub(ceil_label.len() as u16 + 2),
+        fps_area.width.saturating_sub(ceil_label.len() as u16 + 1),
     );
     line(
         frame,
         head,
         fps_area.x,
         fps_area.y,
-        fps_area.width.saturating_sub(ceil_label.len() as u16 + 2),
+        fps_area.width.saturating_sub(ceil_label.len() as u16 + 1),
         fps_area,
     );
     put(
@@ -208,7 +217,7 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let gr = Rect::new(
         fps_area.x,
         fps_area.y + 1,
-        fps_area.width.saturating_sub(1),
+        fps_area.width,
         fps_area.height.saturating_sub(1),
     );
     let mut fps_graph = Graph::new(
@@ -249,26 +258,26 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             }),
         ],
         minmax(st.session.ft, |v| format!("{} ms", num(v, 1))),
-        ft_area.width.saturating_sub(1 + 6 + 2),
+        ft_area.width.saturating_sub(6),
     );
     line(
         frame,
         head,
-        ft_area.x + 1,
+        ft_area.x,
         ft_area.y,
-        ft_area.width.saturating_sub(1 + 6 + 2),
+        ft_area.width.saturating_sub(6),
         ft_area,
     );
     put(
         frame,
-        Paragraph::new(label(if has_history { "50 ms " } else { "" })).right_aligned(),
+        Paragraph::new(label(if has_history { "50 ms" } else { "" })).right_aligned(),
         Rect::new(ft_area.x, ft_area.y, ft_area.width, 1),
         ft_area,
     );
     let gr = Rect::new(
-        ft_area.x + 1,
+        ft_area.x,
         ft_area.y + 1,
-        ft_area.width.saturating_sub(1),
+        ft_area.width,
         ft_area.height.saturating_sub(1),
     );
     let mut ft_graph = Graph::new(
@@ -302,14 +311,24 @@ fn game_lines(g: &crate::model::Game, interval_ms: u64) -> Vec<Line<'static>> {
         Ok("CPU") => th().accent,
         _ => th().text,
     };
+    let low1_color =
+        g.lows.as_ref().map_or(
+            th().fps,
+            |(a, _)| if *a < FPS_LOW { th().fps_low } else { th().fps },
+        );
+    let low01_color =
+        g.lows.as_ref().map_or(
+            th().fps,
+            |(_, b)| if *b < FPS_LOW { th().fps_low } else { th().fps },
+        );
     extra
         .into_iter()
         .chain(vec![
             Line::from(vec![
                 label("1% low "),
-                metric_styled(&g.lows, th().fps, |(a, _)| num(*a, 0)),
+                metric_styled(&g.lows, low1_color, |(a, _)| num(*a, 0)),
                 label(&format!("   {}% low ", num(0.1, 1))),
-                metric_styled(&g.lows, th().fps, |(_, b)| num(*b, 0)),
+                metric_styled(&g.lows, low01_color, |(_, b)| num(*b, 0)),
                 bar_sep(),
                 label("frametime "),
                 metric(&g.frametime, |(a, lo, hi)| {

@@ -1,15 +1,16 @@
 //! Utilitários do Win32 usados pelos coletores.
 
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
 use std::ffi::c_void;
-use windows::Win32::Foundation::{FILETIME, HANDLE};
-
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Foundation::{FILETIME, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::{
-    GetTokenInformation, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    TokenElevation, TokenUser,
 };
 use windows::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
@@ -41,6 +42,13 @@ pub fn printable(s: &str) -> String {
         .collect()
 }
 
+/// Comparação de prefixo ASCII sem diferenciar maiúsculas e sem alocar `String`.
+pub fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
 /// Dono de um `HANDLE` do Win32: fecha no `Drop` (inclusive em caminhos de erro).
 ///
 /// # Safety
@@ -49,6 +57,53 @@ pub fn printable(s: &str) -> String {
 pub unsafe fn own(h: HANDLE) -> OwnedHandle {
     // SAFETY: garantido por quem chama (ver acima).
     unsafe { OwnedHandle::from_raw_handle(h.0) }
+}
+
+/// Dono de um `PSECURITY_DESCRIPTOR` alocado pela API Win32: libera com `LocalFree` no `Drop`.
+pub struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptor {
+    /// Constrói a partir de uma string SDDL (`ConvertStringSecurityDescriptorToSecurityDescriptorW`).
+    pub fn from_sddl(sddl: &str) -> Result<Self, String> {
+        let w = wide(sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: SDDL terminado em zero; `sd` passa a ser liberado pelo Drop de `Self`.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(w.as_ptr()),
+                SDDL_REVISION_1,
+                &raw mut sd,
+                None,
+            )
+        }
+        .map_err(|e| format!("SDDL: {e}"))?;
+        Ok(Self(sd))
+    }
+
+    /// Assume a posse de um descritor alocado pela API (ex.: `GetSecurityInfo`,
+    /// `GetNamedSecurityInfoW`).
+    ///
+    /// # Safety
+    /// `raw` tem de ter sido alocado para liberação por `LocalFree` (ou ser nulo) e não ter outro
+    /// dono.
+    pub unsafe fn from_raw(raw: PSECURITY_DESCRIPTOR) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            // SAFETY: descritor alocado pela API Win32 e liberado uma única vez.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
+            }
+        }
+    }
 }
 
 /// Processo elevado: DLLs carregadas em tempo de execução só de System32 (ou por caminho
@@ -104,10 +159,7 @@ pub fn long_path(p: &std::path::Path) -> PathBuf {
 
 /// Letra da unidade do Windows (ex.: `'C'`).
 pub fn windows_drive() -> Option<char> {
-    let mut buf = [0u16; 260];
-    // SAFETY: buffer local com o tamanho informado.
-    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut buf)) } as usize;
-    drive_letter(&String::from_utf16_lossy(buf.get(..n)?))
+    windows_dir().and_then(|d| drive_letter(&d.to_string_lossy()))
 }
 
 /// Letra de unidade no início de um caminho (`C:\...`, `\??\C:\...`), em maiúscula.
@@ -147,9 +199,7 @@ pub fn reg_multi_sz(key: &str, value: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Valor `REG_SZ` de `HKLM\<key>` na visão de 32 bits (`WOW6432Node`), como os programas de
-/// 32 bits (RTSS) gravam.
-pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
+fn reg_sz_with_flags(key: &str, value: &str, extra: REG_ROUTINE_FLAGS) -> Option<String> {
     let (k, v) = (wide(key), wide(value));
     let mut buf = vec![0u16; 1024];
     let mut len = (buf.len() * 2) as u32;
@@ -160,7 +210,7 @@ pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
             PCWSTR(k.as_ptr()),
             PCWSTR(v.as_ptr()),
             // NOEXPAND: REG_EXPAND_SZ é recusado (o ambiente é herdado de quem abriu o wintop).
-            REG_ROUTINE_FLAGS(RRF_RT_REG_SZ.0 | RRF_SUBKEY_WOW6432KEY.0 | RRF_NOEXPAND.0),
+            REG_ROUTINE_FLAGS(RRF_RT_REG_SZ.0 | RRF_NOEXPAND.0 | extra.0),
             None,
             Some(buf.as_mut_ptr().cast()),
             Some(&raw mut len),
@@ -171,6 +221,17 @@ pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
     }
     let s = from_wide(&buf[..(len as usize / 2).min(buf.len())]);
     (!s.is_empty()).then_some(s)
+}
+
+/// Valor `REG_SZ` de `HKLM\<key>` na visão nativa (64 bits), recusando `REG_EXPAND_SZ`.
+pub fn reg_sz(key: &str, value: &str) -> Option<String> {
+    reg_sz_with_flags(key, value, REG_ROUTINE_FLAGS(0))
+}
+
+/// Valor `REG_SZ` de `HKLM\<key>` na visão de 32 bits (`WOW6432Node`), como os programas de
+/// 32 bits (RTSS) gravam.
+pub fn reg_sz_32(key: &str, value: &str) -> Option<String> {
+    reg_sz_with_flags(key, value, RRF_SUBKEY_WOW6432KEY)
 }
 
 /// Caminho local e absoluto (`C:\...`): sem UNC (`\\servidor\...`), sem `\\?\` e sem `..`.
@@ -185,21 +246,26 @@ pub fn is_local_absolute(p: &std::path::Path) -> bool {
         && c.all(|x| matches!(x, Component::Normal(_)))
 }
 
+/// Token do processo atual aberto para leitura (`TOKEN_QUERY`).
+fn current_token() -> Option<OwnedHandle> {
+    let mut token = HANDLE::default();
+    // SAFETY: `token` recebe um handle válido em caso de sucesso e passa a ter dono logo abaixo.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
+    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
+    Some(unsafe { own(token) })
+}
+
 /// `true` quando o processo atual roda elevado.
 pub fn is_elevated() -> bool {
-    let mut token = HANDLE::default();
-    // SAFETY: token recebe um handle válido em caso de sucesso e passa a ter dono logo abaixo.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_err() {
+    let Some(token) = current_token() else {
         return false;
-    }
-    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
-    let _token = unsafe { own(token) };
+    };
     let mut elev = TOKEN_ELEVATION::default();
     let mut len = 0u32;
-    // SAFETY: buffer do tamanho de TOKEN_ELEVATION.
+    // SAFETY: token válido; buffer do tamanho de TOKEN_ELEVATION.
     let ok = unsafe {
         GetTokenInformation(
-            token,
+            HANDLE(token.as_raw_handle()),
             TokenElevation,
             Some((&raw mut elev).cast()),
             size_of::<TOKEN_ELEVATION>() as u32,
@@ -243,17 +309,13 @@ pub unsafe fn sid_string(sid: PSID) -> Option<String> {
 
 /// SID do usuário do token atual, em texto (S-1-5-21-...).
 pub fn user_sid() -> Option<String> {
-    let mut token = HANDLE::default();
-    // SAFETY: token passa a ter dono logo abaixo.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
-    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
-    let _token = unsafe { own(token) };
+    let token = current_token()?;
     let mut buf = vec![0u64; 64]; // alinhado para TOKEN_USER
     let mut len = 0u32;
-    // SAFETY: buffer local com o tamanho informado.
+    // SAFETY: token válido; buffer local com o tamanho informado.
     unsafe {
         GetTokenInformation(
-            token,
+            HANDLE(token.as_raw_handle()),
             TokenUser,
             Some(buf.as_mut_ptr().cast::<c_void>()),
             (buf.len() * 8) as u32,
@@ -271,15 +333,18 @@ pub fn user_sid() -> Option<String> {
 /// HKLM (não do ambiente nem do HKCU): o usuário não consegue redirecioná-la.
 pub fn profile_dir() -> Option<PathBuf> {
     use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
-    let mut token = HANDLE::default();
-    // SAFETY: token passa a ter dono logo abaixo.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
-    // SAFETY: OpenProcessToken teve sucesso; handle válido e sem outro dono.
-    let _token = unsafe { own(token) };
+    let token = current_token()?;
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
-    // SAFETY: buffer local com o tamanho (em caracteres) informado.
-    unsafe { GetUserProfileDirectoryW(token, Some(PWSTR(buf.as_mut_ptr())), &raw mut len) }.ok()?;
+    // SAFETY: token válido; buffer local com o tamanho (em caracteres) informado.
+    unsafe {
+        GetUserProfileDirectoryW(
+            HANDLE(token.as_raw_handle()),
+            Some(PWSTR(buf.as_mut_ptr())),
+            &raw mut len,
+        )
+    }
+    .ok()?;
     let n = buf.iter().position(|&c| c == 0)?;
     let p = PathBuf::from(String::from_utf16(&buf[..n]).ok()?);
     is_local_absolute(&p).then_some(p)
@@ -308,7 +373,6 @@ pub fn maximize_classic_console() -> bool {
     true
 }
 
-/// `FILETIME` em unidades de 100 ns.
 /// Taxa de atualização (Hz) do monitor principal, pelo modo de vídeo atual. `None` quando o
 /// Windows não informa (0 ou 1 = "padrão do hardware").
 pub fn primary_refresh_hz() -> Option<u32> {
@@ -323,6 +387,7 @@ pub fn primary_refresh_hz() -> Option<u32> {
     (ok.as_bool() && dm.dmDisplayFrequency > 1).then_some(dm.dmDisplayFrequency)
 }
 
+/// `FILETIME` em unidades de 100 ns.
 pub fn filetime(ft: FILETIME) -> u64 {
     (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
 }

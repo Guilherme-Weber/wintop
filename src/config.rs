@@ -173,7 +173,10 @@ fn template(c: &Config) -> String {
          \n\
          [colors]\n\
          # Override single theme colors with \"#rrggbb\", e.g. border = \"#4b5263\".\n\
-         # Names: border, title, text, label, accent, ok, warn, neutral, fail, selected, dim.\n",
+         # UI: border, title, text, label, accent, ok, warn, neutral, fail, selected, dim.\n\
+         # Graphs & bars: net_send, net_recv, fps, frametime, frametime_spike, fps_over,\n\
+         #   fps_low, encode, decode, ram_in_use, ram_compressed, ram_modified, ram_standby, game,\n\
+         #   vram_app, vram_compositor, vram_browser, vram_system, vram_kernel, low, mid, high.\n",
         c.interval_ms,
         c.theme,
         c.fold_pool.name(),
@@ -192,15 +195,38 @@ fn template(c: &Config) -> String {
 const DIR: &str = "wintop";
 const FILE: &str = "config.toml";
 
+/// Onde mora o `config.toml`: subpasta em `AppData\Roaming` ou a própria pasta do exe (portátil).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfigDir {
+    /// `<base>\<dir>` (ex.: `AppData\Roaming\wintop`, ou pasta de teste dentro de `Roaming`).
+    Roaming { base: PathBuf, dir: String },
+    /// Pasta do próprio exe no modo portátil (inclusive raiz de unidade, ex.: `D:\`).
+    Portable(PathBuf),
+}
+
+impl ConfigDir {
+    fn file_path(&self) -> PathBuf {
+        match self {
+            Self::Roaming { base, dir } => base.join(dir).join(FILE),
+            Self::Portable(d) => d.join(FILE),
+        }
+    }
+
+    fn open(&self, create: bool) -> Result<Option<crate::userfile::UserDir>, String> {
+        match self {
+            Self::Portable(d) => crate::userfile::UserDir::open_exe_dir(d).map(Some),
+            Self::Roaming { base, dir } => crate::userfile::UserDir::open(base, dir, create),
+        }
+    }
+}
+
 /// Configuração carregada: os valores, o documento (para regravar mantendo comentários) e
 /// os avisos (valores inválidos, arquivo com erro).
 pub struct Loaded {
     pub config: Config,
     doc: Option<DocumentMut>,
-    /// `AppData\Roaming` (a pasta `wintop` fica dentro).
-    base: Option<PathBuf>,
-    /// Nome da pasta dentro da base (`wintop`; outro só nos testes).
-    dir: String,
+    /// Localização do config (`AppData\Roaming\wintop` ou pasta portátil).
+    loc: Option<ConfigDir>,
     /// Problemas encontrados ao ler (a interface mostra o primeiro).
     pub warnings: Vec<String>,
     /// Gravação liberada (não com o arquivo do usuário em erro de sintaxe ou ilegível).
@@ -220,73 +246,64 @@ pub fn set_portable(dir: PathBuf) {
     let _ = PORTABLE.set(dir);
 }
 
-/// (base, pasta) do config: `<pasta do exe>` no modo portátil (base = a pasta acima dela),
-/// senão `%APPDATA%\wintop`.
-fn home() -> Option<(PathBuf, String)> {
+/// Local do config: pasta do exe no modo portátil, senão `%APPDATA%\wintop`.
+fn home() -> Option<ConfigDir> {
     if let Some(d) = PORTABLE.get() {
-        let name = d.file_name()?.to_string_lossy().to_string();
-        return Some((d.parent()?.to_path_buf(), name));
+        return Some(ConfigDir::Portable(d.clone()));
     }
-    Some((roaming()?, DIR.to_string()))
-}
-
-/// Abre `<base>\<name>`: a pasta do exe no modo portátil é aberta direto (pode estar na raiz
-/// de um disco ou ter outro dono; ver `UserDir::open_exe_dir`), o resto pelo `UserDir::open`.
-fn open_dir(
-    base: &std::path::Path,
-    name: &str,
-    create: bool,
-) -> Result<Option<crate::userfile::UserDir>, String> {
-    match PORTABLE.get() {
-        Some(d) if base.join(name) == *d => crate::userfile::UserDir::open_exe_dir(d).map(Some),
-        _ => crate::userfile::UserDir::open(base, name, create),
-    }
+    Some(ConfigDir::Roaming {
+        base: roaming()?,
+        dir: DIR.to_string(),
+    })
 }
 
 /// Abre a pasta do config (`%APPDATA%\wintop` ou a pasta do exe no modo portátil) pelo
 /// `userfile`. Usada também pelo log de debug.
 pub fn open_home_dir(create: bool) -> Result<Option<crate::userfile::UserDir>, String> {
-    let Some((base, name)) = home() else {
+    let Some(loc) = home() else {
         return Err("no AppData folder".into());
     };
-    open_dir(&base, &name, create)
+    loc.open(create)
 }
 
 /// Caminho do arquivo, para exibir: `%APPDATA%\wintop\config.toml` (ou o portátil).
 pub fn default_path() -> Option<PathBuf> {
-    home().map(|(b, d)| b.join(d).join(FILE))
+    home().map(|loc| loc.file_path())
 }
 
 /// Lê o config do lugar em uso (portátil ou `%APPDATA%`); `create` como em `load`.
 pub fn load_home(create: bool) -> Loaded {
-    match home() {
-        Some((b, d)) => load_in(Some(b), &d, create),
-        None => load(None, create),
-    }
+    load_at(home(), create)
 }
 
 /// Lê o arquivo em `<base>\wintop\config.toml`; `create`: cria com os padrões se faltar (a
 /// interface; o `--check` só lê). Todo acesso passa por `userfile` (o wintop roda elevado e a
 /// pasta é do usuário: links e redirecionamentos são recusados).
-pub fn load(base: Option<PathBuf>, create: bool) -> Loaded {
-    load_in(base, DIR, create)
+#[cfg(test)]
+fn load_in(base: Option<PathBuf>, dir_name: &str, create: bool) -> Loaded {
+    load_at(
+        base.map(|b| ConfigDir::Roaming {
+            base: b,
+            dir: dir_name.to_string(),
+        }),
+        create,
+    )
 }
 
-fn load_in(base: Option<PathBuf>, dir_name: &str, create: bool) -> Loaded {
+fn load_at(loc: Option<ConfigDir>, create: bool) -> Loaded {
     let mut l = Loaded {
         config: Config::default(),
         doc: None,
-        base: base.clone(),
-        dir: dir_name.to_string(),
+        loc: loc.clone(),
         warnings: Vec::new(),
-        writable: base.is_some(),
+        writable: loc.is_some(),
     };
-    let Some(base) = base else {
+    let Some(loc) = loc else {
         l.warnings
             .push("config: no AppData folder (defaults, not saved)".into());
         return l;
     };
-    let dir = match open_dir(&base, dir_name, create) {
+    let dir = match loc.open(create) {
         Ok(Some(d)) => d,
         // Sem a pasta no modo só leitura (a base passou nas checagens): padrões, sem aviso.
         Ok(None) => return l,
@@ -424,6 +441,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             None => warn.push("config: rtss.ignored must be a list of names".into()),
         }
     }
+    if doc
+        .get("colors")
+        .is_some_and(|t| t.as_table_like().is_none())
+    {
+        warn.push("config: colors must be a table ([colors])".into());
+    }
     if let Some(t) = doc.get("colors").and_then(Item::as_table_like) {
         for (k, v) in t.iter().take(64) {
             match v.as_str() {
@@ -465,23 +488,48 @@ fn update_doc(doc: &mut DocumentMut, c: &Config) {
     }
 }
 
+/// Gravação de `config.toml` já serializada em memória, pronta para ir para o disco em outra
+/// thread sem travar a interface.
+pub struct SaveJob {
+    loc: ConfigDir,
+    text: String,
+}
+
+impl SaveJob {
+    pub fn write(&self) -> Result<(), String> {
+        self.loc
+            .open(true)?
+            .ok_or("config folder not created")?
+            .write(FILE, &self.text)
+    }
+}
+
 impl Loaded {
-    /// Grava os valores que a interface muda (intervalo, tema, pool), mantendo o resto do
-    /// documento. Devolve o erro para a interface avisar.
-    pub fn save(&mut self, c: &Config) -> Result<(), String> {
+    /// Atualiza o documento em memória e devolve a gravação pronta para o disco.
+    pub fn prepare_save(&mut self, c: &Config) -> Result<SaveJob, String> {
         if !self.writable {
             return Err("config not saved (see the warning)".into());
         }
-        let base = self.base.clone().ok_or("no AppData folder")?;
+        let loc = self.loc.clone().ok_or("no AppData folder")?;
         let doc = self
             .doc
             .get_or_insert_with(|| template(c).parse().unwrap_or_default());
         update_doc(doc, c);
         let text = doc.to_string();
-        open_dir(&base, &self.dir, true)?
-            .ok_or("config folder not created")?
-            .write(FILE, &text)?;
         self.config = c.clone();
+        Ok(SaveJob { loc, text })
+    }
+
+    /// Grava os valores que a interface muda (intervalo, tema, pool), mantendo o resto do
+    /// documento. Devolve o erro para a interface avisar.
+    #[cfg(test)]
+    pub fn save(&mut self, c: &Config) -> Result<(), String> {
+        let prev = self.config.clone();
+        let job = self.prepare_save(c)?;
+        if let Err(e) = job.write() {
+            self.config = prev;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -494,20 +542,28 @@ impl Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+
+    /// Pasta de teste dentro da Roaming real, removida automaticamente no `Drop`.
+    struct TestDir {
+        base: PathBuf,
+        dir: String,
+        file: PathBuf,
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.base.join(&self.dir));
+        }
+    }
 
     /// Pasta de teste dentro da Roaming real (do usuário, como a de verdade), sem encostar no
-    /// `wintop\config.toml`: devolve (base, nome da pasta, caminho do arquivo).
-    fn temp(name: &str) -> (PathBuf, String, PathBuf) {
+    /// `wintop\config.toml`.
+    fn temp(name: &str) -> TestDir {
         let base = roaming().expect("Roaming");
         let dir = format!("wintop_test_{}_{name}", std::process::id());
         let _ = std::fs::remove_dir_all(base.join(&dir));
         let file = base.join(&dir).join(FILE);
-        (base, dir, file)
-    }
-
-    fn cleanup(base: &Path, dir: &str) {
-        let _ = std::fs::remove_dir_all(base.join(dir));
+        TestDir { base, dir, file }
     }
 
     /// Arquivo qualquer: a leitura dá valores válidos (ou os padrões), e a regravação do que a
@@ -550,36 +606,39 @@ mod tests {
 
     #[test]
     fn primeira_execucao_cria_com_os_padroes() {
-        let (base, dir, p) = temp("novo");
+        let t = temp("novo");
         // Só leitura (--check): não cria nada.
-        let l = load_in(Some(base.clone()), &dir, false);
-        assert!(l.warnings.is_empty() && !p.exists(), "{:?}", l.warnings);
-        let l = load_in(Some(base.clone()), &dir, true);
+        let l = load_in(Some(t.base.clone()), &t.dir, false);
+        assert!(
+            l.warnings.is_empty() && !t.file.exists(),
+            "{:?}",
+            l.warnings
+        );
+        let l = load_in(Some(t.base.clone()), &t.dir, true);
         assert!(l.warnings.is_empty(), "{:?}", l.warnings);
         assert_eq!(l.config, Config::default());
-        let text = std::fs::read_to_string(&p).expect("arquivo criado");
+        let text = std::fs::read_to_string(&t.file).expect("arquivo criado");
         assert!(
             text.contains("interval_ms = 1000") && text.contains("\"discord.exe\""),
             "{text}"
         );
         // O arquivo criado relido dá os mesmos valores.
         assert_eq!(
-            load_in(Some(base.clone()), &dir, true).config,
+            load_in(Some(t.base.clone()), &t.dir, true).config,
             Config::default()
         );
-        cleanup(&base, &dir);
     }
 
     #[test]
     fn gravar_preserva_comentarios_e_o_resto() {
-        let (base, dir, p) = temp("grava");
-        std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
+        let t = temp("grava");
+        std::fs::create_dir_all(t.file.parent().expect("pasta")).expect("pasta");
         std::fs::write(
-            &p,
+            &t.file,
             "# meu comentário\ninterval_ms = 500\ntheme = \"nord\"\n\n[rtss]\nignored = [\"obs64.exe\"]\n\n[colors]\nborder = \"#112233\"\n",
         )
         .expect("escrita");
-        let mut l = load_in(Some(base.clone()), &dir, true);
+        let mut l = load_in(Some(t.base.clone()), &t.dir, true);
         assert_eq!(l.config.interval_ms, 500);
         assert_eq!(l.config.theme, "nord");
         assert_eq!(l.config.rtss_ignored, vec!["obs64.exe"]);
@@ -591,7 +650,7 @@ mod tests {
         c.interval_ms = 1500;
         c.fold_pool = FoldPool::Fold;
         l.save(&c).expect("gravação");
-        let text = std::fs::read_to_string(&p).expect("leitura");
+        let text = std::fs::read_to_string(&t.file).expect("leitura");
         assert!(text.contains("# meu comentário"), "{text}");
         assert!(
             text.contains("interval_ms = 1500") && text.contains("fold_pool = \"fold\""),
@@ -601,33 +660,31 @@ mod tests {
             text.contains("obs64.exe") && text.contains("#112233"),
             "{text}"
         );
-        cleanup(&base, &dir);
     }
 
     #[test]
     fn arquivo_com_erro_abre_com_padroes_e_nao_e_regravado() {
-        let (base, dir, p) = temp("erro");
-        std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
+        let t = temp("erro");
+        std::fs::create_dir_all(t.file.parent().expect("pasta")).expect("pasta");
         let broken = "interval_ms = = 3\n";
-        std::fs::write(&p, broken).expect("escrita");
-        let mut l = load_in(Some(base.clone()), &dir, true);
+        std::fs::write(&t.file, broken).expect("escrita");
+        let mut l = load_in(Some(t.base.clone()), &t.dir, true);
         assert_eq!(l.config, Config::default());
         assert!(l.warnings[0].contains("syntax error"), "{:?}", l.warnings);
         assert!(l.save(&Config::default()).is_err());
         assert_eq!(
-            std::fs::read_to_string(&p).expect("leitura"),
+            std::fs::read_to_string(&t.file).expect("leitura"),
             broken,
             "edição do usuário intacta"
         );
-        cleanup(&base, &dir);
     }
 
     #[test]
     fn rtss_que_nao_e_tabela_nao_derruba_a_gravacao() {
-        let (base, dir, p) = temp("rtss");
-        std::fs::create_dir_all(p.parent().expect("pasta")).expect("pasta");
-        std::fs::write(&p, "rtss = \"off\"\n").expect("escrita");
-        let mut l = load_in(Some(base.clone()), &dir, true);
+        let t = temp("rtss");
+        std::fs::create_dir_all(t.file.parent().expect("pasta")).expect("pasta");
+        std::fs::write(&t.file, "rtss = \"off\"\ncolors = 123\n").expect("escrita");
+        let mut l = load_in(Some(t.base.clone()), &t.dir, true);
         assert!(
             l.warnings
                 .iter()
@@ -635,15 +692,27 @@ mod tests {
             "{:?}",
             l.warnings
         );
+        assert!(
+            l.warnings
+                .iter()
+                .any(|w| w.contains("colors must be a table")),
+            "{:?}",
+            l.warnings
+        );
         let mut c = l.config.clone();
         c.interval_ms = 700;
         l.save(&c).expect("gravação sem pânico");
-        let text = std::fs::read_to_string(&p).expect("leitura");
+        let text = std::fs::read_to_string(&t.file).expect("leitura");
         assert!(
             text.contains("rtss = \"off\"") && text.contains("interval_ms = 700"),
             "{text}"
         );
-        cleanup(&base, &dir);
+    }
+
+    #[test]
+    fn caminho_portatil_na_raiz_do_disco() {
+        let loc = ConfigDir::Portable(PathBuf::from(r"D:\"));
+        assert_eq!(loc.file_path(), PathBuf::from(r"D:\config.toml"));
     }
 
     #[test]

@@ -9,15 +9,18 @@
 
 use std::collections::HashMap;
 
-use crate::pdh::{self, Query, Slot};
+use crate::pdh::{self, PdhError, Query, Slot};
+#[cfg(test)]
+use crate::win::starts_with_ignore_ascii_case;
 
 /// `pid_1234_luid_..._phys_0_eng_3_engtype_VideoDecode` → (1234, "luid_..._phys_0", "VideoDecode").
+#[cfg(test)]
 fn parse(name: &str) -> Option<(u32, &str, &str)> {
     parse_engine(name).map(|(pid, adapter, _, engtype)| (pid, adapter, engtype))
 }
 
 /// Como `parse`, com o número da engine ("3").
-fn parse_engine(name: &str) -> Option<(u32, &str, &str, &str)> {
+pub(super) fn parse_engine(name: &str) -> Option<(u32, &str, &str, &str)> {
     let rest = name.strip_prefix("pid_")?;
     let (pid, rest) = rest.split_once('_')?;
     let (adapter, engine) = rest.split_once("_eng_")?;
@@ -37,47 +40,73 @@ pub(super) struct AdapterUse {
     pub other: Option<(String, f64)>,
 }
 
-pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
-    // (adaptador físico, engine) → (tipo, soma).
-    let mut per: HashMap<(String, &str), (&str, f64)> = HashMap::new();
-    for (name, v) in rows {
-        let Some((_, adapter, eng, engtype)) = parse_engine(name) else {
-            continue;
-        };
-        let adapter = adapter.to_ascii_lowercase();
-        if !adapter.starts_with(luid) {
-            continue;
-        }
+/// Acumulador em streaming de `AdapterUse`: guarda uma entrada por engine física (~10 por GPU)
+/// sem alocar `String` por instância PDH (~540/s).
+#[derive(Default)]
+pub(super) struct AdapterUseAcc {
+    /// `(phys, eng, engtype, soma)`.
+    per: Vec<(String, String, String, f64)>,
+}
+
+impl AdapterUseAcc {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push_parsed(&mut self, phys: &str, eng: &str, engtype: &str, v: f64) {
         let v = if v.is_finite() {
             v.clamp(0.0, 100.0)
         } else {
             0.0
         };
-        per.entry((adapter, eng)).or_insert((engtype, 0.0)).1 += v;
-    }
-    let mut out = AdapterUse::default();
-    let max = |slot: &mut Option<f64>, v: f64| *slot = Some(slot.unwrap_or(0.0).max(v));
-    for (engtype, sum) in per.into_values() {
-        let v = sum.min(100.0);
-        out.usage = out.usage.max(v);
-        if is_encode(engtype) {
-            max(&mut out.encode, v);
-        }
-        if is_decode(engtype) {
-            max(&mut out.decode, v);
-        }
-        if engtype != "3D"
-            && !is_encode(engtype)
-            && !is_decode(engtype)
-            && out
-                .other
-                .as_ref()
-                .is_none_or(|(t, o)| v > *o || (v == *o && engtype < t.as_str()))
-        {
-            out.other = Some((engtype.to_string(), v));
+        if let Some(entry) = self.per.iter_mut().find(|e| e.0 == phys && e.1 == eng) {
+            entry.3 += v;
+        } else {
+            self.per
+                .push((phys.to_string(), eng.to_string(), engtype.to_string(), v));
         }
     }
-    out
+
+    pub(super) fn finish(self) -> AdapterUse {
+        let mut out = AdapterUse::default();
+        let max = |slot: &mut Option<f64>, v: f64| *slot = Some(slot.unwrap_or(0.0).max(v));
+        for (_, _, engtype, sum) in self.per {
+            let v = sum.min(100.0);
+            out.usage = out.usage.max(v);
+            if is_encode(&engtype) {
+                max(&mut out.encode, v);
+            }
+            if is_decode(&engtype) {
+                max(&mut out.decode, v);
+            }
+            if engtype != "3D"
+                && !is_encode(&engtype)
+                && !is_decode(&engtype)
+                && out
+                    .other
+                    .as_ref()
+                    .is_none_or(|(t, o)| v > *o || (v == *o && engtype.as_str() < t.as_str()))
+            {
+                out.other = Some((engtype, v));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+pub(super) fn adapter_use(rows: &[(String, f64)], luid: &str) -> AdapterUse {
+    let mut acc = AdapterUseAcc::new();
+    for (name, v) in rows {
+        let Some((_, adapter, eng, engtype)) = parse_engine(name) else {
+            continue;
+        };
+        if !starts_with_ignore_ascii_case(adapter, luid) {
+            continue;
+        }
+        acc.push_parsed(&adapter[luid.len()..], eng, engtype, *v);
+    }
+    acc.finish()
 }
 
 /// Engine de codificação de vídeo. A AMD expõe encode e decode numa engine só
@@ -94,31 +123,57 @@ pub fn is_decode(engtype: &str) -> bool {
 /// PID → (tipo de engine → uso %), só das instâncias do adaptador `luid`.
 pub(super) type Engines = HashMap<u32, Vec<(String, f64)>>;
 
+/// Acumulador em streaming de `Engines` (aba GPU): evita materializar `Vec<(String, f64)>`.
+#[derive(Default)]
+pub(super) struct EnginesAcc {
+    by_pid: Engines,
+}
+
+impl EnginesAcc {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push_parsed(&mut self, pid: u32, engtype: &str, v: f64) {
+        let v = if v.is_finite() {
+            v.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let list = self.by_pid.entry(pid).or_default();
+        if let Some((_, cur)) = list.iter_mut().find(|(t, _)| t == engtype) {
+            *cur = cur.max(v);
+        } else {
+            list.push((engtype.to_string(), v));
+        }
+    }
+
+    pub(super) fn finish(mut self) -> Engines {
+        for v in self.by_pid.values_mut() {
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        self.by_pid
+    }
+}
+
+#[cfg(test)]
 pub(super) fn group(rows: &[(String, f64)], luid: &str) -> Engines {
-    let mut out: HashMap<u32, HashMap<&str, f64>> = HashMap::new();
+    let mut acc = EnginesAcc::new();
     for (name, v) in rows {
         let Some((pid, adapter, engtype)) = parse(name) else {
             continue;
         };
-        if !adapter.to_ascii_lowercase().starts_with(luid) {
+        if !starts_with_ignore_ascii_case(adapter, luid) {
             continue;
         }
-        let e = out.entry(pid).or_default().entry(engtype).or_insert(0.0);
-        *e = e.max(v.clamp(0.0, 100.0));
+        acc.push_parsed(pid, engtype, *v);
     }
-    out.into_iter()
-        .map(|(pid, m)| {
-            let mut v: Vec<(String, f64)> =
-                m.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0));
-            (pid, v)
-        })
-        .collect()
+    acc.finish()
 }
 
 /// Consulta aberta só enquanto a aba GPU está visível.
 pub(super) struct EngineCollector {
-    open: Option<(Result<Query, String>, Slot)>,
+    open: Option<(Result<Query, PdhError>, Slot)>,
     /// Coletas desde a abertura (taxa só existe a partir da 2ª).
     samples: u32,
 }
@@ -148,18 +203,29 @@ impl EngineCollector {
             (q, slot)
         });
         // Contador recusado: a causa real (ex.: objeto PDH ausente), não "sem dados".
-        slot.as_ref().map_err(Clone::clone)?;
-        q.as_ref().map_err(Clone::clone)?.collect()?;
+        slot.as_ref().map_err(ToString::to_string)?;
+        q.as_ref()
+            .map_err(ToString::to_string)?
+            .collect()
+            .map_err(String::from)?;
         self.samples = self.samples.saturating_add(1);
         Ok(self.samples >= 2)
     }
 
-    /// Linhas da última coleta.
-    pub(super) fn rows(&self) -> Result<Vec<(String, f64)>, String> {
+    /// Percorre as linhas da última coleta sem alocar `String` por instância.
+    pub(super) fn for_each_row(&self, f: impl FnMut(&str, f64)) -> Result<(), String> {
         match &self.open {
-            Some((q, slot)) => pdh::read_array(q, slot),
+            Some((q, slot)) => pdh::for_each_array(q, slot, f).map_err(String::from),
             None => Err("GPU engine query is closed".into()),
         }
+    }
+
+    /// Linhas da última coleta.
+    #[cfg(test)]
+    pub(super) fn rows(&self) -> Result<Vec<(String, f64)>, String> {
+        let mut out = Vec::new();
+        self.for_each_row(|name, v| out.push((name.to_string(), v)))?;
+        Ok(out)
     }
 }
 

@@ -24,19 +24,27 @@ mod cpu;
 mod disks;
 mod game;
 mod gpu;
+pub(super) mod gpu_tab;
 mod net;
+pub(super) mod procs_tab;
+pub(super) mod sensors_tab;
 mod state;
-pub(super) mod tabs;
+mod table;
 
 use cpu::{draw_cpu, mem_text};
 use disks::{disk_notes, disk_order, draw_disks, pool_folded, same_disk};
 use game::draw_game;
 pub(super) use gpu::vram_legend;
-use gpu::{draw_gpu, engine_label, vram_bar};
+use gpu::{draw_gpu, engine_label, snap_top_height, vram_bar};
 use net::draw_net;
+#[cfg(test)]
+pub use procs_tab::ProcSort;
 use state::MinMax;
-pub use state::{Hits, ListHit, State, TOAST_FOR, Tab, UpdateUi, Zoom};
-pub use tabs::{GpuSort, ProcSort};
+#[cfg(test)]
+pub use state::TOAST_FOR;
+pub use state::{Hits, ListHit, Modal, RuntimeJob, RuntimeStatus, State, Tab, UpdateUi, Zoom};
+#[cfg(test)]
+pub use table::SortCol;
 // --- Texto ---
 
 /// Valor, estado neutro (cinza) ou falha (vermelho, com a causa); sem controles.
@@ -67,26 +75,61 @@ fn temp_color(c: f64, limit: f64) -> Color {
     }
 }
 
-/// Largura da faixa do termômetro vertical à direita do gráfico de CPU/GPU.
-const TEMP_BAR_W: u16 = 5;
+/// Cor dinâmica pelo percentual de carga (0..=100), a partir de 40% do gradiente do tema para
+/// manter leitura nítida sobre fundo escuro (igual às tabelas de Processos/GPU).
+fn usage_color(pct: f64) -> Color {
+    super::widgets::gradient(0.4 + 0.6 * (pct / 100.0).clamp(0.0, 1.0))
+}
 
-/// Termômetro vertical: limite de referência no topo, barra vertical em braille com o gradiente
-/// no meio e a leitura atual embaixo (enchendo de baixo para cima em direção ao limite).
+/// Cor semântica para percentual de ocupação em barras (RAM, VRAM, commit, pagefile).
+fn bar_pct_color(pct: f64) -> Color {
+    if pct >= 95.0 {
+        th().high
+    } else if pct >= 85.0 {
+        th().warn
+    } else {
+        th().text
+    }
+}
+
+/// Linha divisória vertical sutil (`│`) entre gráficos adjacentes dentro de uma mesma caixa.
+fn v_divider(frame: &mut Frame<'_>, x: u16, y: u16, h: u16, bound: Rect) {
+    let style = Style::new().fg(th().border);
+    for dy in 0..h {
+        let r = Rect::new(x, y + dy, 1, 1);
+        if r.intersection(bound).width > 0 {
+            frame.render_widget(Paragraph::new(Span::styled("│", style)), r);
+        }
+    }
+}
+
+/// Largura da faixa do termômetro vertical à direita do gráfico de CPU/GPU (1 col divisor + 5).
+const TEMP_BAR_W: u16 = 6;
+
+/// Termômetro vertical: divisor fino à esquerda, limite de referência no topo, barra vertical em
+/// braille com o gradiente no meio e a leitura atual embaixo.
 fn draw_temp_bar(frame: &mut Frame<'_>, area: Rect, temp_c: f64, limit_c: f64) {
-    if area.width < 4 || area.height < 4 {
+    if area.width < 5 || area.height < 4 {
         return;
     }
+    v_divider(frame, area.x, area.y, area.height, area);
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
     let lim = label(&format!(" {:>3}°", limit_c.round() as i32));
-    line(frame, vec![lim], area.x, area.y, area.width, area);
-    let bar_h = area.height.saturating_sub(2);
+    line(frame, vec![lim], inner.x, inner.y, inner.width, inner);
+    let bar_h = inner.height.saturating_sub(2);
     let val = ((temp_c - 20.0) / (limit_c - 20.0).max(1.0)).clamp(0.0, 1.0);
     let bar = Rect::new(
-        area.x + 2,
-        area.y + 1,
-        2.min(area.width.saturating_sub(2)),
+        inner.x + 2,
+        inner.y + 1,
+        2.min(inner.width.saturating_sub(2)),
         bar_h,
     );
-    frame.render_widget(VerticalBar { value: val }, bar.intersection(area));
+    frame.render_widget(VerticalBar { value: val }, bar.intersection(inner));
     let cur = Span::styled(
         format!(" {:>3}°", temp_c.round() as i32),
         Style::new()
@@ -96,28 +139,49 @@ fn draw_temp_bar(frame: &mut Frame<'_>, area: Rect, temp_c: f64, limit_c: f64) {
     line(
         frame,
         vec![cur],
-        area.x,
-        area.y + area.height - 1,
-        area.width,
-        area,
+        inner.x,
+        inner.y + inner.height - 1,
+        inner.width,
+        inner,
     );
 }
 
 /// Divisor horizontal rotulado (`── memory ────`, `── VRAM ────`) dentro de uma caixa.
 fn section_divider(frame: &mut Frame<'_>, divider: Rect, whole: Rect, title: &str) {
+    section_divider_right(frame, divider, whole, title, "");
+}
+
+/// Divisor horizontal com rótulo à esquerda e contexto opcional à direita (ex.: hardware de RAM).
+fn section_divider_right(
+    frame: &mut Frame<'_>,
+    divider: Rect,
+    whole: Rect,
+    title: &str,
+    right: &str,
+) {
     let label_txt = format!("{} ", tr(title));
-    let prefix_w = 3 + label_txt.chars().count();
-    let fill = usize::from(divider.width).saturating_sub(prefix_w);
-    put(
-        frame,
-        Paragraph::new(Line::from(vec![
-            Span::styled("── ", Style::new().fg(th().border)),
-            Span::styled(label_txt, Style::new().fg(th().title)),
-            Span::styled("─".repeat(fill), Style::new().fg(th().border)),
-        ])),
-        divider,
-        whole,
-    );
+    let left_w = 3 + Span::raw(label_txt.as_str()).width();
+    let total_w = usize::from(divider.width);
+    let right_txt = if right.is_empty() {
+        String::new()
+    } else {
+        format!(" {right} ")
+    };
+    let right_w = Span::raw(right_txt.as_str()).width();
+    let mut spans = vec![
+        Span::styled("── ", Style::new().fg(th().border)),
+        Span::styled(label_txt, Style::new().fg(th().title)),
+    ];
+    if !right_txt.is_empty() && left_w + right_w + 4 <= total_w {
+        let fill = total_w - left_w - right_w - 2;
+        spans.push(Span::styled("─".repeat(fill), Style::new().fg(th().border)));
+        spans.push(Span::styled(right_txt, Style::new().fg(th().label)));
+        spans.push(Span::styled("──", Style::new().fg(th().border)));
+    } else {
+        let fill = total_w.saturating_sub(left_w);
+        spans.push(Span::styled("─".repeat(fill), Style::new().fg(th().border)));
+    }
+    put(frame, Paragraph::new(Line::from(spans)), divider, whole);
 }
 
 fn missing(e: &Missing) -> Span<'static> {
@@ -139,6 +203,12 @@ fn text(s: impl Into<String>) -> Span<'static> {
     Span::styled(s, Style::new().fg(th().text))
 }
 
+/// Texto literal do usuário ou de hardware (nunca traduzido por `tr`, ex.: alias de rede,
+/// nome de processo, modelo de placa/disco).
+fn raw_text(s: impl Into<String>) -> Span<'static> {
+    Span::styled(s.into(), Style::new().fg(th().text))
+}
+
 /// Valor zerado em tom de rótulo (o número fica, só sai do primeiro plano).
 fn faded(sp: Span<'static>, zero: bool) -> Span<'static> {
     if zero {
@@ -153,7 +223,7 @@ fn sep() -> Span<'static> {
 }
 
 fn bar_sep() -> Span<'static> {
-    Span::styled("  │  ", Style::new().fg(th().dim))
+    Span::styled("  │  ", Style::new().fg(th().border))
 }
 
 /// "min X max Y" de um extremo da sessão.
@@ -203,7 +273,6 @@ fn with_failure(b: Block<'static>, e: Option<&Missing>) -> Block<'static> {
     }
 }
 
-/// Desenha um parágrafo recortado a `bound`.
 /// Valor curto para um cabeçalho sem espaço para a causa: o valor, "-" (estado neutro) ou
 /// "! failed" (a causa inteira vai, quebrada, nas linhas de detalhe da caixa).
 fn brief<T>(m: &Metric<T>, f: impl FnOnce(&T) -> String) -> Span<'static> {
@@ -219,6 +288,7 @@ fn failed_span() -> Span<'static> {
     Span::styled(tr("! failed").into_owned(), Style::new().fg(th().fail))
 }
 
+/// Desenha um parágrafo recortado a `bound`.
 fn put(frame: &mut Frame<'_>, p: Paragraph<'static>, r: Rect, bound: Rect) {
     frame.render_widget(p, r.intersection(bound));
 }
@@ -290,7 +360,7 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     let mut notice: Vec<Line<'static>> = st.notice.as_ref().map_or_else(Vec::new, |n| {
         wrap(
             vec![Span::styled(
-                format!("! {}", printable(n)),
+                format!("! {}", printable(&tr(n))),
                 Style::new().fg(th().fail),
             )],
             frame.area().width,
@@ -298,10 +368,8 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
             3,
         )
     });
-    // Resultado de uma ação (some depois de alguns segundos).
-    if let Some((msg, err, at)) = &st.toast
-        && at.elapsed() < TOAST_FOR
-    {
+    // Resultado de uma ação (a expiração acontece fora do desenho, em `State::expire_toast`).
+    if let Some((msg, err, _)) = &st.toast {
         let (mark, color) = if *err {
             ("! ", th().fail)
         } else {
@@ -332,18 +400,15 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     draw_footer(frame, footer, st);
     match st.tab {
         Tab::Overview => draw_overview(frame, body, st),
-        Tab::Processes => tabs::draw_processes(frame, body, st),
-        Tab::Gpu => tabs::draw_gpu_tab(frame, body, st),
-        Tab::Sensors => tabs::draw_sensors(frame, body, st),
+        Tab::Processes => procs_tab::draw_processes(frame, body, st),
+        Tab::Gpu => gpu_tab::draw_gpu_tab(frame, body, st),
+        Tab::Sensors => sensors_tab::draw_sensors(frame, body, st),
     }
-    if st.help {
-        draw_help(frame, body);
-    }
-    if let Some(u) = &st.update {
-        draw_update(frame, body, u);
-    }
-    if let Some((pid, name, _)) = &st.confirm_end {
-        draw_confirm_end(frame, body, *pid, name);
+    match &st.modal {
+        Modal::None | Modal::Filter => {}
+        Modal::Help => draw_help(frame, body),
+        Modal::Update(u) => draw_update(frame, body, u),
+        Modal::ConfirmEnd { pid, name, .. } => draw_confirm_end(frame, body, *pid, name),
     }
 }
 
@@ -527,17 +592,16 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
+fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
     // Uma caixa ampliada ocupa a aba inteira.
     if let Some(z) = st.zoom {
         match z {
             Zoom::Cpu => {
-                let mem_rows = mem_text(st, body.width).map_or(2, |t| t.height().saturating_sub(2));
-                draw_cpu(frame, body, st, mem_rows);
+                draw_cpu(frame, body, st, mem_text(st, body.width));
             }
             Zoom::Gpu => draw_gpu(frame, body, st, None),
             Zoom::Net => draw_net(frame, body, st),
-            Zoom::Disks => draw_disks(frame, body, st),
+            Zoom::Disks => draw_disks(frame, body, st, &disk_order(st), None),
             Zoom::Game => draw_game(frame, body, st),
         }
         return;
@@ -548,33 +612,39 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &mut State) {
     // linhas de detalhe (o conhost do atalho abre com 30 linhas); os gráficos é que encolhem.
     const TOP_MIN: u16 = 23;
     // A caixa do jogo tem sempre a mesma altura, com ou sem jogo (o layout não pula quando um
-    // jogo abre; pedido do usuário, 2026-11-22).
-    let game_min = 8;
+    // jogo abre; pedido do usuário, 2026-11-22). Em terminais muito curtos (piso 80×24, body ≤ 23),
+    // cede 2 linhas para que ao menos 1 disco apareça na caixa de discos.
+    let game_min = if body.height <= 23 { 6 } else { 8 };
     // Discos: cabeçalho + uma linha por disco visível, mais uma por causa de falha (inteira,
-    // embaixo da tabela). Largura da coluna da direita, como no layout abaixo.
-    let right_w = body.width - body.width * 34 / 100;
-    let disk_rows = (disk_order(st).len() + disk_notes(st, right_w.saturating_sub(2)).len()) as u16;
+    // embaixo da tabela). Calculados uma vez e reaproveitados em `draw_disks`.
+    let right_inner_w = (body.width - body.width * 34 / 100).saturating_sub(2);
+    let order = disk_order(st);
+    let notes = disk_notes(st, right_inner_w);
+    let disk_rows = (order.len() + notes.len()) as u16;
     let top_h = (body.height * 58 / 100).max(TOP_MIN);
     // Embaixo, sempre o mínimo útil: algumas linhas de discos e a faixa do jogo.
     let bottom_min = ((disk_rows.min(3) + 3 + game_min).max(9)).min(body.height / 2);
-    let top_h = top_h.min(body.height.saturating_sub(bottom_min));
+    let max_top = body.height.saturating_sub(bottom_min);
+    let top_h = top_h.min(max_top);
+    let gpu_w = body.width.saturating_sub(body.width * 56 / 100);
+    let top_h = snap_top_height(st, gpu_w, top_h, TOP_MIN.min(max_top), max_top);
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
     let [cpu, gpu] =
         Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).areas(top);
     let [net, right] =
         Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).areas(bottom);
-    // Linhas da memória dentro da caixa da CPU (sem as bordas, que são da caixa).
-    let mem_rows = mem_text(st, cpu.width).map_or(2, |t| t.height().saturating_sub(2));
+    // Linhas da memória calculadas uma vez e reutilizadas em `draw_cpu`.
+    let mem = mem_text(st, cpu.width);
     let disks_h = (disk_rows + 3)
         .min(right.height.saturating_sub(game_min))
         .max(4);
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
-    let core_graph = draw_cpu(frame, cpu, st, mem_rows);
+    let core_graph = draw_cpu(frame, cpu, st, mem);
     draw_gpu(frame, gpu, st, core_graph);
     draw_net(frame, net, st);
-    draw_disks(frame, disks, st);
+    draw_disks(frame, disks, st, &order, Some((right_inner_w, notes)));
     draw_game(frame, game, st);
 }
 
@@ -666,7 +736,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         }
     }
     if !st.clock.is_empty() {
-        let extra = [bar_sep(), text(st.clock.clone())];
+        let extra = [bar_sep(), raw_text(st.clock.clone())];
         if width(&right) + width(&extra) <= room {
             right.extend(extra);
         }
@@ -683,7 +753,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     };
     // Atalhos em grupos inteiros (tecla + rótulo): um grupo que não cabe sai inteiro.
     // Digitando o filtro, as teclas viram texto: só os atalhos do filtro (e Ctrl+C).
-    let mut groups: Vec<[Span<'static>; 2]> = if st.filtering {
+    let filtering = st.is_filtering();
+    let mut groups: Vec<[Span<'static>; 2]> = if filtering {
         Vec::new()
     } else {
         vec![[key(" 1-4"), label(" tabs  ")]]
@@ -717,7 +788,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     };
     let pairs: &[(&str, &str)] = match st.tab {
         Tab::Overview => &overview,
-        Tab::Processes | Tab::Gpu if st.filtering => &[
+        Tab::Processes | Tab::Gpu if filtering => &[
             (" type", " to filter  "),
             ("enter", " keep  "),
             ("esc", " clear  "),
@@ -759,10 +830,10 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     for (k, l) in pairs {
         groups.push([key(k), label(l)]);
     }
-    if !st.filtering && matches!(st.tab, Tab::Overview | Tab::Gpu) && st.gpu_count() > 1 {
+    if !filtering && matches!(st.tab, Tab::Overview | Tab::Gpu) && st.gpu_count() > 1 {
         groups.push([key("g"), label(" next gpu  ")]);
     }
-    if !st.filtering {
+    if !filtering {
         groups.push([key("p"), label(" pause  ")]);
         groups.push([key("?"), label(" help  ")]);
         groups.push([key("q"), label(" quit")]);
@@ -772,11 +843,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let failing = failing_sources(st);
     let status = |narrow: bool| -> Vec<Span<'static>> {
         let mut right = Vec::new();
+        let app_label = format!("wintop v{} ", env!("CARGO_PKG_VERSION"));
         if let Some(f) = &st.fast {
             match &f.own {
                 Ok(o) => {
                     right.extend([
-                        label("wintop "),
+                        label(&app_label),
                         metric(&o.cpu, |v| format!("{}%", num(*v, 2))),
                         Span::raw(" "),
                         metric(&o.private_ws, |v| bytes(*v)),
@@ -789,7 +861,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
                         ]);
                     }
                 }
-                Err(e) => right.extend([label("wintop "), missing(e)]),
+                Err(e) => right.extend([label(&app_label), missing(e)]),
             }
             if !narrow {
                 right.extend([
@@ -836,7 +908,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     // Prioridade na falta de espaço: abas, sair, ajuda, pausa e depois os atalhos da aba;
     // digitando o filtro só há os atalhos dele, na ordem. A ordem na tela continua a natural.
     let n = groups.len();
-    let mut priority: Vec<usize> = if st.filtering || n < 4 {
+    let mut priority: Vec<usize> = if filtering || n < 4 {
         (0..n).collect()
     } else {
         // Abas, sair, ajuda, os atalhos da aba e por último a pausa.
@@ -956,7 +1028,11 @@ pub(super) fn failing_sources(st: &State) -> usize {
         }
     }
     // Runtimes pedidos na aba GPU (aparecem no detalhe dela).
-    add(st.tab == Tab::Gpu && st.runtimes.values().any(|(_, r)| failed(r)));
+    add(st.tab == Tab::Gpu
+        && st
+            .runtimes
+            .values()
+            .any(|(_, r)| matches!(r, RuntimeStatus::Ready(m) if failed(m))));
     if let Some(f) = &st.fps {
         add(failed(&f.rtss));
         add(failed(&f.pipe));
@@ -990,6 +1066,8 @@ fn empty_box<T>(frame: &mut Frame<'_>, area: Rect, title: &str, m: Option<&Metri
     }
 }
 
+/// Quebra `spans` em linhas de até `width` colunas mantendo grupos iniciados por espaço juntos
+/// (e quebrando por palavra quando um grupo inteiro não cabe). O separador inicial ("│"/espaço)
 /// some e a continuação começa com `indent` espaços. `first` é o recuo da primeira linha.
 pub(super) fn wrap(
     spans: Vec<Span<'static>>,
@@ -1106,10 +1184,43 @@ pub(super) fn wrap(
     lines
 }
 
+/// Texto formatado à direita de uma barra (`" 21.0 GB / 32.0 GB (66%)"`) com o percentual
+/// colorido por pressão (`warn` ≥ 85%, `high` ≥ 95%).
+fn bar_value(m: &Metric<(u64, u64)>) -> (Line<'static>, u16) {
+    match m {
+        Ok((u, t)) => {
+            let p = *u as f64 / (*t).max(1) as f64 * 100.0;
+            let main = format!(" {} / {} ", bytes(*u), bytes(*t));
+            let pct_txt = format!("({}%)", num(p, 0));
+            let line = Line::from(vec![
+                text(main),
+                Span::styled(pct_txt, Style::new().fg(bar_pct_color(p))),
+            ]);
+            let w = line.width() as u16;
+            (line, w)
+        }
+        Err(e) => {
+            let sp = missing(e);
+            let w = sp.width() as u16;
+            (Line::from(sp), w)
+        }
+    }
+}
+
+/// Largura comum do texto à direita de um grupo de barras (ex.: RAM + commit + pagefile) para que
+/// todas terminem exatamente na mesma coluna vertical, sem oscilar quando valores mudam de dígito.
+fn aligned_bar_text_w(metrics: &[&Metric<(u64, u64)>]) -> u16 {
+    metrics
+        .iter()
+        .filter(|&&m| m.is_ok())
+        .map(|m| bar_value(m).1)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Largura do texto ao lado de uma barra: o valor inteiro antes da barra; sem valor, usa toda a
 /// largura depois do rótulo para a causa.
-fn text_room(t: &Span<'_>, missing: bool, width: u16, label_w: u16) -> u16 {
-    let w = t.width() as u16;
+fn text_room(w: u16, missing: bool, width: u16, label_w: u16) -> u16 {
     if missing {
         w.min(width.saturating_sub(label_w))
     } else {
@@ -1118,23 +1229,30 @@ fn text_room(t: &Span<'_>, missing: bool, width: u16, label_w: u16) -> u16 {
     }
 }
 
-/// Linha "rótulo ⣿⣿ usado/total" dentro de `area`, na linha `row`.
-fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<(u64, u64)>) {
+/// Linha "rótulo ⣿⣿ usado/total" dentro de `area`, na linha `row`, com largura mínima de texto
+/// opcional (`min_text_w`) para alinhar várias barras do mesmo bloco.
+fn bar_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    row: u16,
+    name: &str,
+    m: &Metric<(u64, u64)>,
+    min_text_w: u16,
+) {
     if row >= area.height {
         return;
     }
     let y = area.y + row;
-    let t = metric(m, |(u, t)| {
-        format!(
-            " {} / {} ({}%)",
-            bytes(*u),
-            bytes(*t),
-            num(*u as f64 / (*t).max(1) as f64 * 100.0, 0)
-        )
-    });
-    let label_w = (name.len() as u16 + 1).min(area.width);
-    let text_w = text_room(&t, m.is_err(), area.width, label_w);
-    line(frame, vec![label(name)], area.x, y, label_w, area);
+    let (val_line, raw_w) = bar_value(m);
+    let label_span = label(name);
+    let label_w = (label_span.width() as u16 + 1).min(area.width);
+    let target_w = if m.is_err() {
+        raw_w
+    } else {
+        raw_w.max(min_text_w)
+    };
+    let text_w = text_room(target_w, m.is_err(), area.width, label_w);
+    line(frame, vec![label_span], area.x, y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     if let Ok((u, t)) = m {
         let v = if *t > 0 { *u as f64 / *t as f64 } else { 0.0 };
@@ -1143,9 +1261,14 @@ fn bar_line(frame: &mut Frame<'_>, area: Rect, row: u16, name: &str, m: &Metric<
             Rect::new(area.x + label_w, y, bar_w, 1).intersection(area),
         );
     }
+    let p = if m.is_err() {
+        Paragraph::new(val_line)
+    } else {
+        Paragraph::new(val_line).right_aligned()
+    };
     put(
         frame,
-        Paragraph::new(t),
+        p,
         Rect::new(area.x + label_w + bar_w, y, text_w, 1),
         area,
     );

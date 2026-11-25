@@ -3,7 +3,6 @@
 //! Bytes em unidade binária com os rótulos do Gerenciador de Tarefas ("GB" = 2^30), para os
 //! valores baterem com ele (ver `docs/divergencias.md`). Bits de rede em unidade decimal.
 
-/// Número com `dec` casas e ponto decimal.
 /// Número com `dec` casas, com o separador decimal do idioma da interface.
 pub fn num(v: f64, dec: usize) -> String {
     crate::i18n::decimal(format!("{v:.dec$}"))

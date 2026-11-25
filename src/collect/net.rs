@@ -25,6 +25,9 @@ const FILTER_INTERFACE: u8 = 1 << 1;
 
 struct Known {
     row: Box<MIB_IF_ROW2>,
+    /// Nome e descrição em cache (decodificados só na descoberta a cada 30 s).
+    alias: String,
+    description: String,
     /// (instante, recebidos, enviados) da coleta anterior.
     last: Option<(Instant, u64, u64)>,
 }
@@ -105,11 +108,13 @@ impl NetCollector {
                     .and_then(|k| k.last);
                 Known {
                     row: Box::new(*r),
+                    alias: from_wide(&r.Alias),
+                    description: from_wide(&r.Description),
                     last,
                 }
             })
             .collect();
-        found.sort_by_key(|k| from_wide(&k.row.Alias));
+        found.sort_by(|a, b| a.alias.cmp(&b.alias));
         self.nics = found;
         self.error = None;
     }
@@ -130,22 +135,15 @@ impl NetCollector {
             // SAFETY: linha própria com InterfaceLuid preenchido (chave da consulta).
             let r = unsafe { GetIfEntry2(&raw mut *k.row) };
             let now = Instant::now();
-            let nic = Nic {
-                alias: from_wide(&k.row.Alias),
-                description: from_wide(&k.row.Description),
-                link: fail(""),
-                send: fail(""),
-                recv: fail(""),
-                errors: fail(""),
-            };
             if r.is_err() {
                 lost = true;
                 out.push(Nic {
+                    alias: k.alias.clone(),
+                    description: k.description.clone(),
                     link: fail(format!("GetIfEntry2: error {}", r.0)),
                     send: fail("interface disappeared"),
                     recv: fail("interface disappeared"),
                     errors: fail("interface disappeared"),
-                    ..nic
                 });
                 continue;
             }
@@ -160,6 +158,8 @@ impl NetCollector {
                 }
             };
             out.push(Nic {
+                alias: k.alias.clone(),
+                description: k.description.clone(),
                 link: match (connected, k.row.ReceiveLinkSpeed) {
                     (false, _) => neutral("disconnected"),
                     (true, LINK_SPEED_UNKNOWN) => fail("link speed unknown"),
@@ -170,7 +170,6 @@ impl NetCollector {
                 // Só erros (pacote com defeito); descartes são comuns (filtros, protocolos
                 // desconhecidos) e não indicam problema.
                 errors: Ok((k.row.InErrors, k.row.OutErrors)),
-                ..nic
             });
         }
         if lost {
