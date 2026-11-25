@@ -262,6 +262,8 @@ pub struct GpuSlow {
     pub pcie_rx: Metric<u64>,
     /// VRAM dedicada por categoria (como o gputaskman).
     pub vram: Metric<VramBreakdown>,
+    /// Memória compartilhada da GPU por categoria (`\GPU Process Memory(*)\Shared Usage`).
+    pub shared: Metric<VramBreakdown>,
     /// Processos com VRAM ou uso de engine (só com a aba GPU visível; `None` fora dela).
     pub procs: Option<Metric<Vec<GpuProc>>>,
 }
@@ -720,6 +722,7 @@ impl GpuSlow {
         f("pcie_tx", self.pcie_tx.as_ref().err());
         f("pcie_rx", self.pcie_rx.as_ref().err());
         f("vram", self.vram.as_ref().err());
+        f("shared", self.shared.as_ref().err());
         if let Some(procs) = &self.procs {
             f("procs", procs.as_ref().err());
             if let Ok(pl) = procs {

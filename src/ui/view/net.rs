@@ -32,15 +32,15 @@ fn net_rate(st: &State, bits_per_s: f64) -> String {
 }
 
 /// Rede compacta: por placa, 1 linha de identificação (nome, descrição, link, erros) e 1 de
-/// taxas (↓/↑ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
-/// sobrando (download em cima, upload embaixo). Placas desconectadas numa linha só.
+/// taxas (↑/↓ com o máximo da sessão e a escala comum); o gráfico espelhado só entra com altura
+/// sobrando (upload em cima, download embaixo). Placas desconectadas numa linha só.
 pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let nics = st.fast.as_ref().map(|f| &f.nics);
     let Some(Ok(list)) = nics else {
         empty_box(frame, area, "net", nics);
         return;
     };
-    let block = boxed("net", "↓ receive  ↑ send");
+    let block = boxed("net", "↑ send  ↓ receive");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Só o estado neutro ("disconnected") vai para a linha de desconectadas; falha aparece.
@@ -51,12 +51,12 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &State) {
     let rate_lines = |n: &Nic| -> Vec<Line<'static>> {
         let mut spans = Vec::new();
         for (arrow, m, color, mm) in [
-            ("↓ ", &n.recv, th().net_recv, st.session.recv.get(&n.alias)),
+            ("↑ ", &n.send, th().net_send, st.session.send.get(&n.alias)),
             (
-                "  ↑ ",
-                &n.send,
-                th().net_send,
-                st.session.send.get(&n.alias),
+                "  ↓ ",
+                &n.recv,
+                th().net_recv,
+                st.session.recv.get(&n.alias),
             ),
         ] {
             spans.push(Span::styled(arrow, Style::new().fg(color)));
@@ -155,7 +155,7 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &State) {
                 |m: &HashMap<String, Series>| m.get(&n.alias).map_or(0.0, |s| s.max_of(n_samples));
             let scale = peak(&st.send).max(peak(&st.recv)).max(NET_FLOOR);
             // Com ≥ 3 linhas, a escala ganha linha própria acima do gráfico (nunca sobrescreve
-            // os picos mais recentes) e download/upload ficam com alturas exatamente simétricas.
+            // os picos mais recentes) e upload/download ficam com alturas exatamente simétricas.
             let (graph_y, half) = if graph_h >= 3 {
                 put(
                     frame,
@@ -169,10 +169,10 @@ pub(super) fn draw_net(frame: &mut Frame<'_>, area: Rect, st: &State) {
                 (y, graph_h / 2)
             };
             for (series, color, top, h, inverted) in [
-                (st.recv.get(&n.alias), th().net_recv, graph_y, half, false),
+                (st.send.get(&n.alias), th().net_send, graph_y, half, false),
                 (
-                    st.send.get(&n.alias),
-                    th().net_send,
+                    st.recv.get(&n.alias),
+                    th().net_recv,
                     graph_y + half,
                     half,
                     true,

@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use super::state::State;
 use super::table;
 use super::{
-    boxed, empty_box, faded, failed_span, label, line, metric, metric_styled, put, short_bytes,
+    boxed, compact_bytes, empty_box, faded, failed_span, label, line, metric, metric_styled, put,
     temp_color, wrap,
 };
 use crate::fmt::num;
@@ -134,9 +134,9 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
         for (what, m) in fails {
             match m {
                 Some(m @ Missing::Fail(_)) => note(&name, what, m),
-                // "asleep" cabe na coluna da capacidade (6 cols); em idiomas onde a tradução
-                // passa de 6 cols (ex.: "repouso"), vai para a nota em vez de estourar a coluna.
-                Some(m @ Missing::Neutral(n)) if tr(n).chars().count() > 6 => {
+                // "asleep" e "repouso" cabem na coluna da capacidade (7 cols); textos mais longos
+                // vão para a nota em vez de estourar a coluna.
+                Some(m @ Missing::Neutral(n)) if tr(n).chars().count() > 7 => {
                     note(&name, what, m);
                 }
                 _ => {}
@@ -196,28 +196,28 @@ pub(super) fn draw_disks(
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // Atividade (5), resposta (8), leitura e escrita (9 cada) e temperatura (2 + "! failed").
-    // Depois do nome: barramento (7), tipo (4), capacidade (6 + espaço), flags (4) e 2 espaços.
+    // Atividade (5), resposta (8), leitura e escrita (10 cada) e temperatura (1 ou 2 + "! failed").
+    // Depois do nome: barramento (7), tipo (4), capacidade (7 + espaço), flags (4) e 2 espaços.
     // Sem largura para tudo (o conhost abre com 120 colunas), saem primeiro barramento, tipo e
     // resposta (as falhas deles continuam nas notas); leitura, escrita e temperatura ficam.
-    let compact = inner.width < 12 + 24 + 41;
+    let compact = inner.width < 12 + 25 + 43;
     // Ainda mais estreito (o piso de 80 colunas): as flags S/P vão junto do nome, para a
     // temperatura não ser cortada.
-    let tiny = inner.width < 12 + 13 + 33;
+    let tiny = inner.width < 12 + 14 + 35;
     // Com folga (nome inteiro e a atividade), IOPS e fila entram depois da escrita.
-    let wide = inner.width >= 26 + 24 + 52 + 12;
+    let wide = inner.width >= 26 + 25 + 54 + 12;
     let (left_w, info_full): (u16, u16) = if tiny {
-        (8, 33)
+        (8, 34)
     } else if compact {
-        (13, 33)
+        (14, 35)
     } else if wide {
-        (24, 52)
+        (25, 54)
     } else {
-        (24, 41)
+        (25, 43)
     };
-    // O nome encolhe antes de tudo (até 10 cols no piso 80×24 para "! failed" de temperatura
+    // O nome encolhe antes de tudo (até 9 cols no piso 80×24 para "! failed" de temperatura
     // caber inteiro); a atividade fica com a sobra. As colunas nunca se sobrepõem.
-    let name_min = if tiny { 10 } else { 12 };
+    let name_min = if tiny { 9 } else { 12 };
     let name_w = inner
         .width
         .saturating_sub(left_w + info_full + 4)
@@ -238,11 +238,11 @@ pub(super) fn draw_disks(
         tr("drive")
     };
     let left_head = if tiny {
-        format!("{:>6}  ", "cap")
+        format!("{:>7} ", "cap")
     } else if compact {
-        format!("{:>6} {:<4}  ", "cap", "flg")
+        format!("{:>7} {:<4}  ", "cap", "flg")
     } else {
-        format!("{:<7}{:<4}{:>6} {:<4}  ", "bus", "typ", "cap", "flg")
+        format!("{:<7}{:<4}{:>7} {:<4}  ", "bus", "typ", "cap", "flg")
     };
     line(
         frame,
@@ -262,17 +262,21 @@ pub(super) fn draw_disks(
             inner,
         );
     }
+    let temp_gap = if tiny { " " } else { "  " };
     line(
         frame,
         vec![label(&if compact {
-            format!("{:>5}{:>9}{:>9}  temp", "act", "read", "write")
+            format!("{:>5}{:>10}{:>10}{temp_gap}temp", "act", "read", "write")
         } else if wide {
             format!(
-                "{:>5}{:>8}{:>9}{:>9}{:>7}{:>4}  temp",
+                "{:>5}{:>8}{:>10}{:>10}{:>7}{:>4}  temp",
                 "act", "resp", "read", "write", "iops", "q"
             )
         } else {
-            format!("{:>5}{:>8}{:>9}{:>9}  temp", "act", "resp", "read", "write")
+            format!(
+                "{:>5}{:>8}{:>10}{:>10}  temp",
+                "act", "resp", "read", "write"
+            )
         })],
         info_x,
         inner.y,
@@ -347,8 +351,8 @@ pub(super) fn draw_disks(
             .as_ref()
             .map_or_else(missing_mark, |s| if *s { "SSD" } else { "HDD" }.to_string());
         let cap = match &d.capacity {
-            Ok(c) => short_bytes(*c),
-            Err(Missing::Neutral(n)) if tr(n).chars().count() <= 6 => tr(n).into_owned(),
+            Ok(c) => compact_bytes(*c),
+            Err(Missing::Neutral(n)) if tr(n).chars().count() <= 7 => tr(n).into_owned(),
             Err(e) => missing_mark(e),
         };
         let flags = format!(
@@ -370,15 +374,15 @@ pub(super) fn draw_disks(
             ));
         }
         if tiny {
-            left_spans.push(label(&format!("{cap:>6}  ")));
+            left_spans.push(label(&format!("{cap:>7} ")));
         } else if compact {
-            left_spans.push(label(&format!("{cap:>6} ")));
+            left_spans.push(label(&format!("{cap:>7} ")));
             left_spans.push(Span::styled(
                 format!("{flags:<4}  "),
                 Style::new().fg(th().accent),
             ));
         } else {
-            left_spans.push(label(&format!("{bus:<7}{typ:<4}{cap:>6} ")));
+            left_spans.push(label(&format!("{bus:<7}{typ:<4}{cap:>7} ")));
             left_spans.push(Span::styled(
                 format!("{flags:<4}  "),
                 Style::new().fg(th().accent),
@@ -418,11 +422,11 @@ pub(super) fn draw_disks(
         // temperatura continua no lugar dela.
         // Largura das colunas de I/O (para o "! failed" ocupar o lugar delas).
         let io_w = if compact {
-            23
+            25
         } else if wide {
-            42
+            44
         } else {
-            31
+            33
         };
         let info = match (&d.active, &d.response, &d.read, &d.write) {
             (Err(e), Err(_), Err(_), Err(_)) => vec![
@@ -433,7 +437,7 @@ pub(super) fn draw_disks(
                     ),
                     Missing::Neutral(n) => label(&format!("{:<w$}", printable(n), w = io_w)),
                 },
-                Span::raw("  "),
+                Span::raw(temp_gap),
                 t,
             ],
             _ => vec![
@@ -453,13 +457,13 @@ pub(super) fn draw_disks(
                 },
                 faded(
                     metric(&d.read, |v| {
-                        format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                        format!(" {:>9}", format!("{}/s", compact_bytes(*v as u64)))
                     }),
                     d.read.as_ref().is_ok_and(|v| *v < 1.0),
                 ),
                 faded(
                     metric(&d.write, |v| {
-                        format!(" {:>8}", format!("{}/s", short_bytes(*v as u64)))
+                        format!(" {:>9}", format!("{}/s", compact_bytes(*v as u64)))
                     }),
                     d.write.as_ref().is_ok_and(|v| *v < 1.0),
                 ),
@@ -479,7 +483,7 @@ pub(super) fn draw_disks(
                 } else {
                     Span::raw("")
                 },
-                Span::raw("  "),
+                Span::raw(temp_gap),
                 t,
             ],
         };

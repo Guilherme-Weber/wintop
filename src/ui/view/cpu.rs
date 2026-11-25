@@ -11,7 +11,7 @@ use super::state::{Series, State};
 use super::{
     TEMP_BAR_W, aligned_bar_text_w, bar_line, bar_sep, bar_value, boxed, brief, draw_temp_bar,
     empty_box, faded, label, line, metric, metric_styled, minmax, missing, put,
-    section_divider_right, sep, short_bytes, temp_colored, text, text_room, usage_color, v_divider,
+    section_divider_right, sep, temp_colored, text, text_room, usage_color, v_divider,
     with_failure, wrap,
 };
 use crate::fmt::{bytes, num};
@@ -110,7 +110,7 @@ pub(super) fn draw_cpu(
         }),
         Span::raw(" "),
         metric_styled(&c.base_mhz, th().label, |m| {
-            format!("(base {})", num(f64::from(*m) / 1000.0, 2))
+            format!("(base {} GHz)", num(f64::from(*m) / 1000.0, 2))
         }),
     ];
     // Sem o tempo de kernel por lógico a grade mostra só o total: a causa aparece.
@@ -340,7 +340,7 @@ fn draw_core_grid(
                     let g = if clocks { ghz(i) } else { None };
                     [
                         label(&format!("{gap}C{i} ")),
-                        text(g.map_or_else(|| pct.clone(), |g| format!("{pct} {g}"))),
+                        text(g.map_or_else(|| pct.clone(), |g| format!("{pct} {g} GHz"))),
                     ]
                 })
                 .collect();
@@ -381,17 +381,13 @@ fn draw_core_grid(
         let id = format!("C{i}");
         let pct_str = format!("{}%", num(*v, 0));
         let pct_span = faded(text(pct_str.clone()), *v < 0.5);
-        // Clock na mesma linha do uso: "C12 100% 4.05 GHz" com 17 colunas, "4.05G" com 14, só
-        // o número com 13; sem largura, numa linha própria acima do gráfico (se houver altura).
+        // Clock sempre com unidade completa (`GHz`): na mesma linha do uso com 17+ colunas
+        // ("C12 100% 4.05 GHz"); abaixo disso, na 2ª linha da célula (quando houver altura).
         // O formato vem da célula mais estreita: a grade inteira fica igual.
         let mut graph_top = 1;
         let inline_clk = ghz(i).and_then(|g| {
             if narrowest >= 17 {
                 Some(format!(" {g} GHz"))
-            } else if narrowest >= 14 {
-                Some(format!(" {g}G"))
-            } else if narrowest >= 13 {
-                Some(format!(" {g}"))
             } else {
                 if cell.height >= 3 {
                     line(
@@ -552,7 +548,7 @@ pub(super) fn mem_text(st: &State, width: u16) -> Option<MemText> {
                     spans.extend([
                         Span::styled("  ■ ", Style::new().fg(c)),
                         label(&format!("{name} ")),
-                        text(short_bytes(v)),
+                        text(bytes(v)),
                     ]);
                 };
             if p.game > 0 {
@@ -564,9 +560,9 @@ pub(super) fn mem_text(st: &State, width: u16) -> Option<MemText> {
                     spans.extend([
                         Span::styled("  ■ ", Style::new().fg(th().ram_compressed)),
                         label("compressed "),
-                        text(format!("{} ", short_bytes(p.compressed))),
+                        text(format!("{} ", bytes(p.compressed))),
                         Span::styled(
-                            format!("({} {})", short_bytes(p.uncompressed), tr("raw")),
+                            format!("({} {})", bytes(p.uncompressed), tr("raw")),
                             Style::new().fg(th().label),
                         ),
                     ]);
@@ -590,10 +586,10 @@ pub(super) fn mem_text(st: &State, width: u16) -> Option<MemText> {
                 vec![
                     Span::styled("  ■ ", Style::new().fg(th().ram_modified)),
                     label("modified "),
-                    metric(&m.modified, |v| short_bytes(*v)),
+                    metric(&m.modified, |v| bytes(*v)),
                     Span::styled("  ■ ", Style::new().fg(th().ram_standby)),
                     label("standby "),
-                    metric(&m.standby, |v| short_bytes(*v)),
+                    metric(&m.standby, |v| bytes(*v)),
                 ],
                 inner,
                 RAM_LABEL_W,

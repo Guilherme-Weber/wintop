@@ -9,8 +9,8 @@
 //! - antes de criar a tarefa, a ACL da pasta e do executável é conferida: nenhuma entrada dá
 //!   escrita a Todos, Usuários, Usuários autenticados, Interativo ou ao próprio usuário, e o
 //!   dono é Administradores, SYSTEM ou TrustedInstaller;
-//! - o XML da tarefa é escrito dentro dessa pasta protegida (nunca no `%TEMP%`, onde outro
-//!   processo poderia trocá-lo entre a escrita e o `schtasks`).
+//! - o registro, a remoção e o disparo da tarefa usam a API COM nativa `ITaskService` diretamente
+//!   em memória (sem gravar XML temporário em disco nem abrir subprocesso `schtasks.exe`).
 
 use std::path::{Path, PathBuf};
 
@@ -368,28 +368,112 @@ pub fn task_xml(exe: &Path, user: &str) -> String {
     )
 }
 
-fn schtasks(args: &[&str]) -> Result<(), String> {
-    let exe = crate::win::system_dir()
-        .ok_or("System32 not found")?
-        .join("schtasks.exe");
-    let out = std::process::Command::new(&exe)
-        .args(args)
-        .output()
-        .map_err(|e| format!("{}: {e}", exe.display()))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "schtasks {}: {}",
-            args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+/// Guarda RAII para inicialização COM na thread atual (`CoUninitialize` só se esta guarda
+/// realmente inicializou o apartamento; aceita `RPC_E_CHANGED_MODE` se já estava em MTA).
+struct ComGuard {
+    uninit: bool,
+}
+
+impl ComGuard {
+    fn init() -> Result<Self, String> {
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        // SAFETY: inicializa COM na thread atual; `Drop` desfaz só quando `uninit == true`.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if hr.is_ok() {
+            Ok(Self { uninit: true })
+        } else if hr == RPC_E_CHANGED_MODE {
+            Ok(Self { uninit: false })
+        } else {
+            Err(format!("COM: {}", windows::core::Error::from(hr)))
+        }
     }
 }
 
-/// Dispara a tarefa: abre a cópia instalada elevada (sem UAC).
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.uninit {
+            // SAFETY: pareado com o `CoInitializeEx` bem-sucedido nesta thread.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+/// Conecta à pasta raiz (`\`) do Agendador de Tarefas via API COM nativa `ITaskService`.
+fn with_task_folder<T>(
+    action: &str,
+    f: impl FnOnce(&windows::Win32::System::TaskScheduler::ITaskFolder) -> windows::core::Result<T>,
+) -> Result<T, String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::System::TaskScheduler::{ITaskService, TaskScheduler};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let _com = ComGuard::init()?;
+    let r = (|| -> windows::core::Result<T> {
+        // SAFETY: COM inicializado; objetos COM liberados no Drop antes do `_com`.
+        unsafe {
+            let svc: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            let empty = VARIANT::default();
+            svc.Connect(&empty, &empty, &empty, &empty)?;
+            let folder = svc.GetFolder(&BSTR::from("\\"))?;
+            f(&folder)
+        }
+    })();
+    r.map_err(|e| format!("Task Scheduler ({action}): {e}"))
+}
+
+/// Registra (ou atualiza) a tarefa agendada `wintop` em memória via `ITaskService`, sem XML em
+/// disco nem subprocesso `schtasks.exe`.
+fn register_task(exe: &Path, user: &str) -> Result<(), String> {
+    use windows::Win32::System::TaskScheduler::{
+        TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let xml = task_xml(exe, user);
+    with_task_folder("register", |folder| {
+        let empty = VARIANT::default();
+        // SAFETY: `folder` é um `ITaskFolder` válido conectado ao serviço local.
+        unsafe {
+            folder.RegisterTask(
+                &BSTR::from(TASK),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// Remove a tarefa agendada `wintop` via `ITaskService`.
+fn delete_task() -> Result<(), String> {
+    use windows::core::BSTR;
+
+    with_task_folder("delete", |folder| {
+        // SAFETY: `folder` é um `ITaskFolder` válido conectado ao serviço local.
+        unsafe { folder.DeleteTask(&BSTR::from(TASK), 0) }
+    })
+}
+
+/// Dispara a tarefa: abre a cópia instalada elevada (sem UAC) via `ITaskService`.
 pub fn run_task() -> Result<(), String> {
-    schtasks(&["/run", "/tn", TASK])
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    with_task_folder("run", |folder| {
+        // SAFETY: `folder` e `task` são interfaces COM válidas conectadas ao serviço local.
+        unsafe {
+            let task = folder.GetTask(&BSTR::from(TASK))?;
+            task.Run(&VARIANT::default())?;
+        }
+        Ok(())
+    })
 }
 
 /// Versão da cópia instalada (`wintop.exe --version`), se houver uma.
@@ -628,31 +712,16 @@ fn read_modules(from: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize, IPersistFile,
-    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
     use windows::core::Interface;
-
-    struct ComGuard;
-    impl Drop for ComGuard {
-        fn drop(&mut self) {
-            // SAFETY: pareado com o `CoInitializeEx` bem-sucedido nesta thread.
-            unsafe { CoUninitialize() };
-        }
-    }
 
     let schtasks = crate::win::system_dir()
         .ok_or("System32 not found")?
         .join("schtasks.exe");
     let w = |s: &str| wide(s);
-    // SAFETY: COM iniciado nesta thread só para criar o atalho; `ComGuard` desfaz no Drop.
-    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
-        .ok()
-        .map_err(|e| format!("COM: {e}"))?;
-    let _com = ComGuard;
+    let _com = ComGuard::init()?;
     let r = (|| -> windows::core::Result<()> {
         // SAFETY: COM inicializado; strings UTF-16 vivas durante cada chamada; objetos liberados
         // no Drop antes do `_com`.
@@ -734,20 +803,7 @@ pub fn install() -> Result<(), String> {
     secure_owner_tree(&dir)?;
     check_tree(&dir)?;
     let user = crate::win::user_sid().ok_or("could not read the user SID")?;
-    let xml = dir.join("wintop-task.xml");
-    let utf16: Vec<u8> = std::iter::once(0xFEFFu16)
-        .chain(task_xml(&exe, &user).encode_utf16())
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    // Arquivo novo e exclusivo (um que já exista, ou um link no lugar, é apagado antes).
-    if xml.exists() || is_link(&xml) {
-        std::fs::remove_file(&xml).map_err(|e| format!("{}: {e}", xml.display()))?;
-    }
-    create_protected(&xml, &utf16, false)?;
-    check_tree(&xml)?;
-    let r = schtasks(&["/create", "/tn", TASK, "/xml", &xml.to_string_lossy(), "/f"]);
-    let _ = std::fs::remove_file(&xml);
-    r?;
+    register_task(&exe, &user)?;
     println!(
         "scheduled task \"{TASK}\" created (runs {} elevated)",
         exe.display()
@@ -774,7 +830,7 @@ pub fn uninstall() -> Result<(), String> {
     if !crate::win::is_elevated() {
         return Err("run --uninstall elevated".into());
     }
-    match schtasks(&["/delete", "/tn", TASK, "/f"]) {
+    match delete_task() {
         Ok(()) => println!("scheduled task \"{TASK}\" removed"),
         Err(e) => println!("scheduled task: {e}"),
     }
@@ -917,5 +973,18 @@ mod tests {
         let p = unsafe_acl(&mine).expect("acl");
         let _ = std::fs::remove_dir_all(&mine);
         assert!(!p.is_empty(), "pasta do usuário é gravável sem elevação");
+    }
+
+    /// Conexão somente leitura ao Agendador de Tarefas via COM (`ITaskService`), sem alterar
+    /// nenhuma tarefa (valida que o binding COM e a inicialização funcionam sem elevação).
+    #[test]
+    fn task_scheduler_com_conecta_na_pasta_raiz() {
+        with_task_folder("connect", |folder| {
+            // SAFETY: `folder` é um `ITaskFolder` válido retornado por `GetFolder("\\")`.
+            let path = unsafe { folder.Path()? };
+            assert_eq!(path.to_string(), "\\");
+            Ok(())
+        })
+        .expect("ITaskService conectado");
     }
 }

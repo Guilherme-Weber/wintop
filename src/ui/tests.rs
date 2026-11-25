@@ -213,6 +213,19 @@ fn slow() -> Slow {
                 ],
                 processes: vec![],
             }),
+            shared: Ok(crate::model::VramBreakdown {
+                total: 16 * GB,
+                used: 3 * GB,
+                segments: vec![
+                    (crate::model::VramKind::App, 1500 * MB),
+                    (crate::model::VramKind::Compositor, 400 * MB),
+                    (crate::model::VramKind::Browser, 900 * MB),
+                    (crate::model::VramKind::System, 200 * MB),
+                    (crate::model::VramKind::Kernel, 72 * MB),
+                    (crate::model::VramKind::Free, 13 * GB),
+                ],
+                processes: vec![],
+            }),
             procs: None,
         }]),
         disk_temps: Ok(vec![
@@ -522,11 +535,11 @@ fn linhas_de_detalhe_nao_cortam_nada() {
     for (w, h) in [(160, 48), (210, 52), (240, 64)] {
         let out = render(&mut filled(), w, h);
         for want in [
-            "free 5.0G",
-            "kernel 4.0M",
+            "free 5.0 GB",
+            "kernel 4.0 MB",
             "rx 250.0 MB/s",
             "(NVML)",
-            "video 2220/3090 MHz",
+            "video 2220/3090",
             "182004 handles",
             "frame 6.80 ms",
             "1000 ms tick",
@@ -1126,6 +1139,14 @@ fn injections() -> Vec<(&'static str, Inject)> {
             }),
         ),
         (
+            "slow.shared",
+            Box::new(|_, sl, _, t| {
+                if let Ok(l) = &mut sl.gpus {
+                    l[0].shared = f(t);
+                }
+            }),
+        ),
+        (
             "slow.pcie_tx",
             Box::new(|_, sl, _, t| {
                 if let Ok(l) = &mut sl.gpus {
@@ -1701,7 +1722,7 @@ fn melhorias_v13_barra_temp_divisor_vram_ram_do_jogo_e_cores_semanticas() {
     assert!(out.contains("── memory "), "{out}");
     assert!(out.contains("── vram "), "{out}");
     // RAM do jogo em foco aparece destacada na legenda da RAM.
-    assert!(out.contains("■ game 6.0G"), "{out}");
+    assert!(out.contains("■ game 6.0 GB"), "{out}");
     // Termômetros verticais de CPU (61° / 95°) e GPU (45° / 90°).
     assert!(out.contains(" 61°") && out.contains(" 95°"), "{out}");
     assert!(out.contains(" 45°") && out.contains(" 90°"), "{out}");
@@ -1808,7 +1829,7 @@ fn engines_da_gpu_tem_altura_e_passo_identicos() {
 }
 
 #[test]
-fn rede_download_em_cima_e_upload_embaixo() {
+fn rede_upload_em_cima_e_download_embaixo() {
     let mut st = filled();
     let mut t = Terminal::new(TestBackend::new(210, 52)).expect("terminal de teste");
     t.draw(|f| view::draw(f, &mut st)).expect("desenho");
@@ -1819,30 +1840,30 @@ fn rede_download_em_cima_e_upload_embaixo() {
             .next()
             .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
     };
-    // Na metade esquerda inferior (caixa `net`), pontos braille de download (`net_recv`) devem
-    // ficar em linhas acima dos pontos de upload (`net_send`).
-    let mut min_recv_y = u16::MAX;
-    let mut max_recv_y = 0u16;
+    // Na metade esquerda inferior (caixa `net`), pontos braille de upload (`net_send`) devem
+    // ficar em linhas acima dos pontos de download (`net_recv`).
     let mut min_send_y = u16::MAX;
+    let mut max_send_y = 0u16;
+    let mut min_recv_y = u16::MAX;
     for y in 35..51u16 {
         for x in 1..70u16 {
             let cell = &buf[(x, y)];
             if !is_braille(cell.symbol()) {
                 continue;
             }
-            if cell.fg == th.net_recv {
-                min_recv_y = min_recv_y.min(y);
-                max_recv_y = max_recv_y.max(y);
-            } else if cell.fg == th.net_send {
+            if cell.fg == th.net_send {
                 min_send_y = min_send_y.min(y);
+                max_send_y = max_send_y.max(y);
+            } else if cell.fg == th.net_recv {
+                min_recv_y = min_recv_y.min(y);
             }
         }
     }
-    assert!(min_recv_y < u16::MAX, "sem pontos de download na rede");
     assert!(min_send_y < u16::MAX, "sem pontos de upload na rede");
+    assert!(min_recv_y < u16::MAX, "sem pontos de download na rede");
     assert!(
-        max_recv_y < min_send_y,
-        "download ({min_recv_y}..={max_recv_y}) deveria ficar acima do upload ({min_send_y})"
+        max_send_y < min_recv_y,
+        "upload ({min_send_y}..={max_send_y}) deveria ficar acima do download ({min_recv_y})"
     );
 }
 
@@ -1925,7 +1946,7 @@ fn discos_80x24_nao_corta_falha_de_temperatura() {
 fn memoria_comprimida_hardware_paging_e_alerta_bad_pages() {
     let mut st = filled();
     let out = render(&mut st, 160, 48);
-    assert!(out.contains("■ compressed 1.8G (5.4G raw)"), "{out}");
+    assert!(out.contains("■ compressed 1.8 GB (5.4 GB raw)"), "{out}");
     assert!(
         out.contains("DDR4 · 3600 MT/s · 4/4 DIMM · 88.0 MB hw res"),
         "{out}"

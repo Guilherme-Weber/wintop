@@ -150,15 +150,17 @@ pub(super) fn breakdown(
 /// VRAM de um processo em bytes: local, não local (spill para a RAM) e confirmada.
 pub(super) type ProcMem = (u64, u64, u64);
 
-/// Coletor (thread lenta): uma consulta PDH com o uso por processo e o do adaptador. A não
-/// local e a confirmada só são lidas com a aba GPU visível (mesmo objeto PDH da local: a
-/// coleta custa o mesmo).
+/// Coletor (thread lenta): uma consulta PDH com o uso dedicado e compartilhado por processo e do
+/// adaptador. A não local e a confirmada só são lidas com a aba GPU visível (mesmo objeto PDH da
+/// local: a coleta custa o mesmo).
 pub(super) struct VramCollector {
     query: Result<Query, PdhError>,
     local: Slot,
+    shared: Slot,
     non_local: Slot,
     committed: Slot,
     adapter: Slot,
+    adapter_shared: Slot,
     /// PID → nome, relido pelo Toolhelp só quando aparece um PID desconhecido com VRAM.
     pub(super) names: HashMap<u32, String>,
     /// PIDs que o último snapshot não achou (processo que já saiu, instância do PDH atrasada):
@@ -177,15 +179,19 @@ impl VramCollector {
             Err(e) => Err(e.clone()),
         };
         let local = add(r"\GPU Process Memory(*)\Local Usage");
+        let shared = add(r"\GPU Process Memory(*)\Shared Usage");
         let non_local = add(r"\GPU Process Memory(*)\Non Local Usage");
         let committed = add(r"\GPU Process Memory(*)\Total Committed");
         let adapter = add(r"\GPU Adapter Memory(*)\Dedicated Usage");
+        let adapter_shared = add(r"\GPU Adapter Memory(*)\Shared Usage");
         Self {
             query,
             local,
+            shared,
             non_local,
             committed,
             adapter,
+            adapter_shared,
             names: HashMap::new(),
             unnamed: std::collections::HashSet::new(),
             seen: std::collections::HashSet::new(),
@@ -271,7 +277,7 @@ impl VramCollector {
         }
     }
 
-    /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML);
+    /// `luid`: prefixo `luid_0x..._0x..._phys_` do adaptador; `total`: VRAM total (NVML/DXGI);
     /// `names`: PID → nome da lista de processos, quando a aba a coletou (senão, o cache).
     /// Chamar depois de `collect`.
     pub(super) fn read(
@@ -280,9 +286,31 @@ impl VramCollector {
         total: u64,
         names: Option<&HashMap<u32, String>>,
     ) -> Metric<VramBreakdown> {
-        let per_process = self.per_process(&self.local, luid).or_else(fail)?;
+        self.read_kind(false, luid, total, names)
+    }
+
+    /// Memória compartilhada da GPU por categoria (`Shared Usage` por processo e por adaptador).
+    /// Chamar depois de `collect`.
+    pub(super) fn read_shared(
+        &mut self,
+        luid: &str,
+        total: u64,
+        names: Option<&HashMap<u32, String>>,
+    ) -> Metric<VramBreakdown> {
+        self.read_kind(true, luid, total, names)
+    }
+
+    fn read_kind(
+        &mut self,
+        is_shared: bool,
+        luid: &str,
+        total: u64,
+        names: Option<&HashMap<u32, String>>,
+    ) -> Metric<VramBreakdown> {
+        let proc_slot = if is_shared { &self.shared } else { &self.local };
+        let per_process = self.per_process(proc_slot, luid).or_else(fail)?;
         if names.is_none() {
-            // Só os PIDs que de fato usam VRAM (os de 0 bytes nem aparecem na barra).
+            // Só os PIDs que de fato usam memória (os de 0 bytes nem aparecem na barra).
             let using: Vec<u32> = per_process
                 .iter()
                 .filter(|(_, v)| **v > 0)
@@ -291,9 +319,14 @@ impl VramCollector {
             self.refresh_names(using.into_iter());
         }
         let names = names.unwrap_or(&self.names);
+        let adapter_slot = if is_shared {
+            &self.adapter_shared
+        } else {
+            &self.adapter
+        };
         let mut hit = false;
         let mut adapter_used = 0u64;
-        pdh::for_each_array(&self.query, &self.adapter, |name, v| {
+        pdh::for_each_array(&self.query, adapter_slot, |name, v| {
             if starts_with_ignore_ascii_case(name, luid) {
                 hit = true;
                 adapter_used = adapter_used.saturating_add(v as u64);

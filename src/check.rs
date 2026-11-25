@@ -499,14 +499,20 @@ fn slow_report<W: Write>(r: &mut Report<W>, s: &Slow) {
                 r.line(&format!("GPU {} PCIe RX", g.index), &g.pcie_rx, |v| {
                     format!("{}/s", bytes(*v))
                 });
-                r.line(&format!("GPU {} VRAM by kind", g.index), &g.vram, |v| {
+                let fmt_vram = |v: &crate::model::VramBreakdown| {
                     let parts: Vec<String> = v
                         .segments
                         .iter()
                         .map(|(k, b)| format!("{} {}", k.label(), bytes(*b)))
                         .collect();
                     format!("{} ({} processes)", parts.join(", "), v.processes.len())
-                });
+                };
+                r.line(&format!("GPU {} VRAM by kind", g.index), &g.vram, fmt_vram);
+                r.line(
+                    &format!("GPU {} shared by kind", g.index),
+                    &g.shared,
+                    fmt_vram,
+                );
                 if let Some(p) = &g.procs {
                     r.line(&format!("GPU {} processes", g.index), p, |list| {
                         let busy = list

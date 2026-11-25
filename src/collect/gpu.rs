@@ -653,11 +653,11 @@ fn missing_gpu(index: u32, m: &Missing) -> Gpu {
     }
 }
 
-/// PCIe TX/RX (thread lenta; cada leitura leva ~23 ms), VRAM por categoria e processos.
+/// PCIe TX/RX (thread lenta; cada leitura leva ~23 ms), VRAM/shared por categoria e processos.
 pub struct GpuSlowCollector {
     nvml: SharedNvml,
-    /// Cada GPU (mesma lista e ordem do coletor rápido) e o prefixo PDH (LUID) dela.
-    gpus: Vec<(Source, Metric<String>)>,
+    /// Cada GPU (mesma lista e ordem do coletor rápido) e `(prefixo PDH/LUID, shared_total DXGI)`.
+    gpus: Vec<(Source, Metric<(String, u64)>)>,
     vram: VramCollector,
     /// Engines por processo: consulta aberta só com a aba GPU visível.
     engines: EngineCollector,
@@ -667,33 +667,42 @@ pub struct GpuSlowCollector {
     rematched: Instant,
 }
 
-fn slow_list(nvml: &Result<Nvml, String>) -> Vec<(Source, Metric<String>)> {
+fn slow_list(nvml: &Result<Nvml, String>) -> Vec<(Source, Metric<(String, u64)>)> {
     gpu_list(nvml)
         .into_iter()
-        .map(|(s, a)| (s, a.map(|a| prefix_of(&a))))
+        .map(|(s, a)| (s, a.map(|a| (prefix_of(&a), a.shared_total))))
         .collect()
 }
 
 /// Intervalo mínimo entre leituras de PCIe (o piso da thread lenta).
 const PCIE_EVERY: std::time::Duration = std::time::Duration::from_millis(1900);
 
-/// VRAM por categoria e a lista de processos (aba GPU) de um adaptador.
+/// VRAM dedicada e compartilhada por categoria, e a lista de processos (aba GPU) de um adaptador.
 fn vram_and_procs(
     vram: &mut VramCollector,
-    luid: &Metric<String>,
+    adapter: &Metric<(String, u64)>,
     total: Metric<u64>,
     collected: &Result<(), String>,
     engines: Option<Result<&Engines, &Missing>>,
     names: Option<&HashMap<u32, String>>,
-) -> (Metric<VramBreakdown>, Option<Metric<Vec<GpuProc>>>) {
-    let breakdown = match (luid, total, collected) {
-        (Ok(l), Ok(t), Ok(())) => vram.read(l, t, names),
+) -> (
+    Metric<VramBreakdown>,
+    Metric<VramBreakdown>,
+    Option<Metric<Vec<GpuProc>>>,
+) {
+    let breakdown = match (adapter, total, collected) {
+        (Ok((l, _)), Ok(t), Ok(())) => vram.read(l, t, names),
         (Err(e), _, _) => Err(e.clone()),
         (_, Err(e), _) => Err(e),
         (_, _, Err(e)) => fail(e.clone()),
     };
+    let shared_breakdown = match (adapter, collected) {
+        (Ok((l, shared_total)), Ok(())) => vram.read_shared(l, *shared_total, names),
+        (Err(e), _) => Err(e.clone()),
+        (_, Err(e)) => fail(e.clone()),
+    };
     let procs = engines.map(|eng| {
-        let l = luid.clone()?;
+        let (l, _) = adapter.clone()?;
         // LUID trocado (reset): a lista vazia esconderia a causa.
         if lost_adapter(&breakdown) {
             return fail(NO_PDH_INSTANCE);
@@ -713,7 +722,7 @@ fn vram_and_procs(
             _ => Ok(list),
         }
     });
-    (breakdown, procs)
+    (breakdown, shared_breakdown, procs)
 }
 
 impl GpuSlowCollector {
@@ -771,7 +780,7 @@ impl GpuSlowCollector {
                                 return;
                             };
                             for (acc, (_, luid)) in accs.iter_mut().zip(&self.gpus) {
-                                if let Ok(p) = luid
+                                if let Ok((p, _)) = luid
                                     && win::starts_with_ignore_ascii_case(adapter, p)
                                 {
                                     acc.push_parsed(pid, engtype, v);
@@ -794,7 +803,7 @@ impl GpuSlowCollector {
             ..
         } = self;
         let mut out = Vec::new();
-        for (pos, (source, luid)) in gpus.iter().enumerate() {
+        for (pos, (source, adapter)) in gpus.iter().enumerate() {
             let index = pos as u32;
             let device = match (source, nvml.as_ref()) {
                 (Source::Nvml(i), Ok(n)) => Some(nv(n.device_by_index(*i))),
@@ -812,7 +821,8 @@ impl GpuSlowCollector {
             let gpu_engines = engines_per_gpu
                 .as_ref()
                 .map(|m| m.as_ref().map(|v| &v[pos]));
-            let (vram_b, procs) = vram_and_procs(vram, luid, total, &collected, gpu_engines, names);
+            let (vram_b, shared_b, procs) =
+                vram_and_procs(vram, adapter, total, &collected, gpu_engines, names);
             // PCIe custa ~23 ms por sentido: no máximo a cada `PCIE_EVERY`, mesmo quando abrir
             // uma aba acorda a thread lenta antes da hora. KB/s → bytes/s.
             let (pcie_tx, pcie_rx) = match (&device, source) {
@@ -841,11 +851,14 @@ impl GpuSlowCollector {
                 pcie_tx,
                 pcie_rx,
                 vram: vram_b,
+                shared: shared_b,
                 procs,
             });
         }
         // Como no coletor rápido: LUID trocado ou associação anterior em falha.
-        if (out.iter().any(|g| lost_adapter(&g.vram))
+        if (out
+            .iter()
+            .any(|g| lost_adapter(&g.vram) || lost_adapter(&g.shared))
             || self
                 .gpus
                 .iter()

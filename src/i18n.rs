@@ -213,7 +213,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("min", "mín"),
     ("max", "máx"),
     ("· max", "· máx"),
-    ("↓ receive  ↑ send", "↓ recebimento  ↑ envio"),
+    ("↑ send  ↓ receive", "↑ envio  ↓ recebimento"),
     // Rodapé.
     ("tabs", "abas"),
     ("reset min/max", "zerar mín/máx"),

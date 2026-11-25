@@ -302,9 +302,10 @@ fn line(frame: &mut Frame<'_>, spans: Vec<Span<'static>>, x: u16, y: u16, w: u16
     );
 }
 
-/// Bytes curtos (477G, 3.1T, 859M) para colunas estreitas.
-fn short_bytes(v: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+/// Bytes com unidades completas (B, KB, MB, GB, TB) sem casa decimal acima de 100 (ex.: `477 GB`,
+/// `6.7 MB`, `500 KB`), para colunas estreitas da tabela de discos sem abreviar a unidade.
+fn compact_bytes(v: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut x = v as f64;
     let mut u = 0;
     while x >= 1024.0 && u < UNITS.len() - 1 {
@@ -312,9 +313,9 @@ fn short_bytes(v: u64) -> String {
         u += 1;
     }
     if x >= 100.0 || u == 0 {
-        format!("{x:.0}{}", UNITS[u])
+        format!("{x:.0} {}", UNITS[u])
     } else {
-        format!("{}{}", num(x, 1), UNITS[u])
+        format!("{} {}", num(x, 1), UNITS[u])
     }
 }
 
@@ -1001,7 +1002,9 @@ pub(super) fn failing_sources(st: &State) -> usize {
                 st.slow_gpu(l).into_iter().collect()
             };
             shown.into_iter().any(|g| {
-                failed(&g.vram) || (!no_nvml(g.index) && (failed(&g.pcie_tx) || failed(&g.pcie_rx)))
+                failed(&g.vram)
+                    || failed(&g.shared)
+                    || (!no_nvml(g.index) && (failed(&g.pcie_tx) || failed(&g.pcie_rx)))
             })
         }));
         // Só dos discos exibidos (um disco removido ou trocado no mesmo número não aparece em

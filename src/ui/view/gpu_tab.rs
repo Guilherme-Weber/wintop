@@ -204,7 +204,7 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let r0 = Rect::new(inner.x, inner.y, inner.width, 1);
     let fast_gpu_err = st.fast.as_ref().and_then(|f| f.gpus.as_ref().err());
     match (vram, gpu, fast_gpu_err) {
-        (Some(Ok(b)), Some(g), _) => vram_bar(frame, r0, b, game, &g.dedicated, 0),
+        (Some(Ok(b)), Some(g), _) => vram_bar(frame, r0, 0, "VRAM  ", b, game, &g.dedicated, 0),
         (Some(Err(e)), _, _) | (_, _, Some(e)) => {
             note(frame, r0, label("VRAM "));
             note(

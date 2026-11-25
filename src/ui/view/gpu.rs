@@ -11,8 +11,7 @@ use super::state::{MinMax, Series, Session, State};
 use super::{
     TEMP_BAR_W, aligned_bar_text_w, bar_line, bar_sep, bar_value, boxed, brief, draw_temp_bar,
     empty_box, faded, failed_span, label, line, metric, metric_styled, minmax, missing, put,
-    section_divider, sep, short_bytes, temp_color, text, text_room, usage_color, v_divider,
-    with_failure, wrap,
+    section_divider, sep, temp_color, text, text_room, usage_color, v_divider, with_failure, wrap,
 };
 use crate::fmt::{bytes, num};
 use crate::i18n::tr;
@@ -94,31 +93,54 @@ fn gpu_causes(g: &Gpu, width: u16) -> Vec<Line<'static>> {
     causes
 }
 
+/// Combina `phys` (NVML) com `session VRAM` na mesma linha (`phys ... │ session VRAM ...`)
+/// quando `include_session` está ativo, economizando 1 linha vertical para a legenda de `shared`.
+fn phys_and_session_lines(
+    st: &State,
+    phys_spans: Option<&[Span<'static>]>,
+    width: u16,
+    include_session: bool,
+) -> Vec<Line<'static>> {
+    let gb = |v: f64| bytes(v as u64);
+    let has_session = include_session && st.session.vram.get().is_some();
+    match (phys_spans, has_session) {
+        (Some(p), true) => {
+            let mut spans = p.to_vec();
+            spans.extend([
+                bar_sep(),
+                label("session VRAM "),
+                minmax(st.session.vram, gb),
+            ]);
+            wrap(spans, width, 0, 7)
+        }
+        (Some(p), false) => wrap(p.to_vec(), width, 0, 7),
+        (None, true) => wrap(
+            vec![label("session VRAM "), minmax(st.session.vram, gb)],
+            width,
+            0,
+            8,
+        ),
+        (None, false) => Vec::new(),
+    }
+}
+
 /// `(n_cells, avail_top)` da caixa da GPU para ajustar `top_h` na aba Geral e manter todos os
 /// gráficos de engines com altura idêntica sem linhas vazias.
 fn gpu_layout_metrics(st: &State, g: &Gpu, inner_w: u16, inner_h: u16) -> (u16, u16) {
     let (engine, _) = busiest_engine(g);
     let details = gpu_details(st, g, inner_w);
-    let gb = |v: f64| bytes(v as u64);
-    let session_len = if st.session.vram.get().is_some() {
-        wrap(
-            vec![label("session VRAM "), minmax(st.session.vram, gb)],
-            inner_w,
-            0,
-            8,
-        )
-        .len() as u16
-    } else {
-        0
-    };
     let card_h = (details.card.len() + gpu_causes(g, inner_w).len()) as u16;
-    let vram_base_h = (2 + details.legend.len() + details.phys.len()) as u16;
-    let vram_extra_h = if inner_h >= vram_base_h + card_h + 1 + session_len + 4 {
-        details.phys.len() as u16 + session_len
+    let legends_h = (details.vram_legend.len() + details.shared_legend.len()) as u16;
+    let phys_only_h =
+        phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, false).len() as u16;
+    let with_session_h =
+        phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, true).len() as u16;
+    let vram_extra_h = if inner_h >= 2 + legends_h + card_h + 1 + with_session_h + 4 {
+        with_session_h
     } else {
-        details.phys.len() as u16
+        phys_only_h
     };
-    let vram_h = 2 + details.legend.len() as u16 + vram_extra_h;
+    let vram_h = 2 + legends_h + vram_extra_h;
     let div_h = u16::from(inner_h >= vram_h + card_h + 3);
     let n_cells = engine_cells(g, engine).len() as u16;
     let avail_top = inner_h.saturating_sub(vram_h + card_h + div_h);
@@ -197,32 +219,20 @@ pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut details = gpu_details(st, g, inner.width);
-    // Extremos da sessão como na caixa da CPU: a VRAM numa linha ("session RAM" da memória);
-    // temperatura, potência e clock com o máximo ao lado do valor (`nvml_rows`).
-    let gb = |v: f64| bytes(v as u64);
-    // Sem extremos ainda (troca de GPU, `r`, VRAM sem valor), a linha não aparece vazia.
-    let session = if st.session.vram.get().is_some() {
-        wrap(
-            vec![label("session VRAM "), minmax(st.session.vram, gb)],
-            inner.width,
-            0,
-            8,
-        )
-    } else {
-        Vec::new()
-    };
     // Falhas das engines e de drv/VBIOS inteiras na largura da caixa; a grade só leva marca curta.
     let causes = gpu_causes(g, inner.width);
     // Sem altura para tudo, os extremos da VRAM saem primeiro (continuam na aba Sensores): as
     // leituras ao vivo têm prioridade.
     details.card.splice(0..0, causes);
     let card_h = details.card.len() as u16;
-    let vram_base_h = (2 + details.legend.len() + details.phys.len()) as u16;
-    let mut vram_extra = details.phys;
-    if inner.height >= vram_base_h + card_h + 1 + session.len() as u16 + 4 {
-        vram_extra.extend(session);
-    }
-    let vram_h = (2 + details.legend.len() + vram_extra.len()) as u16;
+    let legends_h = (details.vram_legend.len() + details.shared_legend.len()) as u16;
+    let with_session = phys_and_session_lines(st, details.phys_spans.as_deref(), inner.width, true);
+    let vram_extra = if inner.height >= 2 + legends_h + card_h + 1 + with_session.len() as u16 + 4 {
+        with_session
+    } else {
+        phys_and_session_lines(st, details.phys_spans.as_deref(), inner.width, false)
+    };
+    let vram_h = 2 + legends_h + vram_extra.len() as u16;
     let div_h = u16::from(inner.height >= vram_h + card_h + 3);
     // Engines ao lado do gráfico, como a grade por lógico da CPU: o 3D (ou, com ele no gráfico
     // principal, a engine mais usada fora ele e o vídeo), encoder, decoder e a memória.
@@ -340,7 +350,7 @@ pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph
         section_divider(frame, div_area, inner, "vram");
     }
 
-    // VRAM por categoria, compartilhada, física (NVML) e extremos da sessão abaixo do divisor.
+    // VRAM por categoria, compartilhada por categoria, física (NVML) + extremos da sessão.
     let slow = st
         .slow
         .as_ref()
@@ -348,27 +358,61 @@ pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph
         .and_then(|l| l.iter().find(|x| x.index == g.index));
     let b = vram_area;
     let min_text_w = aligned_bar_text_w(&[&g.dedicated, &g.shared]);
+    let mut y = 0u16;
     match slow.map(|s| &s.vram) {
-        Some(Ok(v)) => vram_bar(frame, b, v, details.game_pid, &g.dedicated, min_text_w),
-        _ => bar_line(frame, b, 0, "VRAM  ", &g.dedicated, min_text_w),
+        Some(Ok(v)) => vram_bar(
+            frame,
+            b,
+            y,
+            "VRAM  ",
+            v,
+            details.game_pid,
+            &g.dedicated,
+            min_text_w,
+        ),
+        _ => bar_line(frame, b, y, "VRAM  ", &g.dedicated, min_text_w),
     }
-    let n = details.legend.len() as u16;
-    for (i, l) in details.legend.into_iter().enumerate() {
+    y += 1;
+    for l in details.vram_legend {
         put(
             frame,
             Paragraph::new(l),
-            Rect::new(b.x, b.y + 1 + i as u16, b.width, 1),
+            Rect::new(b.x, b.y + y, b.width, 1),
             b,
         );
+        y += 1;
     }
-    bar_line(frame, b, 1 + n, "shared", &g.shared, min_text_w);
-    for (i, l) in vram_extra.into_iter().enumerate() {
+    match slow.map(|s| &s.shared) {
+        Some(Ok(sv)) => vram_bar(
+            frame,
+            b,
+            y,
+            "shared",
+            sv,
+            details.game_pid,
+            &g.shared,
+            min_text_w,
+        ),
+        _ => bar_line(frame, b, y, "shared", &g.shared, min_text_w),
+    }
+    y += 1;
+    for l in details.shared_legend {
         put(
             frame,
             Paragraph::new(l),
-            Rect::new(b.x, b.y + 2 + n + i as u16, b.width, 1),
+            Rect::new(b.x, b.y + y, b.width, 1),
             b,
         );
+        y += 1;
+    }
+    for l in vram_extra {
+        put(
+            frame,
+            Paragraph::new(l),
+            Rect::new(b.x, b.y + y, b.width, 1),
+            b,
+        );
+        y += 1;
     }
 }
 
@@ -565,13 +609,14 @@ fn draw_engine_cells(
     }
 }
 
-/// Linhas de detalhe da caixa da GPU, separadas entre placa (acima do divisor) e VRAM (abaixo),
-/// já quebradas na largura (nada é cortado).
+/// Linhas de detalhe da caixa da GPU, separadas entre placa (acima do divisor) e VRAM/shared
+/// (abaixo), já quebradas na largura (nada é cortado).
 struct GpuDetails {
     game_pid: Option<u32>,
     card: Vec<Line<'static>>,
-    legend: Vec<Line<'static>>,
-    phys: Vec<Line<'static>>,
+    vram_legend: Vec<Line<'static>>,
+    shared_legend: Vec<Line<'static>>,
+    phys_spans: Option<Vec<Span<'static>>>,
 }
 
 fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
@@ -589,9 +634,10 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .as_ref()
         .and_then(|f| f.game.as_ref().ok())
         .map(|g| g.pid);
-    let legend = vram_legend(slow.map(|s| &s.vram), game_pid, width);
+    let vram_leg = vram_legend(slow.map(|s| &s.vram), game_pid, width);
+    let shared_leg = vram_legend(slow.map(|s| &s.shared), game_pid, width);
     // GPU sem NVML: os campos só dele numa linha, com o motivo (não repetido em cada um).
-    let (card_rows, phys_row): (Vec<Vec<Span<'static>>>, Option<Vec<Span<'static>>>) =
+    let (card_rows, phys_spans): (Vec<Vec<Span<'static>>>, Option<Vec<Span<'static>>>) =
         if let Some(m) = &g.no_nvml {
             (
                 vec![vec![
@@ -608,15 +654,12 @@ fn gpu_details(st: &State, g: &Gpu, width: u16) -> GpuDetails {
         .into_iter()
         .flat_map(|r| wrap(r, width, 0, 7))
         .collect();
-    let phys = phys_row
-        .into_iter()
-        .flat_map(|r| wrap(r, width, 0, 7))
-        .collect();
     GpuDetails {
         game_pid,
         card,
-        legend,
-        phys,
+        vram_legend: vram_leg,
+        shared_legend: shared_leg,
+        phys_spans,
     }
 }
 
@@ -672,7 +715,7 @@ fn nvml_rows(
     };
     let card = vec![
         vec![
-            label("clk    gfx "),
+            label("clk (MHz)  gfx "),
             clk(&g.clock_graphics),
             max(session.gfx_clock),
             label("  SM "),
@@ -681,7 +724,6 @@ fn nvml_rows(
             clk(&g.clock_mem),
             label("  video "),
             clk(&g.clock_video),
-            label(" MHz"),
         ],
         vec![
             label("temp   "),
@@ -769,7 +811,7 @@ pub(in crate::ui) fn vram_legend(
                     [
                         Span::styled("  ■ ", Style::new().fg(vram_color(k))),
                         label(&format!("{} ", k.label())),
-                        text(short_bytes(v)),
+                        text(bytes(v)),
                     ]
                 })
                 .collect();
@@ -824,28 +866,32 @@ fn vram_parts(b: &VramBreakdown, game_pid: Option<u32>) -> Vec<(VramKind, u64)> 
     parts
 }
 
-/// VRAM: barra cortada por categoria (linha 0, com usado/total da dedicada) e legenda (linha 1).
+/// Barra de memória da GPU (`VRAM` ou `shared`) cortada por categoria, na linha `row_y`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn vram_bar(
     frame: &mut Frame<'_>,
     area: Rect,
+    row_y: u16,
+    title: &str,
     b: &VramBreakdown,
     game_pid: Option<u32>,
-    dedicated: &Metric<(u64, u64)>,
+    metric_val: &Metric<(u64, u64)>,
     min_text_w: u16,
 ) {
-    if area.height == 0 {
+    if row_y >= area.height {
         return;
     }
+    let y = area.y + row_y;
     let parts = vram_parts(b, game_pid);
-    let (val_line, raw_w) = bar_value(dedicated);
+    let (val_line, raw_w) = bar_value(metric_val);
     let label_w = VRAM_LABEL_W.min(area.width);
-    let target_w = if dedicated.is_err() {
+    let target_w = if metric_val.is_err() {
         raw_w
     } else {
         raw_w.max(min_text_w)
     };
-    let text_w = text_room(target_w, dedicated.is_err(), area.width, label_w);
-    line(frame, vec![label("VRAM  ")], area.x, area.y, label_w, area);
+    let text_w = text_room(target_w, metric_val.is_err(), area.width, label_w);
+    line(frame, vec![label(title)], area.x, y, label_w, area);
     let bar_w = area.width.saturating_sub(label_w + text_w);
     let colored: Vec<(u64, Color)> = parts
         .iter()
@@ -857,9 +903,9 @@ pub(super) fn vram_bar(
             parts: &colored,
             total: b.total,
         },
-        Rect::new(area.x + label_w, area.y, bar_w, 1).intersection(area),
+        Rect::new(area.x + label_w, y, bar_w, 1).intersection(area),
     );
-    let p = if dedicated.is_err() {
+    let p = if metric_val.is_err() {
         Paragraph::new(val_line)
     } else {
         Paragraph::new(val_line).right_aligned()
@@ -867,7 +913,7 @@ pub(super) fn vram_bar(
     put(
         frame,
         p,
-        Rect::new(area.x + label_w + bar_w, area.y, text_w, 1),
+        Rect::new(area.x + label_w + bar_w, y, text_w, 1),
         area,
     );
 }
