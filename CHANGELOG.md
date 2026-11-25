@@ -6,6 +6,27 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.1] - 2026-11-25
+
+### Adicionado
+
+- Memória compartilhada da GPU (`shared`) dividida por categoria (`game`, `app`, `compositor`,
+  `browser`, `system`, `kernel`, `free`) via `\GPU Process Memory(*)\Shared Usage` na mesma
+  consulta PDH da VRAM, com barra segmentada em braille, legenda própria na caixa da GPU e entrada
+  `GPU N shared by kind` no `--check`.
+
+### Alterado
+
+- Unidades padronizadas no formato completo (`B`/`KB`/`MB`/`GB`/`TB` e `GHz`) nas legendas de RAM
+  e VRAM, tabela de discos e grade de clocks por núcleo da CPU (removendo abreviações `G`/`M`/`K`);
+  unidade de clock da GPU movida para o cabeçalho `clk (MHz)`.
+- Linha `phys` da VRAM posicionada antes de `session VRAM` na mesma linha (`phys ... │ session
+  VRAM ...`) para comportar a legenda de `shared` sem consumir espaço extra dos gráficos da GPU.
+- Gráfico espelhado de rede revertido para upload (`↑ send`) em cima e download (`↓ receive`)
+  embaixo, com a cor de download fortalecida nos temas.
+- Instalador (`--install`, `--uninstall` e abertura da cópia instalada) migrado de subprocesso
+  `schtasks.exe` + XML temporário em disco para a API COM nativa `ITaskService`.
+
 ## [1.4.0] - 2026-11-25
 
 ### Adicionado
