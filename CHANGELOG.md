@@ -6,6 +6,48 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.0] - 2026-11-25
+
+### Adicionado
+
+- Memória comprimida exibida na barra segmentada e na legenda da RAM (`compressed` com tamanho
+  original estimado em `raw`, via `NtQuerySystemInformation` classe `109`), com cor configurável
+  `ram_compressed` em `[colors]` nos 5 temas.
+- Especificações de hardware da RAM no divisor `── memory ──` (geração, velocidade e slots
+  ocupados via SMBIOS Type 17, além de memória reservada para hardware), pico de commit desde o
+  boot (`boot peak`), paginação real em disco (`paging in/out/s`) e alerta silencioso de páginas
+  defeituosas (`bad RAM pages > 0`).
+- Versão atual do wintop exibida no rodapé (`wintop v1.4.0`) e suporte à variável de ambiente
+  `NO_COLOR`.
+
+### Alterado
+
+- Coleta de memória migrada integralmente de PDH para chamadas diretas `NtQuerySystemInformation`
+  (`80`, `18` e `2`), somada a leitura streaming sem alocações no PDH, cache de nomes de
+  adaptadores de rede e pré-cálculo de cores fora dos laços de renderização dos widgets.
+- Caixa da GPU compactada e sem espaços vazios: `drv` e `VBIOS` removidos da Visão geral
+  (mantidos na aba Sensores e no `--check`), `PCIe` posicionado ao lado de `fans`, altura uniforme
+  entre o gráfico principal e as engines, e `min · max` na mesma linha da porcentagem tanto em CPU
+  quanto em GPU.
+- Demarcação e alinhamento visual aprimorados: divisores verticais entre gráfico principal,
+  núcleos/engines e termômetro; linhas de base sutis nos gráficos; bordas direitas alinhadas entre
+  barras de RAM/commit/pagefile e VRAM/shared; `scale` em linha própria acima do gráfico espelhado
+  de rede; hierarquia de cores semânticas refinada na Visão geral, tabelas e aba Sensores.
+- Refatoração interna: RAII para `SecurityDescriptor`, `PdhError` tipado, snapshots imutáveis com
+  `Arc`, controlador de UI puro com gravação assíncrona do `config.toml` e separação das abas em
+  módulos dedicados.
+
+### Corrigido
+
+- Aba Sensores: correspondência de GPUs pelo índice real (`g.index`) em sistemas multi-GPU e
+  tratamento consistente de temperaturas SMART em trocas de disco.
+- Visão geral em terminais 80×24: prioridade de altura ajustada para exibir o primeiro disco em
+  vez de ocultar toda a seção; texto neutro de GPUs sem NVML exibido em largura total abaixo das
+  engines em vez de quebrar em colunas estreitas.
+- Cor `fps_over` no tema padrão corrigida para `#60A5FA` (alinhada ao cabeçalho e ao gráfico de
+  FPS), textos literais de hardware/usuário preservados sem tradução (`raw_text`) e traduções
+  `pt-BR` faltantes completadas.
+
 ## [1.3.2] - 2026-11-24
 
 ### Corrigido
