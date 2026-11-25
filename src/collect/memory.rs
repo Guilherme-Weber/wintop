@@ -45,6 +45,11 @@ const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_REVISION_MISMATCH: u32 = 0xC000_0059;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// Retornado por `SystemStoreInformation(22)` no Windows Server e quando `MemoryCompression`
+/// está desabilitada via `Disable-MMAgent -MemoryCompression`.
+const STATUS_QUOTA_NOT_ENABLED: u32 = 0xC000_01A9;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+const STATUS_COMPRESSION_DISABLED: u32 = 0xC000_0426;
 
 /// Assinatura `'RSMB'` (Raw SMBIOS) para `GetSystemFirmwareTable`.
 const RSMB: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(u32::from_be_bytes(*b"RSMB"));
@@ -215,8 +220,14 @@ fn read_compressed() -> Metric<CompressedMemory> {
             ),
         });
     }
-    let code = status.0 as u32;
+    map_store_status(status.0 as u32)
+}
+
+fn map_store_status(code: u32) -> Metric<CompressedMemory> {
     match code {
+        STATUS_QUOTA_NOT_ENABLED | STATUS_NOT_FOUND | STATUS_COMPRESSION_DISABLED => {
+            neutral("disabled")
+        }
         STATUS_NOT_SUPPORTED | STATUS_INVALID_INFO_CLASS | STATUS_REVISION_MISMATCH => {
             neutral("not supported by Windows")
         }
@@ -714,5 +725,29 @@ mod tests {
             "{:?}",
             m2.bad_pages
         );
+    }
+
+    #[test]
+    fn status_de_compressao_desativada_vira_neutro() {
+        use crate::model::Missing;
+        for code in [
+            STATUS_QUOTA_NOT_ENABLED,
+            STATUS_NOT_FOUND,
+            STATUS_COMPRESSION_DISABLED,
+        ] {
+            assert_eq!(map_store_status(code), neutral("disabled"));
+        }
+        assert_eq!(
+            map_store_status(STATUS_NOT_SUPPORTED),
+            neutral("not supported by Windows")
+        );
+        assert_eq!(
+            map_store_status(STATUS_ACCESS_DENIED),
+            neutral("needs elevation")
+        );
+        assert!(matches!(
+            map_store_status(0xC000_0001),
+            Err(Missing::Fail(_))
+        ));
     }
 }
