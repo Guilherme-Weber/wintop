@@ -6,6 +6,18 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.2] - 2026-11-25
+
+### Alterado
+
+- Linha `clk` da GPU agora exibe `MHz` ao lado de cada contador (`gfx`, `SM`, `mem` e `video`) no
+  mesmo padrão de potência e temperatura, removendo `(MHz)` do rótulo.
+- Divisor `── memory ──` exibe apenas as especificações de hardware da RAM (sem `hw res`, mantido
+  no `--check`).
+- Cabeçalho da caixa de CPU atualizado para exibir núcleos físicos e threads (`N cores · M threads`
+  / `N núcleos · M threads`), movendo a duração total do buffer de histórico (`history 16m40s`) para
+  o rodapé ao lado da versão e consumo do wintop.
+
 ## [1.4.1] - 2026-11-25
 
 ### Adicionado
