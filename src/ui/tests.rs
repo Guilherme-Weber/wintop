@@ -1517,7 +1517,7 @@ fn zoom_amplia_uma_caixa_e_volta() {
     let mut z = None;
     let mut names = Vec::new();
     loop {
-        z = view::Zoom::next(z);
+        z = view::Zoom::next(z, false);
         let Some(zz) = z else { break };
         names.push(zz.name());
         st.zoom = z;
@@ -1964,4 +1964,31 @@ fn memoria_comprimida_hardware_paging_e_alerta_bad_pages() {
     assert!(out.contains("! bad RAM pages: 3 (hardware fault)"), "{out}");
     assert!(out.contains("paging in 420/s  out 12/s"), "{out}");
     bordas_intactas(&mut st, 160, 48);
+}
+
+#[test]
+fn ocultar_caixa_de_fps_e_frametime() {
+    let mut st = filled();
+    // Com falha do RTSS, ocultar o jogo também oculta a contagem da falha no rodapé.
+    st.push_fps(Fps {
+        rtss: fail("RTSS not running"),
+        pipe: Ok((8, 0)),
+        etw: Ok("DXGI + Reflex markers"),
+        game: fail("RTSS not running"),
+        hooked: vec![],
+    });
+    assert!(render(&mut st, 160, 48).contains("! 1 source failing"));
+    st.toggle_game();
+    for (w, h) in [(80, 24), (120, 30), (160, 48), (210, 52)] {
+        let out = render(&mut st, w, h);
+        assert!(!out.contains("game ·"), "{w}x{h}:\n{out}");
+        assert!(!out.contains("FPS "), "{w}x{h}:\n{out}");
+        assert!(!out.contains("1% low"), "{w}x{h}:\n{out}");
+        assert!(out.contains("all OK"), "{w}x{h}:\n{out}");
+        bordas_intactas(&mut st, w, h);
+    }
+    let out = render(&mut st, 210, 52);
+    assert!(out.contains("f show fps"), "{out}");
+    let out_pt = pt_br(st, 210, 52);
+    assert!(out_pt.contains("f mostrar fps"), "{out_pt}");
 }

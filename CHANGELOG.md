@@ -6,6 +6,14 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.3] - 2026-11-26
+
+### Adicionado
+
+- Atalho `f` na aba Geral para ocultar ou mostrar a caixa de jogo (FPS e frametime), reaproveitando
+  a área liberada para expandir os gráficos de CPU/GPU e a caixa de discos; o estado é salvo em
+  `show_game` no `config.toml` e o ciclo de zoom (`z`) pula a caixa de jogo quando oculta.
+
 ## [1.4.2] - 2026-11-25
 
 ### Alterado

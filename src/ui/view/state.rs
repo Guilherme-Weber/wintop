@@ -176,6 +176,8 @@ pub struct State {
     pub hits: Hits,
     /// Caixa da aba Geral ampliada para a aba inteira (tecla `z`).
     pub zoom: Option<Zoom>,
+    /// Esconder a caixa de jogo (FPS e frametime) na aba Geral (tecla `f`).
+    pub hide_game: bool,
     /// Aba Sensores: primeira linha mostrada e se o último desenho deixou linhas de fora (só
     /// então ela rola para baixo).
     pub sensor_offset: usize,
@@ -245,6 +247,14 @@ impl State {
             .and_then(|f| f.disks.as_ref().ok())
             .map_or(0, Vec::len);
         self.fold_pool = Some(!pool_folded(self, total));
+    }
+
+    /// Tecla `f`: esconde ou mostra a caixa de jogo (FPS e frametime) na aba Geral.
+    pub fn toggle_game(&mut self) {
+        self.hide_game = !self.hide_game;
+        if self.hide_game && self.zoom == Some(Zoom::Game) {
+            self.zoom = None;
+        }
     }
 
     /// Posição da GPU exibida numa lista de `n` GPUs (a 1ª se a escolhida sumiu).
@@ -810,15 +820,19 @@ pub enum Zoom {
 impl Zoom {
     const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Net, Self::Disks, Self::Game];
 
-    /// Próxima caixa; depois da última, a aba volta ao normal.
-    pub fn next(z: Option<Self>) -> Option<Self> {
-        match z {
+    /// Próxima caixa; depois da última, a aba volta ao normal. Com `hide_game`, pula `Game`.
+    pub fn next(z: Option<Self>, hide_game: bool) -> Option<Self> {
+        let mut cur = match z {
             None => Some(Self::ALL[0]),
             Some(z) => {
                 let i = Self::ALL.iter().position(|x| *x == z).unwrap_or(0);
                 Self::ALL.get(i + 1).copied()
             }
+        };
+        if hide_game && cur == Some(Self::Game) {
+            cur = None;
         }
+        cur
     }
 
     pub fn name(self) -> &'static str {

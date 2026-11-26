@@ -507,6 +507,10 @@ const HELP: &[(&str, &str)] = &[
         "z",
         "Overview: enlarge one box to the whole tab (z next, esc back)",
     ),
+    (
+        "f",
+        "Overview: hide or show the game box (FPS and frametime)",
+    ),
     ("r", "reset session min/max and the game history"),
     ("g", "next GPU, with more than one (Overview, GPU)"),
     ("t", "next color theme"),
@@ -595,7 +599,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 
 fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
     // Uma caixa ampliada ocupa a aba inteira.
-    if let Some(z) = st.zoom {
+    if let Some(z) = st.zoom
+        && !(st.hide_game && z == Zoom::Game)
+    {
         match z {
             Zoom::Cpu => {
                 draw_cpu(frame, body, st, mem_text(st, body.width));
@@ -608,26 +614,49 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
         return;
     }
     // Em cima, CPU + memória (como GPU + VRAM ao lado); embaixo, rede compacta à esquerda e
-    // discos sobre o jogo à direita.
+    // discos sobre o jogo à direita (ou discos ocupando toda a direita quando o jogo está oculto).
     // Em cima, pelo menos o que CPU + memória e GPU + VRAM precisam para mostrar todas as
     // linhas de detalhe (o conhost do atalho abre com 30 linhas); os gráficos é que encolhem.
     const TOP_MIN: u16 = 23;
-    // A caixa do jogo tem sempre a mesma altura, com ou sem jogo (o layout não pula quando um
-    // jogo abre; pedido do usuário, 2026-11-22). Em terminais muito curtos (piso 80×24, body ≤ 23),
-    // cede 2 linhas para que ao menos 1 disco apareça na caixa de discos.
-    let game_min = if body.height <= 23 { 6 } else { 8 };
     // Discos: cabeçalho + uma linha por disco visível, mais uma por causa de falha (inteira,
     // embaixo da tabela). Calculados uma vez e reaproveitados em `draw_disks`.
     let right_inner_w = (body.width - body.width * 34 / 100).saturating_sub(2);
     let order = disk_order(st);
     let notes = disk_notes(st, right_inner_w);
     let disk_rows = (order.len() + notes.len()) as u16;
+    let gpu_w = body.width.saturating_sub(body.width * 56 / 100);
+    if st.hide_game {
+        let bottom_min = (disk_rows.min(3) + 3).max(6).min(body.height / 2);
+        let want_bottom = (body.height * 24 / 100)
+            .max(disk_rows + 3)
+            .max(bottom_min)
+            .min(body.height / 2);
+        let max_top = body.height.saturating_sub(bottom_min);
+        let top_h = body.height.saturating_sub(want_bottom).min(max_top);
+        let top_h = snap_top_height(st, gpu_w, top_h, TOP_MIN.min(max_top), max_top);
+        let [top, bottom] =
+            Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
+        let [cpu, gpu] =
+            Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).areas(top);
+        let [net, disks] =
+            Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+                .areas(bottom);
+        let mem = mem_text(st, cpu.width);
+        let core_graph = draw_cpu(frame, cpu, st, mem);
+        draw_gpu(frame, gpu, st, core_graph);
+        draw_net(frame, net, st);
+        draw_disks(frame, disks, st, &order, Some((right_inner_w, notes)));
+        return;
+    }
+    // A caixa do jogo tem sempre a mesma altura, com ou sem jogo (o layout não pula quando um
+    // jogo abre; pedido do usuário, 2026-11-22). Em terminais muito curtos (piso 80×24, body ≤ 23),
+    // cede 2 linhas para que ao menos 1 disco apareça na caixa de discos.
+    let game_min = if body.height <= 23 { 6 } else { 8 };
     let top_h = (body.height * 58 / 100).max(TOP_MIN);
     // Embaixo, sempre o mínimo útil: algumas linhas de discos e a faixa do jogo.
     let bottom_min = ((disk_rows.min(3) + 3 + game_min).max(9)).min(body.height / 2);
     let max_top = body.height.saturating_sub(bottom_min);
     let top_h = top_h.min(max_top);
-    let gpu_w = body.width.saturating_sub(body.width * 56 / 100);
     let top_h = snap_top_height(st, gpu_w, top_h, TOP_MIN.min(max_top), max_top);
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
@@ -768,20 +797,17 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
     } else {
         " fold pool  "
     };
-    let overview: Vec<(&str, &str)> = if pool {
-        vec![
-            ("r", " reset min/max  "),
-            ("z", " zoom  "),
-            ("d", fold),
-            ("t", " theme  "),
-        ]
+    let fps_lbl = if st.hide_game {
+        " show fps  "
     } else {
-        vec![
-            ("r", " reset min/max  "),
-            ("z", " zoom  "),
-            ("t", " theme  "),
-        ]
+        " hide fps  "
     };
+    let mut overview: Vec<(&str, &str)> =
+        vec![("r", " reset min/max  "), ("z", " zoom  "), ("f", fps_lbl)];
+    if pool {
+        overview.push(("d", fold));
+    }
+    overview.push(("t", " theme  "));
     let sensors: Vec<(&str, &str)> = if st.sensor_overflow || st.sensor_offset > 0 {
         vec![("↑↓", " scroll  "), ("r", " reset min/max  ")]
     } else {
@@ -1050,7 +1076,9 @@ pub(super) fn failing_sources(st: &State) -> usize {
             .runtimes
             .values()
             .any(|(_, r)| matches!(r, RuntimeStatus::Ready(m) if failed(m))));
-    if let Some(f) = &st.fps {
+    if !st.hide_game
+        && let Some(f) = &st.fps
+    {
         add(failed(&f.rtss));
         add(failed(&f.pipe));
         // O jogo sem valor herda a falha do RTSS (já contada): só as métricas dele contam.

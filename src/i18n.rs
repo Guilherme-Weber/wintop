@@ -222,6 +222,8 @@ const PT_BR: &[(&str, &str)] = &[
     ("theme", "tema"),
     ("fold pool", "recolher pool"),
     ("expand pool", "expandir pool"),
+    ("hide fps", "ocultar fps"),
+    ("show fps", "mostrar fps"),
     ("next gpu", "próxima gpu"),
     ("pause", "pausar"),
     ("quit", "sair"),
@@ -269,6 +271,10 @@ const PT_BR: &[(&str, &str)] = &[
     (
         "Overview: enlarge one box to the whole tab (z next, esc back)",
         "Geral: ampliar uma caixa para a aba inteira (z próxima, esc volta)",
+    ),
+    (
+        "Overview: hide or show the game box (FPS and frametime)",
+        "Geral: ocultar ou mostrar a caixa de jogo (FPS e frametime)",
     ),
     (
         "reset session min/max and the game history",

@@ -240,7 +240,11 @@ fn handle_key(
             st.zoom = None;
         }
         KeyCode::Char('z') if st.tab == view::Tab::Overview => {
-            st.zoom = view::Zoom::next(st.zoom);
+            st.zoom = view::Zoom::next(st.zoom, st.hide_game);
+        }
+        KeyCode::Char('f') if st.tab == view::Tab::Overview => {
+            st.toggle_game();
+            effects.push(Effect::SaveConfig);
         }
         KeyCode::Char('?') => {
             st.modal = view::Modal::Help;
@@ -458,6 +462,10 @@ fn sync_state_config(st: &mut view::State, cfg: &crate::config::Loaded, no_color
     let c = &cfg.config;
     st.interval_ms = clamp_interval(c.interval_ms);
     st.fold_pool = c.fold_pool.as_option();
+    st.hide_game = !c.show_game;
+    if st.hide_game && st.zoom == Some(view::Zoom::Game) {
+        st.zoom = None;
+    }
     st.frametime_alert_ms = c.frametime_alert_ms;
     st.net_bytes = c.net_bytes;
     st.notice = cfg.warnings.first().cloned();
@@ -624,8 +632,8 @@ fn event_loop(
         }
         if let Some(s) = u.fps {
             st.push_fps(s);
-            // O número de FPS muda a cada 250 ms, mas só aparece na aba Geral.
-            dirty |= overview;
+            // O número de FPS muda a cada 250 ms, mas só aparece na aba Geral (se visível).
+            dirty |= overview && !st.hide_game;
         }
         // Relógio da barra de abas: o tick da coleta já redesenha a cada segundo; só com um
         // intervalo maior o relógio pede redesenho próprio.
@@ -800,6 +808,7 @@ fn queue_save(
     c.interval_ms = st.interval_ms;
     c.theme.clone_from(&st.theme_name);
     c.fold_pool = crate::config::FoldPool::from_option(st.fold_pool);
+    c.show_game = !st.hide_game;
     if c == cfg.config || !cfg.writable() {
         // Sem gravação: o aviso de leitura (que explica o porquê) continua na tela.
         return;
@@ -1017,5 +1026,35 @@ mod controller_tests {
         assert!(st.toast.is_some());
         assert!(st.expire_toast(t0 + view::TOAST_FOR));
         assert!(st.toast.is_none());
+    }
+
+    #[test]
+    fn atalho_f_oculta_jogo_salva_config_e_pula_zoom_do_jogo() {
+        let mut st = view::State::new(1000);
+        assert!(!st.hide_game);
+        // Com zoom no jogo, `f` oculta, sai do zoom e pede SaveConfig.
+        st.zoom = Some(view::Zoom::Game);
+        let (dirty, eff) = handle_key(&mut st, key(KeyCode::Char('F')), &[], false);
+        assert!(dirty && st.hide_game && st.zoom.is_none());
+        assert_eq!(eff, vec![Effect::SaveConfig]);
+        // Com o jogo oculto, o ciclo de `z` vai até Disks e volta a None (pula Game).
+        for want in [
+            Some(view::Zoom::Cpu),
+            Some(view::Zoom::Gpu),
+            Some(view::Zoom::Net),
+            Some(view::Zoom::Disks),
+            None,
+        ] {
+            let _ = handle_key(&mut st, key(KeyCode::Char('z')), &[], false);
+            assert_eq!(st.zoom, want);
+        }
+        // `f` de novo reexibe o jogo.
+        let (dirty, eff) = handle_key(&mut st, key(KeyCode::Char('f')), &[], false);
+        assert!(dirty && !st.hide_game);
+        assert_eq!(eff, vec![Effect::SaveConfig]);
+        // Em outra aba, `f` não altera `hide_game`.
+        st.set_tab(view::Tab::Processes);
+        let (dirty, eff) = handle_key(&mut st, key(KeyCode::Char('f')), &[], false);
+        assert!(!dirty && eff.is_empty() && !st.hide_game);
     }
 }

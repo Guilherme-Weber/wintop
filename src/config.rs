@@ -75,7 +75,10 @@ impl FoldPool {
 pub struct Config {
     pub interval_ms: u64,
     pub theme: String,
+    /// Recolhimento dos membros do Storage Space.
     pub fold_pool: FoldPool,
+    /// Mostrar a caixa de jogo (FPS e frametime) na aba Geral (tecla `f`).
+    pub show_game: bool,
     /// Executáveis (minúsculos) que nunca viram "o jogo".
     pub rtss_ignored: Vec<String>,
     /// Cores trocadas sobre o tema: (nome da cor, "#rrggbb").
@@ -106,6 +109,7 @@ impl Default for Config {
             interval_ms: DEFAULT_INTERVAL_MS,
             theme: "default".into(),
             fold_pool: FoldPool::Auto,
+            show_game: true,
             rtss_ignored: DEFAULT_RTSS_IGNORED
                 .iter()
                 .map(ToString::to_string)
@@ -141,6 +145,9 @@ fn template(c: &Config) -> String {
          \n\
          # Storage Space members in the disk box: auto, fold, expand. Key: d.\n\
          fold_pool = \"{}\"\n\
+         \n\
+         # Show the game box (FPS and frametime) on Overview. Key: f.\n\
+         show_game = {}\n\
          \n\
          # Frametime (ms) from which the game box highlights it (33.3 = below 30 FPS).\n\
          frametime_alert_ms = {}\n\
@@ -180,6 +187,7 @@ fn template(c: &Config) -> String {
         c.interval_ms,
         c.theme,
         c.fold_pool.name(),
+        c.show_game,
         c.frametime_alert_ms,
         if c.net_bytes { "bytes" } else { "bits" },
         c.mouse,
@@ -380,6 +388,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             }
         };
     }
+    if let Some(v) = doc.get("show_game") {
+        match v.as_bool() {
+            Some(b) => c.show_game = b,
+            None => warn.push("config: show_game must be true or false".into()),
+        }
+    }
     if let Some(v) = doc.get("frametime_alert_ms") {
         let n = v.as_float().or_else(|| v.as_integer().map(|i| i as f64));
         match n {
@@ -475,6 +489,7 @@ fn update_doc(doc: &mut DocumentMut, c: &Config) {
     doc["interval_ms"] = value(c.interval_ms as i64);
     doc["theme"] = value(c.theme.as_str());
     doc["fold_pool"] = value(c.fold_pool.name());
+    doc["show_game"] = value(c.show_game);
     // A lista do RTSS só entra se a tabela não existe (um `rtss` que não é tabela fica como
     // o usuário deixou: indexar nele derrubaria o programa).
     if doc.get("rtss").is_none() {
@@ -598,8 +613,13 @@ mod tests {
             let again: DocumentMut = doc.to_string().parse().expect("regravado inválido");
             let back = from_doc(&again, &mut Vec::new());
             assert_eq!(
-                (back.interval_ms, back.theme, back.fold_pool.name()),
-                (c.interval_ms, c.theme, c.fold_pool.name())
+                (
+                    back.interval_ms,
+                    back.theme,
+                    back.fold_pool.name(),
+                    back.show_game
+                ),
+                (c.interval_ms, c.theme, c.fold_pool.name(), c.show_game)
             );
         });
     }
@@ -801,5 +821,23 @@ mod tests_1_1 {
             ..Config::default()
         };
         assert_eq!(read(&template(&c)), (true, 0));
+    }
+
+    #[test]
+    fn show_game_no_config() {
+        let read = |s: &str| {
+            let doc: DocumentMut = s.parse().expect("toml");
+            let mut warn = Vec::new();
+            (from_doc(&doc, &mut warn).show_game, warn.len())
+        };
+        assert_eq!(read(""), (true, 0));
+        assert_eq!(read("show_game = false\n"), (false, 0));
+        assert_eq!(read("show_game = true\n"), (true, 0));
+        assert_eq!(read("show_game = \"no\"\n"), (true, 1));
+        let c = Config {
+            show_game: false,
+            ..Config::default()
+        };
+        assert_eq!(read(&template(&c)), (false, 0));
     }
 }

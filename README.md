@@ -8,7 +8,7 @@ de jogos.
 
 ## Estado
 
-Versão 1.4.2. O histórico está em
+Versão 1.4.3. O histórico está em
 [CHANGELOG.md](CHANGELOG.md), o inventário completo de métricas em
 [docs/metricas.md](docs/metricas.md), as diferenças conhecidas em relação ao Gerenciador de
 Tarefas em [docs/divergencias.md](docs/divergencias.md) e as provas de viabilidade de cada fonte
@@ -62,7 +62,8 @@ wintop --version
 ```
 
 Na interface: `1` a `4` trocam de aba, `+` e `-` ajustam o intervalo de atualização (passos de
-100 ms), `r` zera os mínimos e máximos da sessão, `d` recolhe os membros do Storage Space e `q`
+100 ms), `r` zera os mínimos e máximos da sessão, `f` oculta ou mostra a caixa de FPS e frametime,
+`d` recolhe os membros do Storage Space e `q`
 (ou `Esc`, `Ctrl+C`) sai. Nas abas Processos e GPU, as setas (ou `j`/`k`, `PgUp`/`PgDn`,
 `Home`/`End`) selecionam; na aba Processos, `←`/`→` mudam a coluna da ordem, `i` inverte e `/`
 filtra pelo nome ou PID; na aba GPU, `Enter` lista os runtimes de GPU do processo selecionado
@@ -78,7 +79,7 @@ dos membros do Storage Space, lista de aplicativos que o RTSS acompanha mas não
 de atualização (`check_updates`), modo debug (`debug`, gera `wintop-debug.log` rotativo) e cores
 avulsas (`[colors]`, em `#rrggbb`). O idioma da interface é escolhido em `language`: `en-US`
 (padrão) ou `pt-BR` (português do Brasil, com vírgula decimal); erros vindos do sistema e dos
-drivers aparecem como o Windows os informa. As mudanças feitas na interface (`+`/`-`, `t`, `d`) são
+drivers aparecem como o Windows os informa. As mudanças feitas na interface (`+`/`-`, `t`, `d`, `f`) são
 gravadas no próprio arquivo, preservando os comentários. Um arquivo com erro de sintaxe não
 impede a abertura: o wintop usa os padrões, avisa no rodapé e não o regrava.
 
