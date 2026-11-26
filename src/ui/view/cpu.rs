@@ -67,19 +67,11 @@ pub(super) fn draw_cpu(
         .and_then(|r| r.as_ref().ok())
         .and_then(|s| s.tctl.as_ref().ok())
         .copied();
-    let inner_w = area.width.saturating_sub(2);
-    let graphs_w = if cpu_tctl.is_some() && inner_w >= 44 {
-        inner_w.saturating_sub(TEMP_BAR_W)
-    } else {
-        inner_w
+    let right = match &c.topology {
+        Ok(t) => format!("{} cores · {} threads", t.cores, t.logical),
+        Err(_) => format!("{per_len} threads"),
     };
-    // Janela real do gráfico total: 2 amostras por coluna, no intervalo atual.
-    let cols = u64::from(total_width(graphs_w).saturating_sub(2));
-    let secs = cols * 2 * st.interval_ms / 1000;
-    let block = with_failure(
-        boxed(&name, &format!("total {secs}s · {per_len} logical")),
-        c.name.as_ref().err(),
-    );
+    let block = with_failure(boxed(&name, &right), c.name.as_ref().err());
     let whole = block.inner(area);
     frame.render_widget(block, area);
     // Memória embaixo, depois de um divisor rotulado (como a VRAM na caixa da GPU).
@@ -461,26 +453,11 @@ fn memory_divider_right(m: &Memory, width: u16) -> String {
         };
         base.push(slots);
     }
-    let hw_res = m
-        .hardware_reserved
-        .as_ref()
-        .ok()
-        .filter(|v| **v > 0)
-        .map(|v| format!("{} {}", bytes(*v), tr("hw res")));
-    let full = match (base.is_empty(), &hw_res) {
-        (false, Some(r)) => format!("{} · {r}", base.join(" · ")),
-        (false, None) => base.join(" · "),
-        (true, Some(r)) => r.clone(),
-        (true, None) => String::new(),
-    };
+    let summary = base.join(" · ");
     // Reserva espaço para "── memory ────  ──" (16 colunas no mínimo).
     let room = usize::from(width.saturating_sub(18));
-    if !full.is_empty() && Span::raw(full.as_str()).width() <= room {
-        return full;
-    }
-    let short = base.join(" · ");
-    if !short.is_empty() && Span::raw(short.as_str()).width() <= room {
-        return short;
+    if !summary.is_empty() && Span::raw(summary.as_str()).width() <= room {
+        return summary;
     }
     String::new()
 }

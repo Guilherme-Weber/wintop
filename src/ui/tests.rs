@@ -539,7 +539,7 @@ fn linhas_de_detalhe_nao_cortam_nada() {
             "kernel 4.0 MB",
             "rx 250.0 MB/s",
             "(NVML)",
-            "video 2220/3090",
+            "video 2220/3090 MHz",
             "182004 handles",
             "frame 6.80 ms",
             "1000 ms tick",
@@ -1947,10 +1947,8 @@ fn memoria_comprimida_hardware_paging_e_alerta_bad_pages() {
     let mut st = filled();
     let out = render(&mut st, 160, 48);
     assert!(out.contains("■ compressed 1.8 GB (5.4 GB raw)"), "{out}");
-    assert!(
-        out.contains("DDR4 · 3600 MT/s · 4/4 DIMM · 88.0 MB hw res"),
-        "{out}"
-    );
+    assert!(out.contains("DDR4 · 3600 MT/s · 4/4 DIMM"), "{out}");
+    assert!(!out.contains("hw res"), "{out}");
     assert!(out.contains("boot peak 48.0 GB"), "{out}");
     assert!(out.contains("paging in 0/s  out 0/s"), "{out}");
     assert!(!out.contains("bad RAM pages"), "{out}");

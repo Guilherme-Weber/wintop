@@ -681,9 +681,9 @@ fn nvml_rows(
     let clk = |m: &Metric<(u32, u32)>| {
         metric_styled(m, th().accent, |(c, mx)| {
             if *mx > 0 {
-                format!("{c}/{mx}")
+                format!("{c}/{mx} MHz")
             } else {
-                c.to_string()
+                format!("{c} MHz")
             }
         })
     };
@@ -715,7 +715,7 @@ fn nvml_rows(
     };
     let card = vec![
         vec![
-            label("clk (MHz)  gfx "),
+            label("clk    gfx "),
             clk(&g.clock_graphics),
             max(session.gfx_clock),
             label("  SM "),

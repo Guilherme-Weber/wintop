@@ -865,7 +865,21 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
                 Err(e) => right.extend([label(&app_label), missing(e)]),
             }
             if !narrow {
+                let hist_s = state::HISTORY as u64 * st.interval_ms / 1000;
+                let hist_txt = if hist_s >= 3600 {
+                    format!("{}h{}m", hist_s / 3600, (hist_s % 3600) / 60)
+                } else if hist_s >= 60 {
+                    if hist_s.is_multiple_of(60) {
+                        format!("{}m", hist_s / 60)
+                    } else {
+                        format!("{}m{}s", hist_s / 60, hist_s % 60)
+                    }
+                } else {
+                    format!("{hist_s}s")
+                };
                 right.extend([
+                    bar_sep(),
+                    label(&format!("history {hist_txt}")),
                     bar_sep(),
                     label(&format!(
                         "collection {} ms",

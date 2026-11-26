@@ -12,7 +12,7 @@ use super::procs_tab::{self, ProcSort};
 use super::table::TableState;
 use crate::model::{Fast, Fps, GpuProc, Metric, Proc, Slow, View};
 /// Amostras guardadas por série (cobre ~500 colunas de braille).
-const HISTORY: usize = 1000;
+pub(super) const HISTORY: usize = 1000;
 
 /// Sobreposição ativa que captura o teclado (exclusivas por construção).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
