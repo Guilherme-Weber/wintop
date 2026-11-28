@@ -36,5 +36,10 @@ if (-not (Test-Path $iscc)) {
     Remove-Item $dir -Recurse -Force
     if (-not (Test-Path $iscc)) { throw "Inno Setup instalado, mas $iscc não existe" }
 }
-$v = (Get-Item $iscc).VersionInfo.ProductVersion
+# O ISCC.exe não traz versão no recurso do executável: vem da chave de desinstalação.
+$keys = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1'
+$v = $keys | ForEach-Object { (Get-ItemProperty $_ -ErrorAction SilentlyContinue).DisplayVersion } |
+    Where-Object { $_ } | Select-Object -First 1
+if (-not $v) { $v = 'versão desconhecida' }
 Write-Host "Inno Setup: $iscc ($v)"

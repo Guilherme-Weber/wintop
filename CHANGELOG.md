@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.7] - 2026-11-28
+
 ### Alterado
 
 - CI: o Inno Setup, se não vier na imagem, é baixado na versão 6.7.3 com SHA-256 e assinatura
