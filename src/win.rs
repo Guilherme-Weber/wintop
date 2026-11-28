@@ -119,6 +119,21 @@ pub fn harden_dll_search() {
     if let Err(e) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } {
         eprintln!("warning: SetDefaultDllDirectories: {e}");
     }
+    quiet_critical_errors();
+}
+
+/// Sem as caixas modais de erro crítico do Windows ("não há disco na unidade", arquivo não
+/// encontrado ao abrir): um leitor de cartão esvaziado entre a releitura das letras e a consulta
+/// de espaço livre vira erro da chamada, não uma janela que trava a thread de coleta até alguém
+/// clicar. Vale para o processo todo (as threads herdam o modo).
+fn quiet_critical_errors() {
+    use windows::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+    };
+    // SAFETY: sem pré-condições; só muda o modo de erro deste processo.
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    }
 }
 
 /// Pasta System32 pela API (a variável de ambiente `SystemRoot` é herdável e manipulável).

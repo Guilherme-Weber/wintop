@@ -440,6 +440,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("hardware fault", "falha de hardware"),
     ("modified", "modificada"),
     ("free", "livre"),
+    ("free space", "espaço livre"),
     ("used", "em uso"),
     ("reserved", "reservada"),
     ("kernel pools", "pools do kernel"),

@@ -41,10 +41,7 @@ jobs:
       # ícone, avisos de licença): um problema no empacotamento aparece antes da tag.
       - name: Inno Setup
         shell: pwsh
-        run: |
-          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
-          if (-not (Test-Path $iscc)) { throw 'Inno Setup não instalado' }
+        run: ./scripts/ensure-inno.ps1
       - name: Pacote
         shell: pwsh
         run: ./scripts/package.ps1

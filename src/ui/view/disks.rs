@@ -383,6 +383,7 @@ pub(super) fn draw_disks(
             ));
         }
         // Espaço livre: laranja abaixo de 10% do total dos volumes; sem volume, em branco.
+        let low_free = matches!(&d.free, Ok((f, t)) if f.saturating_mul(10) < *t);
         let free = match &d.free {
             Ok((f, t)) => Span::styled(
                 format!("{:>7} ", compact_bytes(*f)),
@@ -399,7 +400,13 @@ pub(super) fn draw_disks(
             Err(_) => Span::raw(" ".repeat(8)),
         };
         if tiny {
-            left_spans.push(label(&format!("{cap:>7} ")));
+            // Sem lugar para as duas colunas (80 colunas): o espaço livre em laranja substitui a
+            // capacidade quando está abaixo de 10%, para o alerta não sumir.
+            if low_free {
+                left_spans.push(free);
+            } else {
+                left_spans.push(label(&format!("{cap:>7} ")));
+            }
         } else if compact {
             left_spans.push(label(&format!("{cap:>7} ")));
             left_spans.push(free);

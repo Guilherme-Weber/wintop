@@ -491,6 +491,23 @@ pub fn unpack(verified: VerifiedZip<'_>, version: &str) -> Result<Package, Strin
     if entries.iter().any(|e| !e.0.starts_with(&root)) {
         return Err(format!("the package is not wintop {version}"));
     }
+    // Defesa em profundidade (o zip já tem a assinatura conferida): nada de componentes `.`/`..`,
+    // barra invertida, `:` ou partes vazias, e nenhum nome repetido (dois leitores de zip podiam
+    // escolher entradas diferentes com o mesmo nome).
+    for (i, e) in entries.iter().enumerate() {
+        let rel = &e.0[root.len()..];
+        let bad = e.0.contains('\\')
+            || e.0.contains(':')
+            || rel.split('/').enumerate().any(|(k, part)| {
+                part == "." || part == ".." || (part.is_empty() && k + 1 < rel.split('/').count())
+            });
+        if bad {
+            return Err(format!("invalid entry in the package: {:?}", e.0));
+        }
+        if entries[..i].iter().any(|o| o.0.eq_ignore_ascii_case(&e.0)) {
+            return Err(format!("duplicate entry in the package: {:?}", e.0));
+        }
+    }
     let find = |rel: &str| {
         entries
             .iter()
@@ -498,6 +515,9 @@ pub fn unpack(verified: VerifiedZip<'_>, version: &str) -> Result<Package, Strin
             .map(|&(_, m, c, s, l)| zip_read(z, m, c, s, l))
     };
     let exe = find("wintop.exe").ok_or("wintop.exe not in the package")??;
+    if !exe.starts_with(b"MZ") {
+        return Err("wintop.exe in the package is not an executable".into());
+    }
     let mut modules = Vec::new();
     for f in MODULE_FILES {
         if let Some(r) = find(&format!("modules/{f}")) {
@@ -975,8 +995,44 @@ mod tests {
             let _ = unpack(VerifiedZip(&z0[..n]), "1.2.0");
         }
         crate::fuzz::run("zip_updater", &[z0, z8], 512, |_, b| {
-            let _ = unpack(VerifiedZip(b), "1.2.0");
+            // Pacote aceito: exe executável, só módulos da lista fechada, sem repetição, e os
+            // `.bin` obrigatórios presentes.
+            if let Ok(p) = unpack(VerifiedZip(b), "1.2.0") {
+                assert!(p.exe.starts_with(b"MZ"));
+                for (i, (n, _)) in p.modules.iter().enumerate() {
+                    assert!(MODULE_FILES.contains(&n.as_str()), "{n}");
+                    assert!(!p.modules[..i].iter().any(|(o, _)| o == n), "{n}");
+                }
+                for f in MODULE_FILES.iter().filter(|f| f.ends_with(".bin")) {
+                    assert!(p.modules.iter().any(|(n, _)| n == f), "{f}");
+                }
+            }
         });
+        // Nomes hostis montados de propósito (o mutador raramente acerta um nome inteiro).
+        let base = "wintop-1.2.0-windows-x64/";
+        let ok_mods = [
+            (format!("{base}modules/AMDFamily17.bin"), b"m".to_vec()),
+            (format!("{base}modules/IntelMSR.bin"), b"i".to_vec()),
+        ];
+        for evil in [
+            format!("{base}../evil.dll"),
+            format!("{base}modules/../wintop.exe"),
+            format!("{base}./wintop.exe"),
+            format!("{base}modules\\x.dll"),
+            format!("{base}C:/x.dll"),
+            format!("{base}modules//x"),
+            format!("{base}WINTOP.EXE"),
+        ] {
+            let mut entries: Vec<(String, Vec<u8>)> =
+                vec![(format!("{base}wintop.exe"), b"MZexe".to_vec())];
+            entries.extend(ok_mods.iter().cloned());
+            entries.push((evil.clone(), b"x".to_vec()));
+            let refs: Vec<(&str, &[u8])> = entries
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_slice()))
+                .collect();
+            assert!(unpack(VerifiedZip(&zip(&refs)), "1.2.0").is_err(), "{evil}");
+        }
     }
 
     /// Troca portátil com o exe em execução (uma cópia do ping.exe rodando como wintop.exe), na

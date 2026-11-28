@@ -6,11 +6,28 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Alterado
+
+- CI: o Inno Setup, se não vier na imagem, é baixado na versão 6.7.3 com SHA-256 e assinatura
+  conferidos (`scripts/ensure-inno.ps1`), em vez do Chocolatey sem versão fixada.
+- `src/install.rs` dividido em `src/install/` (ACL, tarefa e atalho, exe e módulos,
+  desinstalação), sem mudança de comportamento.
+
 ### Corrigido
 
 - Instalador: a caixa "Abrir o wintop" da tela final dava o erro 740 ("a operação requer
   elevação"), porque o Inno Setup roda essa caixa como o usuário sem elevação; agora o wintop é
   aberto pela tarefa agendada, como o atalho do Menu Iniciar (sem UAC).
+- Coluna `free` em 80 colunas: o espaço livre abaixo de 10% substitui a capacidade (antes o
+  alerta laranja sumia no terminal pequeno).
+- Desinstalação: recusa com o wintop aberto (antes de remover qualquer coisa) e só apaga a
+  entrada de "Aplicativos instalados" depois que a pasta saiu; se a pasta falhar, a
+  desinstalação pode ser repetida por lá.
+- Caixas modais de erro crítico do Windows desligadas (`SetErrorMode`): um cartão removido entre
+  duas leituras não abre mais "não há disco na unidade" travando a coleta.
+- Atualização automática: o pacote é recusado com entradas `..`, barra invertida, `:` ou nomes
+  repetidos, e com um `wintop.exe` que não seja executável (defesa em profundidade; o zip já
+  tem a assinatura conferida).
 - Memória comprometida de 91 MB (em vez de ~35 MB) com a janela maximizada na abertura
   (`start_maximized`, o padrão): o `ShowWindow` síncrono na janela do conhost fazia o Windows
   comprometer ~54 MB no processo do wintop. Agora a maximização é pedida com

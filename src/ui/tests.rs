@@ -313,6 +313,57 @@ fn espaco_livre_laranja_abaixo_de_10_por_cento() {
     assert_eq!(buf[(x + 1, y)].fg, th.label);
 }
 
+/// Em 80 colunas só cabe uma coluna: o livre abaixo de 10% substitui a capacidade (o alerta
+/// laranja não some no terminal pequeno).
+#[test]
+fn espaco_livre_baixo_aparece_em_80_colunas() {
+    // C: (o disco que cabe na aba Geral em 80x24) com 30 GB livres de 477 GB.
+    let mut st = State::new(1000);
+    for i in 0..120 {
+        let mut f = fast(i);
+        if let Ok(list) = &mut f.disks {
+            for d in list.iter_mut().filter(|d| d.number == 7) {
+                d.free = Ok((30 * GB, 477 * GB));
+            }
+        }
+        st.push_fast(f);
+        st.push_fps(game());
+    }
+    st.slow = Some(slow().into());
+    let mut t = Terminal::new(TestBackend::new(80, 24)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let buf = t.backend().buffer().clone();
+    let th = super::theme::th();
+    let mut achou = false;
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        if let Some(i) = row.find("30.0 GB") {
+            let x = row[..i].chars().count() as u16;
+            assert_eq!(buf[(x, y)].fg, th.disk_low);
+            achou = true;
+        }
+    }
+    assert!(achou, "livre baixo não apareceu em 80x24");
+}
+
+/// Console do Windows 10 com Consolas (sem braille): gráficos e barras só com os blocos do
+/// WGL4 (▄ ▀ █ ▌ ░), no tamanho do conhost do atalho.
+#[test]
+fn geral_meio_bloco_120x30() {
+    super::glyphs::set(super::glyphs::Glyphs::Halves);
+    let mut st = filled();
+    st.clock = "10:33:28".into();
+    let out = render(&mut st, 120, 30);
+    super::glyphs::set(super::glyphs::Glyphs::Braille);
+    assert!(
+        !out.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+        "braille no modo meio bloco"
+    );
+    insta::assert_snapshot!(out);
+}
+
 #[test]
 fn geral_com_jogo() {
     insta::assert_snapshot!(render(&mut filled(), 160, 48));

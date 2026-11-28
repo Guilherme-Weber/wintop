@@ -1066,6 +1066,43 @@ mod tests {
         assert!(is_pool_member(&l));
     }
 
+    /// Os IOCTLs de reserva da capacidade (pendrives que recusam `IOCTL_DISK_GET_LENGTH_INFO`)
+    /// dão o mesmo valor que ele em todo disco que responde aos três (`DiskSize` em +24 da
+    /// geometria e `DiskLength` em +24 do `READ CAPACITY`). Elevado:
+    /// `cargo test capacidade_pelas_reservas -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "hardware: discos físicos e terminal elevado"]
+    fn capacidade_pelas_reservas() {
+        let mut checked = 0;
+        for n in 0..16 {
+            let Some(h) = Handle::open(n, GENERIC_READ.0) else {
+                continue;
+            };
+            let mut buf = [0u8; 256];
+            let Ok(len) = h.ioctl_raw(IOCTL_DISK_GET_LENGTH_INFO, None, &mut buf[..8]) else {
+                continue;
+            };
+            let main = u64_at(&buf[..len], 0).expect("tamanho");
+            for (name, code) in [
+                ("GEOMETRY_EX", IOCTL_DISK_GET_DRIVE_GEOMETRY_EX),
+                ("READ_CAPACITY", IOCTL_STORAGE_READ_CAPACITY),
+            ] {
+                let mut b = [0u8; 256];
+                match h.ioctl_raw(code, None, &mut b) {
+                    Ok(k) => {
+                        let v = u64_at(&b[..k], 24).expect("resposta curta");
+                        println!("disco {n}: {name} = {v} (LENGTH_INFO = {main})");
+                        assert_eq!(v, main, "disco {n} {name}");
+                        checked += 1;
+                    }
+                    Err((c, e)) => println!("disco {n}: {name} recusado (0x{c:X}: {e})"),
+                }
+            }
+            assert!(capacity(&h) == Ok(main));
+        }
+        assert!(checked > 0, "nenhum disco respondeu aos IOCTLs de reserva");
+    }
+
     #[test]
     fn modelo_sem_repetir_fabricante() {
         let mut d = vec![0u8; 64];
