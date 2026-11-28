@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.6] - 2026-11-27
+
 ### Adicionado
 
 - Instalador `wintop-<versão>-setup.exe` (Inno Setup, português e inglês): instala em

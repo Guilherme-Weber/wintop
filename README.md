@@ -8,7 +8,7 @@ de jogos.
 
 ## Estado
 
-Versão 1.4.5. O histórico está em
+Versão 1.4.6. O histórico está em
 [CHANGELOG.md](CHANGELOG.md), o inventário completo de métricas em
 [docs/metricas.md](docs/metricas.md), as diferenças conhecidas em relação ao Gerenciador de
 Tarefas em [docs/divergencias.md](docs/divergencias.md) e as provas de viabilidade de cada fonte
