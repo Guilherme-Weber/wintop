@@ -11,6 +11,10 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 - Instalador: a caixa "Abrir o wintop" da tela final dava o erro 740 ("a operação requer
   elevação"), porque o Inno Setup roda essa caixa como o usuário sem elevação; agora o wintop é
   aberto pela tarefa agendada, como o atalho do Menu Iniciar (sem UAC).
+- Memória comprometida de 91 MB (em vez de ~35 MB) com a janela maximizada na abertura
+  (`start_maximized`, o padrão): o `ShowWindow` síncrono na janela do conhost fazia o Windows
+  comprometer ~54 MB no processo do wintop. Agora a maximização é pedida com
+  `ShowWindowAsync`.
 
 ## [1.4.6] - 2026-11-27
 

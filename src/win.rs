@@ -451,13 +451,15 @@ impl Drop for RegKey {
 /// 120x30). No Windows Terminal a janela do console é um pseudoconsole oculto: nada muda.
 /// Devolve se maximizou.
 pub fn maximize_classic_console() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindowAsync};
     let Some(hwnd) = classic_console_window() else {
         return false;
     };
-    // SAFETY: janela do console deste processo. O retorno diz se ela estava visível antes,
-    // não se deu certo.
-    let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    // Assíncrono: a janela é do conhost (outro processo). O `ShowWindow` síncrono fazia o
+    // Windows comprometer ~54 MB no processo do wintop (medido: commit de 35 para 91 MB, quase
+    // tudo zerado e fora do working set); o pedido assíncrono só posta a mensagem ao conhost.
+    // SAFETY: janela do console deste processo. O retorno diz se o pedido foi postado.
+    let _ = unsafe { ShowWindowAsync(hwnd, SW_MAXIMIZE) };
     true
 }
 
