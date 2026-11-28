@@ -6,6 +6,8 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.5] - 2026-11-27
+
 ### Adicionado
 
 - Temperatura e potência de processadores Intel pelo PawnIO (módulo oficial `IntelMSR`, LGPL-2.1,
