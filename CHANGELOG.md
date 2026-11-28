@@ -6,6 +6,12 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Corrigido
+
+- Instalador: a caixa "Abrir o wintop" da tela final dava o erro 740 ("a operação requer
+  elevação"), porque o Inno Setup roda essa caixa como o usuário sem elevação; agora o wintop é
+  aberto pela tarefa agendada, como o atalho do Menu Iniciar (sem UAC).
+
 ## [1.4.6] - 2026-11-27
 
 ### Adicionado
