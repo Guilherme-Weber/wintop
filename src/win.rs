@@ -28,6 +28,12 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Converte um `OsStr` para UTF-16 terminado em zero sem perda de surrogates.
+pub fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
 /// Texto de um buffer UTF-16 terminado em zero (ou cheio).
 pub fn from_wide(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -310,15 +316,16 @@ pub unsafe fn sid_string(sid: PSID) -> Option<String> {
 /// SID do usuário do token atual, em texto (S-1-5-21-...).
 pub fn user_sid() -> Option<String> {
     let token = current_token()?;
-    let mut buf = vec![0u64; 64]; // alinhado para TOKEN_USER
+    // TOKEN_USER (16 bytes) + SECURITY_MAX_SID_SIZE (68 bytes) = 84 bytes; 128 bytes na pilha.
+    let mut buf = [0u64; 16];
     let mut len = 0u32;
-    // SAFETY: token válido; buffer local com o tamanho informado.
+    // SAFETY: token válido; buffer local alinhado com o tamanho informado.
     unsafe {
         GetTokenInformation(
             HANDLE(token.as_raw_handle()),
             TokenUser,
             Some(buf.as_mut_ptr().cast::<c_void>()),
-            (buf.len() * 8) as u32,
+            size_of_val(&buf) as u32,
             &raw mut len,
         )
     }

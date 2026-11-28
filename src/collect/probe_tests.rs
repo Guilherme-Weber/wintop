@@ -184,7 +184,15 @@ fn probe_aparece_na_aba_gpu() {
         gpu: true,
     };
     let s = slow
-        .collect(&std::sync::atomic::AtomicBool::new(false), view, 0)
+        .collect(
+            &std::sync::atomic::AtomicBool::new(false),
+            |d| {
+                std::thread::sleep(d);
+                false
+            },
+            view,
+            0,
+        )
         .expect("coleta lenta");
     let gpus = s.gpus.expect("GPUs");
     let procs = gpus[0].procs.clone().expect("aba GPU").expect("processos");
@@ -435,7 +443,15 @@ fn probe_dois_jogos_segue_o_foco() {
         gpu: true,
     };
     let s = slow
-        .collect(&std::sync::atomic::AtomicBool::new(false), view, 0)
+        .collect(
+            &std::sync::atomic::AtomicBool::new(false),
+            |d| {
+                std::thread::sleep(d);
+                false
+            },
+            view,
+            0,
+        )
         .expect("coleta lenta");
     let procs = s.gpus.expect("GPUs")[0]
         .procs

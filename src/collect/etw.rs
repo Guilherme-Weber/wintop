@@ -227,58 +227,63 @@ fn classify(provider: &GUID, id: u16, ptr64: bool, data: &[u8], tl: Option<&[u8]
 }
 
 unsafe extern "system" fn on_event(r: *mut EVENT_RECORD) {
-    // SAFETY: o ETW passa um registro válido durante o callback.
-    let r = unsafe { &*r };
-    if r.UserContext.is_null() {
+    if r.is_null() {
         return;
     }
-    // SAFETY: `UserContext` = o `Shared` do `Arc` que a thread do consumidor segura até o
-    // `ProcessTrace` voltar.
-    let shared = unsafe { &*r.UserContext.cast::<Shared>() };
-    let h = &r.EventHeader;
-    let target = shared.target.load(Ordering::Relaxed);
-    if target == 0 || h.ProcessId != target {
-        return;
-    }
-    let data: &[u8] = if r.UserData.is_null() || r.UserDataLength == 0 {
-        &[]
-    } else {
-        // SAFETY: payload do evento com o tamanho informado, válido durante o callback.
-        unsafe {
-            std::slice::from_raw_parts(r.UserData.cast::<u8>(), usize::from(r.UserDataLength))
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: o ETW passa um registro válido e não nulo durante o callback.
+        let r = unsafe { &*r };
+        if r.UserContext.is_null() {
+            return;
         }
-    };
-    let mut tl = None;
-    if !r.ExtendedData.is_null() {
-        for i in 0..usize::from(r.ExtendedDataCount.min(64)) {
-            // SAFETY: `ExtendedDataCount` itens válidos durante o callback.
-            let e = unsafe { &*r.ExtendedData.add(i) };
-            if u32::from(e.ExtType) == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
-                && e.DataPtr != 0
-                && e.DataSize > 0
-            {
-                // SAFETY: item de dados estendidos com o tamanho informado.
-                tl = Some(unsafe {
-                    std::slice::from_raw_parts(e.DataPtr as *const u8, usize::from(e.DataSize))
-                });
-                break;
+        // SAFETY: `UserContext` = o `Shared` do `Arc` que a thread do consumidor segura até o
+        // `ProcessTrace` voltar.
+        let shared = unsafe { &*r.UserContext.cast::<Shared>() };
+        let h = &r.EventHeader;
+        let target = shared.target.load(Ordering::Relaxed);
+        if target == 0 || h.ProcessId != target {
+            return;
+        }
+        let data: &[u8] = if r.UserData.is_null() || r.UserDataLength == 0 {
+            &[]
+        } else {
+            // SAFETY: payload do evento com o tamanho informado, válido durante o callback.
+            unsafe {
+                std::slice::from_raw_parts(r.UserData.cast::<u8>(), usize::from(r.UserDataLength))
+            }
+        };
+        let mut tl = None;
+        if !r.ExtendedData.is_null() {
+            for i in 0..usize::from(r.ExtendedDataCount.min(64)) {
+                // SAFETY: `ExtendedDataCount` itens válidos durante o callback.
+                let e = unsafe { &*r.ExtendedData.add(i) };
+                if u32::from(e.ExtType) == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
+                    && e.DataPtr != 0
+                    && e.DataSize > 0
+                {
+                    // SAFETY: item de dados estendidos com o tamanho informado.
+                    tl = Some(unsafe {
+                        std::slice::from_raw_parts(e.DataPtr as *const u8, usize::from(e.DataSize))
+                    });
+                    break;
+                }
             }
         }
-    }
-    let ptr64 = u32::from(h.Flags) & EVENT_HEADER_FLAG_32_BIT_HEADER == 0;
-    let Some(kind) = classify(&h.ProviderId, h.EventDescriptor.Id, ptr64, data, tl) else {
-        return;
-    };
-    let mut inbox = shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
-    if inbox.events.len() >= MAX_INBOX {
-        inbox.dropped += 1;
-    } else {
-        inbox.events.push(Event {
-            pid: h.ProcessId,
-            qpc: h.TimeStamp,
-            kind,
-        });
-    }
+        let ptr64 = u32::from(h.Flags) & EVENT_HEADER_FLAG_32_BIT_HEADER == 0;
+        let Some(kind) = classify(&h.ProviderId, h.EventDescriptor.Id, ptr64, data, tl) else {
+            return;
+        };
+        let mut inbox = shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        if inbox.events.len() >= MAX_INBOX {
+            inbox.dropped += 1;
+        } else {
+            inbox.events.push(Event {
+                pid: h.ProcessId,
+                qpc: h.TimeStamp,
+                kind,
+            });
+        }
+    }));
 }
 
 // --- Sessão ---
@@ -481,17 +486,18 @@ impl Session {
     }
 
     /// Move os eventos recebidos para `out`; devolve quantos foram descartados (caixa cheia).
+    /// Troca os vetores em O(1) sob o mutex (sem alocar nem encolher segurando o lock do ETW).
     pub fn drain(&self, out: &mut Vec<Event>) -> u64 {
+        out.clear();
+        if out.capacity() > 4096 {
+            out.shrink_to(1024);
+        }
         let mut inbox = self
             .shared
             .inbox
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        out.append(&mut inbox.events);
-        // Depois de um pico, devolve a memória.
-        if inbox.events.capacity() > 4096 {
-            inbox.events.shrink_to(1024);
-        }
+        std::mem::swap(out, &mut inbox.events);
         std::mem::take(&mut inbox.dropped)
     }
 

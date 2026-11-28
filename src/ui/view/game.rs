@@ -195,17 +195,18 @@ pub(super) fn draw_game(frame: &mut Frame<'_>, area: Rect, st: &State) {
             fps_head.push(label(&format!(" ({ratio})")));
         }
     }
+    let ceil_w = Span::raw(ceil_label.as_str()).width() as u16;
     let head = head_fit(
         fps_head,
         minmax(st.session.fps, |v| num(v, 0)),
-        fps_area.width.saturating_sub(ceil_label.len() as u16 + 1),
+        fps_area.width.saturating_sub(ceil_w + 1),
     );
     line(
         frame,
         head,
         fps_area.x,
         fps_area.y,
-        fps_area.width.saturating_sub(ceil_label.len() as u16 + 1),
+        fps_area.width.saturating_sub(ceil_w + 1),
         fps_area,
     );
     put(

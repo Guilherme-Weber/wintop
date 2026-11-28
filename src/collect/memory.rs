@@ -87,8 +87,8 @@ struct SystemMemoryListInformation {
 pub struct MemoryCollector {
     /// Tamanho de página do sistema (tipicamente 4096 bytes), lido uma vez na abertura.
     page_size: u64,
-    /// Buffer reaproveitado para `SystemPagefileInformation`.
-    pagefile_buf: Vec<u8>,
+    /// Buffer alinhado reaproveitado para `SystemPagefileInformation`.
+    pagefile_buf: Vec<u64>,
     /// Amostra anterior `(instante, PageReadCount, DirtyPagesWriteCount)` para a taxa de paginação.
     last_paging: Option<(Instant, u32, u32)>,
     /// Estáticos por boot: lidos uma única vez na abertura.
@@ -285,32 +285,35 @@ fn read_memory_list(page_size: u64) -> Metric<(u64, u64, u64)> {
 
 /// Lê `(usado, total)` em bytes de todos os arquivos de paginação ativos via
 /// `NtQuerySystemInformation(SystemPagefileInformation = 18)`.
-fn read_pagefile(buf: &mut Vec<u8>, page_size: u64) -> Metric<(u64, u64)> {
-    if buf.len() < 512 {
-        buf.resize(512, 0);
+fn read_pagefile(buf: &mut Vec<u64>, page_size: u64) -> Metric<(u64, u64)> {
+    if buf.len() < 64 {
+        buf.resize(64, 0);
     }
     for _ in 0..4 {
         let mut ret = 0u32;
-        // SAFETY: buffer próprio e contíguo com tamanho informado em bytes.
+        let cap_bytes = buf.len() * 8;
+        // SAFETY: buffer próprio, contíguo e alinhado a 8 bytes com tamanho informado em bytes.
         let status = unsafe {
             NtQuerySystemInformation(
                 SYSTEM_INFORMATION_CLASS(SYSTEM_PAGEFILE_INFORMATION),
                 buf.as_mut_ptr().cast(),
-                buf.len() as u32,
+                cap_bytes as u32,
                 &raw mut ret,
             )
         };
         if status.is_ok() {
-            let len = (ret as usize).min(buf.len());
-            return parse_pagefiles(&buf[..len], page_size);
+            let len = (ret as usize).min(cap_bytes);
+            // SAFETY: `buf` é uma fatia válida de `cap_bytes` bytes já inicializados.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) };
+            return parse_pagefiles(bytes, page_size);
         }
         let code = status.0 as u32;
         if code == STATUS_INFO_LENGTH_MISMATCH {
-            let needed = (ret as usize).max(buf.len().saturating_mul(2));
+            let needed = (ret as usize).max(cap_bytes.saturating_mul(2));
             if needed > PF_MAX_BUF {
                 return fail("SystemPagefileInformation: buffer too large");
             }
-            buf.resize(needed, 0);
+            buf.resize(needed.div_ceil(8), 0);
             continue;
         }
         return match code {
@@ -373,14 +376,14 @@ fn parse_pagefiles(buf: &[u8], page_size: u64) -> Metric<(u64, u64)> {
 /// Lê `(pages_in/s, pages_out/s)` pelo delta de `PageReadCount` e `DirtyPagesWriteCount` de
 /// `NtQuerySystemInformation(SystemPerformanceInformation = 2)`.
 fn read_paging(last: &mut Option<(Instant, u32, u32)>) -> Metric<(f64, f64)> {
-    let mut buf = [0u8; 1024];
+    let mut words = [0u64; 128];
     let mut ret = 0u32;
-    // SAFETY: buffer local alinhado na pilha com tamanho informado em bytes.
+    // SAFETY: buffer local alinhado a 8 bytes na pilha com tamanho informado em bytes (1024).
     let status = unsafe {
         NtQuerySystemInformation(
             SYSTEM_INFORMATION_CLASS(SYSTEM_PERFORMANCE_INFORMATION),
-            buf.as_mut_ptr().cast(),
-            buf.len() as u32,
+            words.as_mut_ptr().cast(),
+            size_of_val(&words) as u32,
             &raw mut ret,
         )
     };
@@ -396,6 +399,9 @@ fn read_paging(last: &mut Option<(Instant, u32, u32)>) -> Metric<(f64, f64)> {
     if (ret as usize) < PERF_MIN_LEN {
         return fail("SystemPerformanceInformation: response too short");
     }
+    // SAFETY: `words` é um array local inicializado de 1024 bytes.
+    let buf =
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(&words)) };
     let page_read = u32::from_le_bytes([
         buf[PERF_PAGE_READ_COUNT],
         buf[PERF_PAGE_READ_COUNT + 1],
@@ -680,6 +686,32 @@ mod tests {
         // Buffer truncado ou vazio não entra em pânico.
         assert!(parse_smbios_memory(&[]).is_err());
         assert!(parse_smbios_memory(&raw[..12]).is_err());
+    }
+
+    #[test]
+    fn fuzz_smbios_e_pagefiles() {
+        let mut smbios_body = type17_entry(8192, 0x09, 0x1A, 3200, 3600);
+        smbios_body.extend(type17_entry(0x7FFF, 0x0C, 0x22, 0xFFFF, 0xFFFF));
+        let mut smbios_seed = vec![0, 3, 2, 0];
+        smbios_seed.extend_from_slice(&(smbios_body.len() as u32).to_le_bytes());
+        smbios_seed.extend(smbios_body);
+
+        let mut pf_seed = pagefile_entry(32, 1000, 250);
+        pf_seed.extend(pagefile_entry(0, 500, 100));
+
+        crate::fuzz::run(
+            "smbios_e_pagefiles",
+            &[smbios_seed, pf_seed],
+            4096,
+            |_, b| {
+                if let Ok(hw) = parse_smbios_memory(b) {
+                    assert!(hw.slots_used > 0 && hw.slots_used <= hw.slots_total);
+                }
+                if let Ok((used, total)) = parse_pagefiles(b, 4096) {
+                    assert!(used <= total);
+                }
+            },
+        );
     }
 
     #[test]

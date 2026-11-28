@@ -124,47 +124,78 @@ fn phys_and_session_lines(
     }
 }
 
-/// `(n_cells, avail_top)` da caixa da GPU para ajustar `top_h` na aba Geral e manter todos os
-/// gráficos de engines com altura idêntica sem linhas vazias.
-fn gpu_layout_metrics(st: &State, g: &Gpu, inner_w: u16, inner_h: u16) -> (u16, u16) {
-    let (engine, _) = busiest_engine(g);
-    let details = gpu_details(st, g, inner_w);
-    let card_h = (details.card.len() + gpu_causes(g, inner_w).len()) as u16;
-    let legends_h = (details.vram_legend.len() + details.shared_legend.len()) as u16;
-    let phys_only_h =
-        phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, false).len() as u16;
-    let with_session_h =
-        phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, true).len() as u16;
-    let vram_extra_h = if inner_h >= 2 + legends_h + card_h + 1 + with_session_h + 4 {
-        with_session_h
-    } else {
-        phys_only_h
-    };
-    let vram_h = 2 + legends_h + vram_extra_h;
-    let div_h = u16::from(inner_h >= vram_h + card_h + 3);
-    let n_cells = engine_cells(g, engine).len() as u16;
-    let avail_top = inner_h.saturating_sub(vram_h + card_h + div_h);
-    (n_cells, avail_top)
+/// Linhas e células da caixa da GPU pré-calculadas uma vez por quadro para `inner_w`:
+/// evita recomputar `gpu_details`, `gpu_causes` e `engine_cells` em cada tentativa de
+/// `snap_top_height` e de novo em `draw_gpu`.
+pub(super) struct PreparedGpu {
+    inner_w: u16,
+    engine: &'static str,
+    engine_v: u32,
+    details: GpuDetails,
+    cells: Vec<EngineCell>,
+    with_session: Vec<Line<'static>>,
+    phys_only: Vec<Line<'static>>,
+}
+
+impl PreparedGpu {
+    fn layout_metrics(&self, inner_h: u16) -> (u16, u16) {
+        let card_h = self.details.card.len() as u16;
+        let legends_h = (self.details.vram_legend.len() + self.details.shared_legend.len()) as u16;
+        let with_session_h = self.with_session.len() as u16;
+        let phys_only_h = self.phys_only.len() as u16;
+        let vram_extra_h = if inner_h >= 2 + legends_h + card_h + 1 + with_session_h + 4 {
+            with_session_h
+        } else {
+            phys_only_h
+        };
+        let vram_h = 2 + legends_h + vram_extra_h;
+        let div_h = u16::from(inner_h >= vram_h + card_h + 3);
+        let n_cells = self.cells.len() as u16;
+        let avail_top = inner_h.saturating_sub(vram_h + card_h + div_h);
+        (n_cells, avail_top)
+    }
+}
+
+/// Pré-calcula as linhas e engines da GPU exibida para a largura `gpu_w` (com bordas).
+pub(super) fn prepare_gpu(st: &State, gpu_w: u16) -> Option<PreparedGpu> {
+    let list = st.fast.as_ref()?.gpus.as_ref().ok()?;
+    let g = list.get(st.gpu_index(list.len()))?;
+    Some(prepare_gpu_inner(st, g, gpu_w.saturating_sub(2)))
+}
+
+fn prepare_gpu_inner(st: &State, g: &Gpu, inner_w: u16) -> PreparedGpu {
+    let (engine, engine_v) = busiest_engine(g);
+    let mut details = gpu_details(st, g, inner_w);
+    // Falhas das engines e de drv/VBIOS inteiras na largura da caixa; a grade só leva marca curta.
+    let causes = gpu_causes(g, inner_w);
+    details.card.splice(0..0, causes);
+    let with_session = phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, true);
+    let phys_only = phys_and_session_lines(st, details.phys_spans.as_deref(), inner_w, false);
+    let cells = engine_cells(g, engine);
+    PreparedGpu {
+        inner_w,
+        engine,
+        engine_v,
+        details,
+        cells,
+        with_session,
+        phys_only,
+    }
 }
 
 /// Ajusta `top_h` em no máximo ±3 linhas (dentro de `min_top..=max_top`) para que a altura da
 /// área de gráficos da GPU divida exato pelo número de engines — eliminando qualquer linha em
 /// branco acima de `clk` ou `── vram ──` e mantendo todas as engines com a mesma altura.
 pub(super) fn snap_top_height(
-    st: &State,
-    gpu_w: u16,
+    prepared: Option<&PreparedGpu>,
     top_h: u16,
     min_top: u16,
     max_top: u16,
 ) -> u16 {
-    let Some(Ok(list)) = st.fast.as_ref().map(|f| &f.gpus) else {
+    let Some(p) = prepared else {
         return top_h;
     };
-    let Some(g) = list.get(st.gpu_index(list.len())) else {
-        return top_h;
-    };
-    let inner_w = gpu_w.saturating_sub(2);
-    let (n_cells, avail_top) = gpu_layout_metrics(st, g, inner_w, top_h.saturating_sub(2));
+    let (n_cells, avail_top) = p.layout_metrics(top_h.saturating_sub(2));
     if n_cells < 2 || avail_top < n_cells * 2 || avail_top.is_multiple_of(n_cells) {
         return top_h;
     }
@@ -176,7 +207,7 @@ pub(super) fn snap_top_height(
         if cand < min_top || cand > max_top {
             continue;
         }
-        let (n, avail) = gpu_layout_metrics(st, g, inner_w, cand.saturating_sub(2));
+        let (n, avail) = p.layout_metrics(cand.saturating_sub(2));
         if n >= 2 && avail >= n * 2 && avail.is_multiple_of(n) {
             return cand;
         }
@@ -186,7 +217,13 @@ pub(super) fn snap_top_height(
 
 /// Caixa da GPU. `core_graph_w`: largura do gráfico de cada célula por núcleo da CPU, para os
 /// mini gráficos de copy/encode/decode/mem act terem a mesma largura (e altura idêntica entre si).
-pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph_w: Option<u16>) {
+pub(super) fn draw_gpu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    st: &State,
+    core_graph_w: Option<u16>,
+    prepared: Option<PreparedGpu>,
+) {
     let gpus = st.fast.as_ref().map(|f| &f.gpus);
     let Some(Ok(list)) = gpus else {
         empty_box(frame, area, "gpu", gpus);
@@ -200,7 +237,6 @@ pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph
         );
         return;
     };
-    let (engine, engine_v) = busiest_engine(g);
     // Com mais de uma GPU, a posição da exibida (tecla `g` troca).
     let gpu = if list.len() > 1 {
         format!("gpu {}/{}", sel + 1, list.len())
@@ -218,25 +254,31 @@ pub(super) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, st: &State, core_graph
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let mut details = gpu_details(st, g, inner.width);
-    // Falhas das engines e de drv/VBIOS inteiras na largura da caixa; a grade só leva marca curta.
-    let causes = gpu_causes(g, inner.width);
+    let PreparedGpu {
+        engine,
+        engine_v,
+        details,
+        cells,
+        with_session,
+        phys_only,
+        ..
+    } = match prepared {
+        Some(p) if p.inner_w == inner.width => p,
+        _ => prepare_gpu_inner(st, g, inner.width),
+    };
     // Sem altura para tudo, os extremos da VRAM saem primeiro (continuam na aba Sensores): as
     // leituras ao vivo têm prioridade.
-    details.card.splice(0..0, causes);
     let card_h = details.card.len() as u16;
     let legends_h = (details.vram_legend.len() + details.shared_legend.len()) as u16;
-    let with_session = phys_and_session_lines(st, details.phys_spans.as_deref(), inner.width, true);
     let vram_extra = if inner.height >= 2 + legends_h + card_h + 1 + with_session.len() as u16 + 4 {
         with_session
     } else {
-        phys_and_session_lines(st, details.phys_spans.as_deref(), inner.width, false)
+        phys_only
     };
     let vram_h = 2 + legends_h + vram_extra.len() as u16;
     let div_h = u16::from(inner.height >= vram_h + card_h + 3);
     // Engines ao lado do gráfico, como a grade por lógico da CPU: o 3D (ou, com ele no gráfico
     // principal, a engine mais usada fora ele e o vídeo), encoder, decoder e a memória.
-    let cells = engine_cells(g, engine);
     let n_cells = cells.len() as u16;
     // Os detalhes (métricas) têm prioridade sobre a altura do gráfico; sem linhas em branco
     // acima de `clk` ou `── vram ──` (todo o espaço vai para os gráficos).

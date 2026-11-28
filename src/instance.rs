@@ -9,13 +9,10 @@
 use std::ffi::c_void;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::Security::{
-    CreateWellKnownSid, GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    TOKEN_QUERY, TokenSessionId, WinBuiltinAdministratorsSid,
+    CreateWellKnownSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TokenSessionId, WinBuiltinAdministratorsSid,
 };
 use windows::Win32::System::Threading::{
     AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexW,
@@ -29,46 +26,44 @@ pub enum Error {
     Os(windows::core::Error),
 }
 
-/// Mantém a instância enquanto viver: o mutex e depois o namespace (nessa ordem no Drop).
-pub struct Guard {
-    _mutex: OwnedHandle,
-    namespace: HANDLE,
-}
+/// Handle do namespace privado fechado no `Drop` (sem destruir: outra instância pode usar).
+struct PrivateNamespace(HANDLE);
 
-impl Drop for Guard {
+impl Drop for PrivateNamespace {
     fn drop(&mut self) {
-        // SAFETY: handle de namespace aberto por `acquire`, fechado uma vez (sem destruí-lo:
-        // outra instância pode estar usando).
+        // SAFETY: handle de namespace aberto por `open_namespace`, fechado uma vez.
         unsafe {
-            let _ = ClosePrivateNamespace(self.namespace, 0);
+            let _ = ClosePrivateNamespace(self.0, 0);
         }
     }
+}
+
+/// Mantém a instância enquanto viver: os campos caem na ordem de declaração (`_mutex` antes de
+/// `_namespace`, garantindo que o mutex fecha antes do namespace).
+pub struct Guard {
+    _mutex: OwnedHandle,
+    _namespace: PrivateNamespace,
 }
 
 const ALIAS: PCWSTR = w!("wintop");
 
 pub fn acquire() -> Result<Guard, Error> {
+    let sid = session_id()?;
+    acquire_named(&format!("wintop\\instance_s{sid}"))
+}
+
+fn acquire_named(mutex_name: &str) -> Result<Guard, Error> {
     let namespace = open_namespace()?;
-    let name = crate::win::wide(&format!("wintop\\instance_s{}", session_id()?));
+    let name = crate::win::wide(mutex_name);
     // SAFETY: nome terminado em zero dentro do namespace aberto; o handle passa a ter dono.
-    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
-    let handle = match handle {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: namespace aberto acima, fechado uma vez.
-            unsafe {
-                let _ = ClosePrivateNamespace(namespace, 0);
-            }
-            return Err(Error::Os(e));
-        }
-    };
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.map_err(Error::Os)?;
     // Lido antes de qualquer outra chamada.
     // SAFETY: sem pré-condições.
     let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     let guard = Guard {
         // SAFETY: CreateMutexW devolveu um handle válido, com um único dono a partir daqui.
         _mutex: unsafe { OwnedHandle::from_raw_handle(handle.0) },
-        namespace,
+        _namespace: namespace,
     };
     if existed {
         return Err(Error::AlreadyRunning);
@@ -78,16 +73,17 @@ pub fn acquire() -> Result<Guard, Error> {
 
 /// Cria o namespace (só Administradores e SYSTEM o acessam) ou abre o que outra instância
 /// elevada já criou.
-fn open_namespace() -> Result<HANDLE, Error> {
+fn open_namespace() -> Result<PrivateNamespace, Error> {
     // SAFETY: nome estático; o descritor é apagado no fim desta função.
     let mut boundary = unsafe { CreateBoundaryDescriptorW(ALIAS, 0) };
     if boundary.is_invalid() {
         return Err(Error::Os(windows::core::Error::from_thread()));
     }
     let r = (|| {
-        let mut sid = [0u8; 68]; // SECURITY_MAX_SID_SIZE
-        let mut len = sid.len() as u32;
-        // SAFETY: buffer local com o tamanho informado.
+        // Alinhado a 4 bytes (DWORD) para `SID`, com 68 bytes (`SECURITY_MAX_SID_SIZE`).
+        let mut sid = [0u32; 17];
+        let mut len = size_of_val(&sid) as u32;
+        // SAFETY: buffer local alinhado com o tamanho informado.
         unsafe {
             CreateWellKnownSid(
                 WinBuiltinAdministratorsSid,
@@ -100,32 +96,19 @@ fn open_namespace() -> Result<HANDLE, Error> {
         // SAFETY: descritor válido; o SID é copiado para dentro dele.
         unsafe { AddSIDToBoundaryDescriptor(&raw mut boundary, PSID(sid.as_mut_ptr().cast())) }
             .map_err(Error::Os)?;
-        let sddl = w!("D:P(A;;GA;;;BA)(A;;GA;;;SY)");
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: SDDL estático; o descritor é liberado abaixo.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl,
-                SDDL_REVISION_1,
-                &raw mut sd,
-                None,
-            )
-        }
-        .map_err(Error::Os)?;
+        let sd = crate::win::SecurityDescriptor::from_sddl("D:P(A;;GA;;;BA)(A;;GA;;;SY)")
+            .map_err(|_| Error::Os(windows::core::Error::from_thread()))?;
         let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
+            lpSecurityDescriptor: sd.raw().0,
             bInheritHandle: false.into(),
         };
-        // SAFETY: atributos e descritor válidos durante a chamada.
+        // SAFETY: atributos e descritor válidos durante a chamada (`sd` vive até o drop).
         let created =
             unsafe { CreatePrivateNamespaceW(Some(&raw const sa), boundary.0.cast_const(), ALIAS) };
-        // SAFETY: descritor alocado pela API; liberado uma vez.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(sd.0)));
-        }
+        drop(sd);
         if !created.is_invalid() {
-            return Ok(created);
+            return Ok(PrivateNamespace(created));
         }
         // Já existe (outra instância elevada, em qualquer sessão): abre o mesmo.
         // SAFETY: descritor válido.
@@ -133,7 +116,7 @@ fn open_namespace() -> Result<HANDLE, Error> {
         if opened.is_invalid() {
             return Err(Error::Os(windows::core::Error::from_thread()));
         }
-        Ok(opened)
+        Ok(PrivateNamespace(opened))
     })();
     // SAFETY: descritor criado acima, apagado uma vez.
     unsafe { DeleteBoundaryDescriptor(boundary) };
@@ -172,17 +155,17 @@ mod tests {
     #[test]
     #[ignore = "chamado pelo teste instancia_unica_entre_processos"]
     fn sonda_filha() {
-        if std::env::var_os("WINTOP_INSTANCE_CHILD").is_none() {
+        let Ok(name) = std::env::var("WINTOP_INSTANCE_CHILD") else {
             return;
-        }
-        match acquire() {
+        };
+        match acquire_named(&name) {
             Ok(_) => println!("CHILD:acquired"),
             Err(Error::AlreadyRunning) => println!("CHILD:already"),
             Err(Error::Os(e)) => println!("CHILD:os {e}"),
         }
     }
 
-    fn child() -> String {
+    fn child(name: &str) -> String {
         let out = std::process::Command::new(std::env::current_exe().expect("exe do teste"))
             .args([
                 "--ignored",
@@ -190,7 +173,7 @@ mod tests {
                 "instance::tests::sonda_filha",
                 "--nocapture",
             ])
-            .env("WINTOP_INSTANCE_CHILD", "1")
+            .env("WINTOP_INSTANCE_CHILD", name)
             .output()
             .expect("processo filho");
         String::from_utf8_lossy(&out.stdout)
@@ -200,16 +183,17 @@ mod tests {
     }
 
     /// Com uma instância viva, outro processo da sessão recebe "já em execução"; solta a
-    /// primeira, o outro adquire.
+    /// primeira, o outro adquire (nome isolado por PID para não colidir com um wintop aberto).
     #[test]
     fn instancia_unica_entre_processos() {
         // O namespace exige o SID de Administradores habilitado: só num processo elevado.
         if !crate::win::is_elevated() {
             return;
         }
-        let first = acquire().ok().expect("primeira instância");
-        assert_eq!(child(), "already");
+        let name = format!("wintop\\instance_test_{}", std::process::id());
+        let first = acquire_named(&name).ok().expect("primeira instância");
+        assert_eq!(child(&name), "already");
         drop(first);
-        assert_eq!(child(), "acquired");
+        assert_eq!(child(&name), "acquired");
     }
 }

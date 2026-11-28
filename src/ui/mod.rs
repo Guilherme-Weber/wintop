@@ -47,11 +47,11 @@ impl Drop for PanicHookGuard {
     }
 }
 
-/// Roda até `q`, Esc, Ctrl+C ou `stop` (Ctrl+Break / fechar a janela, pelo handler do console).
+/// Roda até `q`, Ctrl+C ou `stop` (Ctrl+Break / fechar a janela, pelo handler do console).
 /// `start` inicia o motor depois do terminal e do panic hook (um pânico precoce de coletor não
 /// desfaz o terminal); o motor é parado antes de o terminal ser restaurado.
 pub fn run(
-    start: impl FnOnce() -> Engine,
+    start: impl FnOnce() -> Result<Engine, String>,
     stop: &AtomicBool,
     mut cfg: crate::config::Loaded,
     updates: Option<&UpdateCtx>,
@@ -63,11 +63,13 @@ pub fn run(
     if cfg.config.start_maximized {
         crate::win::maximize_classic_console();
     }
-    if std::io::stdout().is_terminal() {
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::terminal::SetTitle("wintop")
-        );
+    let is_tty = std::io::stdout().is_terminal();
+    if is_tty {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        // Salva o título anterior na pilha xterm (CSI 22;0 t) antes de trocar para "wintop".
+        let _ = out.write_all(b"\x1b[22;0t");
+        let _ = ratatui::crossterm::execute!(out, ratatui::crossterm::terminal::SetTitle("wintop"));
     }
     // Guarda o hook original para restaurá-lo na saída normal (sem empilhar wrappers).
     let orig_hook: PanicHook = Arc::from(std::panic::take_hook());
@@ -75,38 +77,92 @@ pub fn run(
     std::panic::set_hook(Box::new(move |info| orig_for_ratatui(info)));
     let _hook_guard = PanicHookGuard(Some(orig_hook));
 
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = match ratatui::try_init() {
+        Ok(t) => t,
+        Err(e) => {
+            ratatui::restore();
+            restore_title(is_tty);
+            return Err(e);
+        }
+    };
     // O hook do ratatui restaura o terminal em qualquer pânico, inclusive nos que os coletores
     // já capturam (catch_unwind) e mostram como falha: aí a TUI seguiria desenhando com o
-    // terminal desfeito. Só um pânico na thread da interface restaura o terminal.
+    // terminal desfeito. Só um pânico na thread da interface restaura o terminal; os demais
+    // ficam registrados no log de depuração.
     let ratatui_hook = std::panic::take_hook();
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
             set_mouse(false);
+            set_paste(false);
             ratatui_hook(info);
+            restore_title(is_tty);
+        } else {
+            crate::debug::log("panic", &format!("{info}"));
         }
     }));
+    set_paste(true);
     set_mouse(cfg.config.mouse);
-    let engine = start();
+    let engine = match start() {
+        Ok(e) => e,
+        Err(e) => {
+            set_mouse(false);
+            set_paste(false);
+            ratatui::restore();
+            restore_title(is_tty);
+            return Err(std::io::Error::other(e));
+        }
+    };
     let result = event_loop(&mut terminal, &engine, stop, &mut cfg, updates);
     // Threads paradas (handles fechados, PawnIO e NVML liberados) antes de restaurar.
     drop(engine);
     set_mouse(false);
+    set_paste(false);
     ratatui::restore();
+    restore_title(is_tty);
     result
 }
 
-/// Liga ou desliga a captura do mouse no terminal (sempre desligada ao sair, inclusive num
-/// pânico: senão o terminal fica sem seleção de texto).
+static MOUSE_ON: AtomicBool = AtomicBool::new(false);
+static PASTE_ON: AtomicBool = AtomicBool::new(false);
+
+fn restore_title(is_tty: bool) {
+    if is_tty {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[23;0t");
+        let _ = out.flush();
+    }
+}
+
+/// Liga ou desliga a captura do mouse no terminal (só envia escape quando o estado muda; sempre
+/// desligada ao sair, inclusive num pânico, para não prender a seleção de texto).
 fn set_mouse(on: bool) {
     use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use ratatui::crossterm::execute;
+    if MOUSE_ON.swap(on, Ordering::SeqCst) == on {
+        return;
+    }
     let mut out = std::io::stdout();
     let _ = if on {
         execute!(out, EnableMouseCapture)
     } else {
         execute!(out, DisableMouseCapture)
+    };
+}
+
+/// Liga ou desliga bracketed paste (evita que texto colado dispare atalhos como `q` ou `del`).
+fn set_paste(on: bool) {
+    use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+    use ratatui::crossterm::execute;
+    if PASTE_ON.swap(on, Ordering::SeqCst) == on {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = if on {
+        execute!(out, EnableBracketedPaste)
+    } else {
+        execute!(out, DisableBracketedPaste)
     };
 }
 
@@ -209,12 +265,31 @@ fn handle_key(
             }
             return (true, effects);
         }
-        // Ajuda aberta: qualquer tecla fecha (Ctrl+C ainda sai).
+        // Ajuda aberta: setas/PgUp/PgDn/Home/End rolam; qualquer outra tecla fecha (Ctrl+C sai).
         view::Modal::Help => {
             if ctrl_c {
                 effects.push(Effect::Quit);
             } else {
-                st.modal = view::Modal::None;
+                match lower(k.code) {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        st.help_offset = st.help_offset.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        st.help_offset = st.help_offset.saturating_add(1).min(st.help_max);
+                    }
+                    KeyCode::PageUp => {
+                        st.help_offset = st.help_offset.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        st.help_offset = st.help_offset.saturating_add(8).min(st.help_max);
+                    }
+                    KeyCode::Home => st.help_offset = 0,
+                    KeyCode::End => st.help_offset = st.help_max,
+                    _ => {
+                        st.modal = view::Modal::None;
+                        st.help_offset = 0;
+                    }
+                }
             }
             return (true, effects);
         }
@@ -235,7 +310,7 @@ fn handle_key(
                 dirty = false;
             }
         }
-        // Uma caixa ampliada: Esc volta ao normal antes de sair.
+        // Uma caixa ampliada: Esc volta ao normal.
         KeyCode::Esc if st.zoom.is_some() && st.tab == view::Tab::Overview => {
             st.zoom = None;
         }
@@ -247,18 +322,20 @@ fn handle_key(
             effects.push(Effect::SaveConfig);
         }
         KeyCode::Char('?') => {
+            st.help_offset = 0;
             st.modal = view::Modal::Help;
         }
         KeyCode::Char('p' | ' ') => {
             st.paused = !st.paused;
         }
-        // Esc com um filtro aplicado limpa o filtro (o segundo Esc sai).
+        // Esc com um filtro aplicado limpa o filtro (Esc no nível raiz nunca fecha o wintop).
         KeyCode::Esc
             if matches!(st.tab, view::Tab::Processes | view::Tab::Gpu) && !st.filter.is_empty() =>
         {
             st.filter.clear();
         }
-        KeyCode::Char('q') | KeyCode::Esc => effects.push(Effect::Quit),
+        KeyCode::Esc => dirty = false,
+        KeyCode::Char('q') => effects.push(Effect::Quit),
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
             effects.push(Effect::Quit);
         }
@@ -291,7 +368,7 @@ fn handle_key(
         KeyCode::Char('g') if matches!(st.tab, view::Tab::Overview | view::Tab::Gpu) => {
             st.next_gpu();
         }
-        KeyCode::Char('d') => {
+        KeyCode::Char('d') if st.tab == view::Tab::Overview => {
             // Automático → recolhe → expande → recolhe...
             st.toggle_fold_pool();
             effects.push(Effect::SaveConfig);
@@ -305,13 +382,78 @@ fn handle_key(
             });
             effects.push(Effect::SetView(st.view()));
         }
+        KeyCode::Tab => {
+            st.set_tab(match st.tab {
+                view::Tab::Overview => view::Tab::Processes,
+                view::Tab::Processes => view::Tab::Gpu,
+                view::Tab::Gpu => view::Tab::Sensors,
+                view::Tab::Sensors => view::Tab::Overview,
+            });
+            effects.push(Effect::SetView(st.view()));
+        }
+        KeyCode::BackTab => {
+            st.set_tab(match st.tab {
+                view::Tab::Overview => view::Tab::Sensors,
+                view::Tab::Processes => view::Tab::Overview,
+                view::Tab::Gpu => view::Tab::Processes,
+                view::Tab::Sensors => view::Tab::Gpu,
+            });
+            effects.push(Effect::SetView(st.view()));
+        }
         code => dirty = list_key(st, code, &mut effects),
     }
     (dirty, effects)
 }
 
-/// Controlador puro de mouse: só atua quando nenhum modal (inclusive filtro) está ativo.
+/// Texto colado (bracketed paste): entra apenas no filtro (primeira linha, sem controles, até
+/// 64 caracteres); fora do filtro é ignorado para nunca disparar atalhos (`q`, `del`, `y`).
+fn handle_paste(st: &mut view::State, s: &str) -> bool {
+    if !matches!(st.modal, view::Modal::Filter) {
+        return false;
+    }
+    let first = s.split(['\r', '\n']).next().unwrap_or("");
+    let mut len = st.filter.chars().count();
+    let mut changed = false;
+    for c in first.chars() {
+        if len >= 64 {
+            break;
+        }
+        // Descarta caracteres de controle e controles bidirecionais (U+202A..U+202E, U+2066..U+2069).
+        if !c.is_control()
+            && !matches!(
+                c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        {
+            st.filter.push(c);
+            len += 1;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Controlador puro de mouse: na ajuda rola o texto; nos demais modais é ignorado.
 fn handle_mouse(st: &mut view::State, m: event::MouseEvent) -> (bool, Vec<Effect>) {
+    if matches!(st.modal, view::Modal::Help) {
+        use event::MouseEventKind;
+        let moved = match m.kind {
+            MouseEventKind::ScrollUp => {
+                let next = st.help_offset.saturating_sub(3);
+                let changed = next != st.help_offset;
+                st.help_offset = next;
+                changed
+            }
+            MouseEventKind::ScrollDown => {
+                let next = st.help_offset.saturating_add(3).min(st.help_max);
+                let changed = next != st.help_offset;
+                st.help_offset = next;
+                changed
+            }
+            _ => false,
+        };
+        return (moved, Vec::new());
+    }
     if !matches!(st.modal, view::Modal::None) {
         return (false, Vec::new());
     }
@@ -522,7 +664,7 @@ fn event_loop(
     let mut seen = Seen::default();
     let mut dirty = true;
     let mut last_second = (u16::MAX, 0, 0);
-    let mut applying: Option<Receiver<Result<crate::update::PendingRestart, String>>> = None;
+    let mut applying: Option<crate::update::ApplyHandle> = None;
 
     let mut apply_save_result = |r: Result<(), String>,
                                  mtime: Option<SystemTime>,
@@ -650,39 +792,68 @@ fn event_loop(
         // Expira a mensagem curta mesmo com a tela pausada (mantém `view::draw` puro).
         dirty |= st.expire_toast(Instant::now());
         if dirty {
-            terminal.draw(|f| view::draw(f, &mut st))?;
+            use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+            let _ = ratatui::crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate);
+            let draw_res = terminal.draw(|f| view::draw(f, &mut st));
+            let _ = ratatui::crossterm::execute!(std::io::stdout(), EndSynchronizedUpdate);
+            draw_res?;
             dirty = false;
         }
-        if !event::poll(poll_timeout(st.interval_ms))? {
-            continue;
-        }
-        // Drena a fila (ex.: dezenas de Resize ao arrastar a janela) antes de redesenhar.
-        loop {
-            let (ev_dirty, effects) = match event::read()? {
-                Event::Key(k) => handle_key(&mut st, k, &cfg.config.colors, updates.is_some()),
-                Event::Resize(..) => (true, Vec::new()),
-                Event::Mouse(m) => handle_mouse(&mut st, m),
-                _ => (false, Vec::new()),
-            };
-            dirty |= ev_dirty;
-            for eff in effects {
-                if let Some(outcome) = execute_effect(
-                    eff,
-                    &mut st,
-                    engine,
-                    cfg,
-                    &saver,
-                    &mut cfg_seen,
-                    &jobs_tx,
-                    updates,
-                    &mut applying,
-                    no_color,
-                    &mut apply_save_result,
-                ) {
-                    return Ok(outcome);
+        let deadline = Instant::now() + poll_timeout(st.interval_ms);
+        while !stop.load(Ordering::SeqCst) {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if !event::poll(rem)? {
+                break;
+            }
+            // Drena a fila (ex.: dezenas de Resize ao arrastar a janela) antes de redesenhar;
+            // movimentos simples de mouse (`Moved`) são descartados sem acordar o laço externo.
+            let mut only_moved = true;
+            loop {
+                let (ev_dirty, effects) = match event::read()? {
+                    Event::Mouse(m) if matches!(m.kind, event::MouseEventKind::Moved) => {
+                        (false, Vec::new())
+                    }
+                    Event::Key(k) => {
+                        only_moved = false;
+                        handle_key(&mut st, k, &cfg.config.colors, updates.is_some())
+                    }
+                    Event::Paste(s) => {
+                        only_moved = false;
+                        (handle_paste(&mut st, &s), Vec::new())
+                    }
+                    Event::Resize(..) => {
+                        only_moved = false;
+                        (true, Vec::new())
+                    }
+                    Event::Mouse(m) => {
+                        only_moved = false;
+                        handle_mouse(&mut st, m)
+                    }
+                    _ => (false, Vec::new()),
+                };
+                dirty |= ev_dirty;
+                for eff in effects {
+                    if let Some(outcome) = execute_effect(
+                        eff,
+                        &mut st,
+                        engine,
+                        cfg,
+                        &saver,
+                        &mut cfg_seen,
+                        &jobs_tx,
+                        updates,
+                        &mut applying,
+                        no_color,
+                        &mut apply_save_result,
+                    ) {
+                        return Ok(outcome);
+                    }
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
             }
-            if !event::poll(Duration::ZERO)? {
+            if !only_moved || dirty || Instant::now() >= deadline {
                 break;
             }
         }
@@ -700,7 +871,7 @@ fn execute_effect(
     cfg_seen: &mut Option<SystemTime>,
     jobs_tx: &Sender<RuntimeResult>,
     updates: Option<&UpdateCtx>,
-    applying: &mut Option<Receiver<Result<crate::update::PendingRestart, String>>>,
+    applying: &mut Option<crate::update::ApplyHandle>,
     no_color: bool,
     apply_save_result: &mut impl FnMut(
         Result<(), String>,
@@ -721,6 +892,10 @@ fn execute_effect(
             colors,
             honor_no_color,
         } => {
+            if !honor_no_color && no_color {
+                // O usuário pediu troca explícita (`t`): libera cores no crossterm mesmo com NO_COLOR.
+                ratatui::crossterm::style::force_color_output(true);
+            }
             let t = theme::build_with_no_color(&name, &colors, honor_no_color && no_color);
             theme::set(t);
             st.theme_name = t.name.to_string();
@@ -849,6 +1024,7 @@ fn list_key(st: &mut view::State, code: KeyCode, effects: &mut Vec<Effect>) -> b
             KeyCode::PageUp => sensor_scroll(st, false, 10),
             KeyCode::PageDown => sensor_scroll(st, true, 10),
             KeyCode::Home => st.sensor_offset = 0,
+            KeyCode::End => st.sensor_offset = st.sensor_offset.saturating_add(st.sensor_beyond),
             _ => return false,
         }
         return true;
@@ -969,8 +1145,9 @@ mod controller_tests {
         assert_eq!(st.filter, "Ab");
         let (_, eff) = handle_key(&mut st, key(KeyCode::Esc), &[], false);
         assert!(eff.is_empty() && st.filter.is_empty());
-        let (_, eff) = handle_key(&mut st, key(KeyCode::Esc), &[], false);
-        assert_eq!(eff, vec![Effect::Quit]);
+        // Segundo Esc no nível raiz não fecha o wintop (só `q` ou Ctrl+C saem).
+        let (dirty, eff) = handle_key(&mut st, key(KeyCode::Esc), &[], false);
+        assert!(!dirty && eff.is_empty());
 
         // Caps Lock em atalhos: `+`, `-`, `T`, `P`, `Q`.
         let (_, eff) = handle_key(&mut st, key(KeyCode::Char('+')), &[], false);
@@ -1056,5 +1233,47 @@ mod controller_tests {
         st.set_tab(view::Tab::Processes);
         let (dirty, eff) = handle_key(&mut st, key(KeyCode::Char('f')), &[], false);
         assert!(!dirty && eff.is_empty() && !st.hide_game);
+    }
+
+    #[test]
+    fn paste_so_no_filtro_e_navegacao_tab_e_ajuda() {
+        let mut st = view::State::new(1000);
+        // Fora do filtro, colar texto nunca dispara atalhos nem altera filtro.
+        assert!(!handle_paste(&mut st, "q\ndel"));
+        assert!(st.filter.is_empty());
+
+        // Dentro do filtro: só a primeira linha, sem controles, limitado a 64 caracteres.
+        st.modal = view::Modal::Filter;
+        assert!(handle_paste(&mut st, "game\x07.exe\r\nsegunda linha"));
+        assert_eq!(st.filter, "game.exe");
+        st.modal = view::Modal::None;
+
+        // `Tab` e `Shift+Tab` ciclam as 4 abas; `d` só atua na aba Geral.
+        for want in [
+            view::Tab::Processes,
+            view::Tab::Gpu,
+            view::Tab::Sensors,
+            view::Tab::Overview,
+        ] {
+            let (dirty, eff) = handle_key(&mut st, key(KeyCode::Tab), &[], false);
+            assert!(dirty && st.tab == want && eff.len() == 1);
+        }
+        let (_, _) = handle_key(&mut st, key(KeyCode::BackTab), &[], false);
+        assert_eq!(st.tab, view::Tab::Sensors);
+        let (dirty, eff) = handle_key(&mut st, key(KeyCode::Char('d')), &[], false);
+        assert!(!dirty && eff.is_empty());
+
+        // Rolagem da ajuda com j/k/Home/End e fechamento com Esc.
+        st.help_max = 10;
+        let _ = handle_key(&mut st, key(KeyCode::Char('?')), &[], false);
+        assert_eq!(st.modal, view::Modal::Help);
+        let _ = handle_key(&mut st, key(KeyCode::Down), &[], false);
+        assert_eq!(st.help_offset, 1);
+        let _ = handle_key(&mut st, key(KeyCode::End), &[], false);
+        assert_eq!(st.help_offset, 10);
+        let _ = handle_key(&mut st, key(KeyCode::Home), &[], false);
+        assert_eq!(st.help_offset, 0);
+        let _ = handle_key(&mut st, key(KeyCode::Esc), &[], false);
+        assert_eq!(st.modal, view::Modal::None);
     }
 }

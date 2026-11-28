@@ -296,8 +296,18 @@ impl Widget for Graph<'_> {
     }
 }
 
+/// Glifo da trilha apagada de medidores: em temas coloridos usa `⣿` em `dim` (estilo btop);
+/// sob `NO_COLOR` ou tema `mono`, usa `⣀` para manter contraste visual sem depender de cor.
+fn empty_track_glyph() -> &'static str {
+    if crate::ui::theme::no_color() || crate::ui::theme::th().name == "mono" {
+        "⣀"
+    } else {
+        "⣿"
+    }
+}
+
 /// Medidor horizontal em braille (`⡇`, `⣿`): parte cheia com o gradiente pela posição (resolução
-/// de 2 colunas de pontos por célula) e trilha apagada (`⣿` em `dim`).
+/// de 2 colunas de pontos por célula) e trilha apagada (`⣿` em `dim`, ou `⣀` em `mono`/`NO_COLOR`).
 pub struct Meter {
     /// 0..=1.
     pub value: f64,
@@ -322,12 +332,13 @@ impl Widget for Meter {
         };
         let t3 = crate::ui::theme::th();
         let dim = t3.dim;
+        let empty = empty_track_glyph();
         let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
         let denom = w.max(2).saturating_sub(1) as f64;
         for i in 0..w {
             let fill = steps.saturating_sub(i * 2).min(2);
             let (sym, style) = match fill {
-                0 => ("⣿", Style::new().fg(dim)),
+                0 => (empty, Style::new().fg(dim)),
                 1 => (
                     "⡇",
                     Style::new().fg(gradient_rgb(i as f64 / denom, low, mid, high)),
@@ -543,6 +554,7 @@ impl Widget for VerticalBar {
         };
         let t3 = crate::ui::theme::th();
         let dim = t3.dim;
+        let empty = empty_track_glyph();
         let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
         for row in 0..h {
             // `row` = 0 na base, `h - 1` no topo.
@@ -554,7 +566,7 @@ impl Widget for VerticalBar {
                 v
             };
             let (sym, style) = if fill == 0 {
-                (VBRAILLE[0], Style::new().fg(dim))
+                (empty, Style::new().fg(dim))
             } else {
                 (
                     VBRAILLE[fill],
@@ -578,20 +590,24 @@ impl Widget for Segmented<'_> {
             return;
         }
         let dim = crate::ui::theme::th().dim;
+        let empty = empty_track_glyph();
         for i in 0..w {
             // Meio da célula, em bytes.
             let mid = ((i as f64 + 0.5) / w as f64) * self.total as f64;
             let mut acc = 0.0;
             let mut color = dim;
+            let mut filled = false;
             for &(bytes, c) in self.parts {
                 acc += bytes as f64;
                 if mid < acc {
                     color = c;
+                    filled = true;
                     break;
                 }
             }
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
-                cell.set_symbol("⣿").set_style(Style::new().fg(color));
+                let sym = if filled { "⣿" } else { empty };
+                cell.set_symbol(sym).set_style(Style::new().fg(color));
             }
         }
     }

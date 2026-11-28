@@ -88,13 +88,14 @@ pub(super) fn parse(b: &[u8], base: usize) -> Result<Vec<Raw>, String> {
             let start = ptr.checked_sub(base).ok_or_else(oob)?;
             let end = start.checked_add(len).ok_or_else(oob)?;
             let raw = b.get(start..end).ok_or_else(oob)?;
-            let wide: Vec<u16> = raw
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes(*c))
-                .collect();
-            String::from_utf16_lossy(&wide)
+            char::decode_utf16(
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c)),
+            )
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
         };
         out.push(Raw {
             pid,
@@ -471,6 +472,14 @@ mod tests {
             if let Ok(list) = parse(b, base) {
                 // Cada entrada ocupa pelo menos a parte fixa.
                 assert!(!list.is_empty() && list.len() <= b.len() / ENTRY);
+                // `find_private_ws` deve concordar com `parse` para um PID presente e um ausente.
+                let first = &list[0];
+                assert_eq!(find_private_ws(b, first.pid), Ok(Some(first.mem)));
+                if !list.iter().any(|p| p.pid == u32::MAX) {
+                    assert_eq!(find_private_ws(b, u32::MAX), Ok(None));
+                }
+            } else {
+                let _ = find_private_ws(b, 1234);
             }
         });
     }

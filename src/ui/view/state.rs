@@ -178,10 +178,14 @@ pub struct State {
     pub zoom: Option<Zoom>,
     /// Esconder a caixa de jogo (FPS e frametime) na aba Geral (tecla `f`).
     pub hide_game: bool,
-    /// Aba Sensores: primeira linha mostrada e se o último desenho deixou linhas de fora (só
-    /// então ela rola para baixo).
+    /// Aba Sensores: primeira linha mostrada, se o último desenho deixou linhas de fora e quantas
+    /// linhas ficaram além da última coluna (para `End` pular direto ao fim).
     pub sensor_offset: usize,
     pub sensor_overflow: bool,
+    pub sensor_beyond: usize,
+    /// Rolagem da janela de ajuda (`?`) e deslocamento máximo do último desenho.
+    pub help_offset: usize,
+    pub help_max: usize,
     pub filter: String,
     /// Aba GPU: processos da GPU exibida, cursor, ordem e runtimes pedidos (Enter), por PID.
     pub gpu_procs: Option<Metric<Vec<GpuProc>>>,

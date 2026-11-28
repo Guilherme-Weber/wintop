@@ -210,10 +210,19 @@ impl Engine {
                 .map(ToString::to_string)
                 .collect(),
         )
+        .expect("engine start")
     }
 
     /// `rtss_ignored`: executáveis que nunca viram o jogo (`config.toml`).
-    pub fn start_with(interval_ms: u64, rtss_ignored: Vec<String>) -> Self {
+    /// Cria `stop_event` primeiro e constrói `Engine` antes de disparar as threads, garantindo
+    /// que qualquer falha parcial acione `Drop` e encerre as threads já iniciadas.
+    pub fn start_with(interval_ms: u64, rtss_ignored: Vec<String>) -> Result<Self, String> {
+        // Evento manual de parada da thread do RTSS: acorda a espera do pipe na hora.
+        // SAFETY: evento sem nome; o handle passa a ter dono logo abaixo.
+        let stop_raw = unsafe { CreateEventW(None, true, false, None) }
+            .map_err(|e| format!("failed to create the stop event: {e}"))?;
+        // SAFETY: `CreateEventW` teve sucesso; handle válido e sem outro dono.
+        let stop_event = Arc::new(unsafe { OwnedHandle::from_raw_handle(stop_raw.0) });
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -221,6 +230,11 @@ impl Engine {
             stopping: AtomicBool::new(false),
             game_pid: AtomicU32::new(0),
         });
+        let mut engine = Self {
+            shared: Arc::clone(&shared),
+            threads: Vec::with_capacity(3),
+            stop_event: Arc::clone(&stop_event),
+        };
         // Um NVML para as duas threads (iniciado aqui, antes delas: sem nvmlInit simultâneo).
         let nvml = crate::collect::shared_nvml();
         let fast = {
@@ -264,25 +278,18 @@ impl Engine {
                         st.fast_seq += 1;
                     }
                 })
-                .expect("failed to create the fast collection thread")
+                .map_err(|e| format!("failed to create the fast collection thread: {e}"))?
         };
-        // Evento manual de parada da thread do RTSS: acorda a espera do pipe na hora.
-        // SAFETY: evento sem nome; o handle passa a ter dono logo abaixo.
-        let stop_event = Arc::new(unsafe {
-            OwnedHandle::from_raw_handle(
-                CreateEventW(None, true, false, None)
-                    .expect("failed to create the stop event")
-                    .0,
-            )
-        });
+        engine.threads.push(fast);
         let rtss = {
             let sh = Arc::clone(&shared);
             let stop = Arc::clone(&stop_event);
             std::thread::Builder::new()
                 .name("rtss".into())
                 .spawn(move || rtss_thread(&sh, HANDLE(stop.as_raw_handle()), rtss_ignored))
-                .expect("failed to create the RTSS thread")
+                .map_err(|e| format!("failed to create the RTSS thread: {e}"))?
         };
+        engine.threads.push(rtss);
         let slow = {
             let sh = Arc::clone(&shared);
             let nvml_slow = nvml;
@@ -298,7 +305,9 @@ impl Engine {
                             }
                             let view = sh.lock().view;
                             let game_pid = sh.game_pid.load(Ordering::Relaxed);
-                            let Some(snap) = c.collect(&sh.stopping, view, game_pid) else {
+                            let Some(snap) =
+                                c.collect(&sh.stopping, |d| sh.sleep(d), view, game_pid)
+                            else {
                                 return;
                             };
                             crate::debug::log_slow(&snap);
@@ -321,13 +330,10 @@ impl Engine {
                         st.slow_seq += 1;
                     }
                 })
-                .expect("failed to create the slow collection thread")
+                .map_err(|e| format!("failed to create the slow collection thread: {e}"))?
         };
-        Self {
-            shared,
-            threads: vec![fast, slow, rtss],
-            stop_event,
-        }
+        engine.threads.push(slow);
+        Ok(engine)
     }
 
     /// Últimos resultados e o número da coleta rápida (testes).

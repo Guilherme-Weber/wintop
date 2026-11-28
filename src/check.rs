@@ -166,6 +166,10 @@ pub fn run(json: bool) -> i32 {
     let s = slow
         .collect(
             &std::sync::atomic::AtomicBool::new(false),
+            |d| {
+                std::thread::sleep(d);
+                false
+            },
             crate::model::View {
                 procs: true,
                 gpu: true,

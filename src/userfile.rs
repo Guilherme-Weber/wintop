@@ -194,7 +194,7 @@ fn verify(c: &Checked, path: &Path, dir: bool, single_name: bool) -> Result<(), 
 /// Confere que `name` é um único nome de arquivo ou pasta (sem separadores, letra de unidade,
 /// `.` ou `..`), impedindo escapar da pasta aberta pelo `UserDir`.
 fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains(['\\', '/']) {
+    if name.is_empty() || name.contains(['\\', '/', ':', '\0']) {
         return Err(format!("invalid file name {name:?} (refused)"));
     }
     let mut c = Path::new(name).components();
@@ -290,7 +290,7 @@ fn pin_file(dir: &Path) -> Result<Checked, String> {
     let c = open(
         &p,
         GENERIC_READ.0 | DELETE.0,
-        FILE_SHARE_READ,
+        FILE_SHARE_MODE(0),
         CREATE_NEW,
         false,
         true,
@@ -428,7 +428,7 @@ impl UserDir {
         let f = File::from(c.handle);
         let mut buf = Vec::new();
         let n = f
-            .take(max + 1)
+            .take(max.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| format!("{}: {e}", p.display()))?;
         if n as u64 > max {
@@ -614,22 +614,27 @@ pub struct Held {
 
 /// Troca o arquivo de `h` pelo destino `to` (substituindo), pelo handle.
 fn rename_over(h: HANDLE, to: &Path) -> Result<(), String> {
-    let name: Vec<u16> = to.to_string_lossy().encode_utf16().collect();
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<u16> = to.as_os_str().encode_wide().collect();
+    let name_bytes = u32::try_from(name.len().saturating_mul(2))
+        .map_err(|_| format!("rename target too long: {}", to.display()))?;
     let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let size = header + (name.len() + 1) * 2;
+    let size = (header + (name.len() + 1) * 2).max(size_of::<FILE_RENAME_INFO>());
+    let size_u32 =
+        u32::try_from(size).map_err(|_| format!("rename target too long: {}", to.display()))?;
     let mut buf = vec![0u64; size.div_ceil(8)];
     let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: buffer alinhado com espaço para o cabeçalho e o nome; campos escritos no lugar.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = HANDLE::default();
-        (*info).FileNameLength = (name.len() * 2) as u32;
+        (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
             (&raw mut (*info).FileName).cast::<u16>(),
             name.len(),
         );
-        SetFileInformationByHandle(h, FileRenameInfo, info.cast(), size as u32)
+        SetFileInformationByHandle(h, FileRenameInfo, info.cast(), size_u32)
     }
     .map_err(|e| format!("rename to {}: {e}", to.display()))
 }
@@ -786,9 +791,12 @@ mod tests {
                 .expect("base ok")
                 .is_none()
         );
-        // Base que não é caminho local (UNC, pipe): recusada antes de qualquer abertura.
-        assert!(UserDir::open(Path::new(r"\127.0.0.1\c$"), "wintop", false).is_err());
-        assert!(UserDir::open(Path::new(r"\.\pipe\x"), "wintop", false).is_err());
+        // Base que não é caminho local (UNC, pipe, prefixo de dispositivo): recusada antes de abrir.
+        assert!(UserDir::open(Path::new(r"\\127.0.0.1\c$"), "wintop", false).is_err());
+        assert!(UserDir::open(Path::new(r"\\.\pipe\x"), "wintop", false).is_err());
+        assert!(UserDir::open(Path::new(r"\\?\C:\Users"), "wintop", false).is_err());
+        assert!(validate_name("foo:bar").is_err());
+        assert!(validate_name("foo\0bar").is_err());
     }
 
     /// Transforma a pasta (vazia) numa junction para `target`, como faria um processo sem

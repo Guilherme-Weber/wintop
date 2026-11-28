@@ -6,6 +6,39 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+## [1.4.4] - 2026-11-27
+
+### Corrigido
+
+- Alinhamento de buffers em chamadas Win32/NT (`memory`, `instance` e `win`), ordem de `Drop` e
+  fechamento seguro do namespace privado de instância única, rejeição de seções file-backed em
+  `SharedView` (evita falha SEH `EXCEPTION_IN_PAGE_ERROR`) e proteção `catch_unwind` nos callbacks
+  FFI de ETW e console.
+- Endurecimento de segurança no instalador, atualizador e leitores de arquivos: leitura segura dos
+  módulos PawnIO (sem seguir reparse points, hardlinks ou caminhos não-locais), leitura anti-TOCTOU
+  do próprio executável, `VerifiedZip` exigindo verificação ed25519 antes de `unpack`, bloqueio de
+  downgrade e allowlist de hosts no atualizador, limpeza de variáveis de ambiente ao iniciar o RTSS
+  e remoção de `CREATOR OWNER` na ACL da tarefa agendada.
+- Percentual `(69%)` da barra de VRAM não é mais cortado no piso de terminal 80×24; modais de
+  confirmação e atualização agora quebram linhas e ajustam altura automaticamente em telas estreitas.
+- `Esc` no nível raiz não fecha mais o wintop acidentalmente (mantendo `q` e `Ctrl+C` para sair;
+  `Esc` continua fechando modais, filtro e zoom).
+- Movimentos simples de mouse (`Moved`) não acordam mais o laço principal em idle, reduzindo
+  consumo de CPU; bracketed paste ativado para colar com segurança apenas no filtro (`/`).
+
+### Alterado
+
+- Desempenho e concorrência: eliminação de polling de 20 ms na coleta lenta (`WaitForSingleObject`),
+  cálculo de 1%/0,1% lows em O(n) sem alocação no RTSS, `drain` em O(1) no ETW, pré-cálculo único
+  por quadro na caixa da GPU (`PreparedGpu`), renderização direta de divisores/linhas e caminho sem
+  alocação em `i18n::tr`.
+- Usabilidade e acessibilidade: `Tab`/`Shift+Tab` ciclam entre as 4 abas, `End` rola até o fim em
+  Sensores, janela de ajuda (`?`) rolável, rodapé indica `p resume` quando pausado, trilha distinta
+  (`⣀`) e seleção invertida (`REVERSED`) sob `NO_COLOR`/tema `mono`, e sincronização de quadro
+  (`BeginSynchronizedUpdate`/`EndSynchronizedUpdate`) com restauração do título da janela ao sair.
+- CI e release: `cargo-audit` fixado por versão, verificação de integridade SHA-256 antes de assinar
+  e publicar, `environment: release` no job de publicação e Dependabot semanal para GitHub Actions.
+
 ## [1.4.3] - 2026-11-26
 
 ### Adicionado

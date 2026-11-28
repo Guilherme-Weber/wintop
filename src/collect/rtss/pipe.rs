@@ -6,12 +6,9 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{
     ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree,
+    ERROR_PIPE_CONNECTED, HANDLE,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
     PIPE_ACCESS_DUPLEX, ReadFile,
@@ -346,32 +343,19 @@ pub(super) fn create_pipe_named(name: &str) -> Result<Vec<Instance>, String> {
     let sid = crate::win::user_sid().ok_or("could not read the user SID")?;
     // DACL protegida: SYSTEM e Administradores com controle total; o usuário (jogo sem
     // elevação) com GRGW, sem WRITE_DAC/WRITE_OWNER. Rótulo de integridade média.
-    let sddl = wide(&format!(
+    let sd = crate::win::SecurityDescriptor::from_sddl(&format!(
         "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})S:(ML;;NW;;;ME)"
-    ));
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: SDDL terminado em zero; o descritor é liberado abaixo.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &raw mut sd,
-            None,
-        )
-    }
+    ))
     .map_err(|e| format!("pipe SDDL: {e}"))?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
+        lpSecurityDescriptor: sd.raw().0,
         bInheritHandle: false.into(),
     };
     let instances: Result<Vec<Instance>, String> = (0..INSTANCES)
         .map(|i| Instance::create(&name, i == 0, &sa))
         .collect();
-    // SAFETY: descritor alocado acima; as instâncias já foram criadas.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
+    drop(sd);
     let mut instances =
         instances.map_err(|e| format!("frametime pipe (another server running?): {e}"))?;
     for inst in &mut instances {

@@ -337,18 +337,91 @@ fn install_dir() -> Result<PathBuf, String> {
 fn module_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = exe.parent().ok_or("executable has no folder")?;
-    #[allow(unused_mut)]
-    let mut candidates = vec![dir.join("modules").join(MODULE)];
+    let primary = dir.join("modules").join(MODULE);
+    if primary.is_file() {
+        return Ok(primary);
+    }
     #[cfg(test)]
-    candidates.push(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    {
+        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("modules")
-            .join(MODULE),
-    );
-    candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or_else(|| format!("{MODULE} not found in {}", dir.join("modules").display()))
+            .join(MODULE);
+        if dev.is_file() {
+            return Ok(dev);
+        }
+    }
+    Err(format!(
+        "{MODULE} not found in {}",
+        dir.join("modules").display()
+    ))
+}
+
+/// Teto para `AMDFamily17.bin` (o módulo real tem ~10 KB).
+const MAX_MODULE_BYTES: u64 = 16 << 20;
+
+/// Lê um módulo do PawnIO pelo handle sem seguir reparse points, hardlinks, pipes ou UNC, com
+/// teto de tamanho (seguro mesmo em pasta portátil gravável pelo usuário).
+fn read_module_safe(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    if !crate::win::is_local_absolute(path) {
+        return Err(format!("{} is not a local path (refused)", path.display()));
+    }
+    let w = crate::win::wide_os(path.as_os_str());
+    // SAFETY: caminho terminado em zero; flags impedem seguir reparse points ou impersonação.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(w.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+            None,
+        )
+    }
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
+    let owned = unsafe { own(h) };
+    let raw = HANDLE(owned.as_raw_handle());
+    // SAFETY: handle válido.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_DISK {
+        return Err(format!("{} is not a disk file (refused)", path.display()));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: handle válido; estrutura local.
+    unsafe { GetFileInformationByHandle(raw, &raw mut info) }
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(format!("{} is a link (refused)", path.display()));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        return Err(format!("{} is a directory (refused)", path.display()));
+    }
+    if info.nNumberOfLinks > 1 {
+        return Err(format!("{} is a hardlink (refused)", path.display()));
+    }
+    let mut buf = Vec::new();
+    let n = std::fs::File::from(owned)
+        .take(MAX_MODULE_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if n as u64 > MAX_MODULE_BYTES {
+        return Err(format!(
+            "{} is larger than {} MB",
+            path.display(),
+            MAX_MODULE_BYTES >> 20
+        ));
+    }
+    Ok(buf)
 }
 
 enum State {
@@ -392,7 +465,7 @@ impl PawnIoCollector {
 
     fn open(support: CpuSupport) -> Result<State, String> {
         let path = module_path()?;
-        let module = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let module = read_module_safe(&path)?;
         let pio = PawnIo::open(&module)?;
         let unit = pio.msr(MSR_PWR_UNIT)?;
         Ok(State::Ready {

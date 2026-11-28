@@ -82,13 +82,12 @@ impl Handle {
         HANDLE(self.0.as_raw_handle())
     }
 
-    pub(super) fn ioctl(
+    pub(super) fn ioctl_into(
         &self,
         code: u32,
         input: Option<&[u8]>,
-        out_len: usize,
-    ) -> Result<Vec<u8>, String> {
-        let mut out = vec![0u8; out_len];
+        out: &mut [u8],
+    ) -> Result<usize, String> {
         let mut ret = 0u32;
         // SAFETY: buffers locais com os tamanhos informados; chamada síncrona.
         unsafe {
@@ -104,7 +103,18 @@ impl Handle {
             )
         }
         .map_err(|e| format!("IOCTL 0x{:X}: error 0x{:X}", code, e.code().0 & 0xFFFF))?;
-        out.truncate(ret as usize);
+        Ok((ret as usize).min(out.len()))
+    }
+
+    pub(super) fn ioctl(
+        &self,
+        code: u32,
+        input: Option<&[u8]>,
+        out_len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut out = vec![0u8; out_len];
+        let ret = self.ioctl_into(code, input, &mut out)?;
+        out.truncate(ret);
         Ok(out)
     }
 
@@ -523,8 +533,9 @@ impl Inventory {
             };
             h
         };
-        let now = match h.ioctl(IOCTL_DISK_PERFORMANCE, None, PERF_SIZE) {
-            Ok(b) => parse_perf(&b),
+        let mut buf = [0u8; PERF_SIZE];
+        let now = match h.ioctl_into(IOCTL_DISK_PERFORMANCE, None, &mut buf) {
+            Ok(n) => parse_perf(&buf[..n]),
             Err(e) => {
                 if !self.alive() {
                     self.lost = true;
@@ -746,11 +757,11 @@ impl DiskCollector {
                 system: self.system_drive.is_some_and(|c| has(&letters, c)),
                 pagefile: self.pagefile_drives.iter().any(|&c| has(&letters, c)),
                 letters,
-                active: act.clone().map(|a| a.0.0),
-                read: act.clone().map(|a| a.0.1),
-                write: act.clone().map(|a| a.0.2),
-                response: act.clone().map(|a| a.0.3),
-                iops: act.clone().map(|a| a.1),
+                active: act.as_ref().map(|a| a.0.0).map_err(Clone::clone),
+                read: act.as_ref().map(|a| a.0.1).map_err(Clone::clone),
+                write: act.as_ref().map(|a| a.0.2).map_err(Clone::clone),
+                response: act.as_ref().map(|a| a.0.3).map_err(Clone::clone),
+                iops: act.as_ref().map(|a| a.1).map_err(Clone::clone),
                 queue: act.map(|a| a.2),
             });
         }

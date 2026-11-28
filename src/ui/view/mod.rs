@@ -35,7 +35,7 @@ use cpu::{draw_cpu, mem_text};
 use disks::{disk_notes, disk_order, draw_disks, pool_folded, same_disk};
 use game::draw_game;
 pub(super) use gpu::vram_legend;
-use gpu::{draw_gpu, engine_label, snap_top_height, vram_bar};
+use gpu::{draw_gpu, engine_label, prepare_gpu, snap_top_height, vram_bar};
 use net::draw_net;
 #[cfg(test)]
 pub use procs_tab::ProcSort;
@@ -94,11 +94,16 @@ fn bar_pct_color(pct: f64) -> Color {
 
 /// Linha divisória vertical sutil (`│`) entre gráficos adjacentes dentro de uma mesma caixa.
 fn v_divider(frame: &mut Frame<'_>, x: u16, y: u16, h: u16, bound: Rect) {
-    let style = Style::new().fg(th().border);
-    for dy in 0..h {
-        let r = Rect::new(x, y + dy, 1, 1);
-        if r.intersection(bound).width > 0 {
-            frame.render_widget(Paragraph::new(Span::styled("│", style)), r);
+    if h == 0 || x < bound.x || x >= bound.right() {
+        return;
+    }
+    let y0 = y.max(bound.y);
+    let y1 = y.saturating_add(h).min(bound.bottom());
+    let fg = th().border;
+    let buf = frame.buffer_mut();
+    for row in y0..y1 {
+        if let Some(cell) = buf.cell_mut((x, row)) {
+            cell.set_symbol("│").set_fg(fg);
         }
     }
 }
@@ -294,12 +299,10 @@ fn put(frame: &mut Frame<'_>, p: Paragraph<'static>, r: Rect, bound: Rect) {
 }
 
 fn line(frame: &mut Frame<'_>, spans: Vec<Span<'static>>, x: u16, y: u16, w: u16, bound: Rect) {
-    put(
-        frame,
-        Paragraph::new(Line::from(spans)),
-        Rect::new(x, y, w, 1),
-        bound,
-    );
+    let r = Rect::new(x, y, w, 1).intersection(bound);
+    if r.width > 0 && r.height > 0 {
+        frame.render_widget(Line::from(spans), r);
+    }
 }
 
 /// Bytes com unidades completas (B, KB, MB, GB, TB) sem casa decimal acima de 100 (ex.: `477 GB`,
@@ -407,7 +410,7 @@ pub fn draw(frame: &mut Frame<'_>, st: &mut State) {
     }
     match &st.modal {
         Modal::None | Modal::Filter => {}
-        Modal::Help => draw_help(frame, body),
+        Modal::Help => draw_help(frame, body, st),
         Modal::Update(u) => draw_update(frame, body, u),
         Modal::ConfirmEnd { pid, name, .. } => draw_confirm_end(frame, body, *pid, name),
     }
@@ -426,78 +429,77 @@ fn draw_update(frame: &mut Frame<'_>, area: Rect, u: &UpdateUi) {
             Style::new().fg(th().title).add_modifier(Modifier::BOLD),
         )
     };
-    let lines = match u {
+    let max_inner = area.width.saturating_sub(3).max(1);
+    let raw_rows: Vec<Vec<Span<'static>>> = match u {
         UpdateUi::Offer(v) => vec![
-            Line::from(vec![
-                label(" "),
+            vec![
                 ver(v),
                 label(" is available (this is "),
                 Span::raw(crate::update::current()),
-                label("). Update now? "),
-            ]),
-            Line::from(vec![
-                key(" y"),
+                label("). Update now?"),
+            ],
+            vec![
+                key("y"),
                 label(" update and restart    "),
                 key("n / esc"),
                 label(" not now"),
-            ]),
+            ],
         ],
         UpdateUi::Applying(v) => vec![
-            Line::from(vec![label(" Downloading "), ver(v), label("... ")]),
-            Line::from(label(" Checking the signature, then wintop restarts. ")),
+            vec![label("Downloading "), ver(v), label("...")],
+            vec![label("Checking the signature, then wintop restarts.")],
         ],
     };
+    let lines: Vec<Line<'static>> = raw_rows
+        .into_iter()
+        .flat_map(|row| wrap(row, max_inner, 1, 1))
+        .collect();
     let w = (lines.iter().map(|l| l.width() as u16).max().unwrap_or(0) + 3).min(area.width);
-    let h = 4.min(area.height);
-    let r = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = area.centered(Constraint::Length(w), Constraint::Length(h));
     frame.render_widget(ratatui::widgets::Clear, r);
     frame.render_widget(Paragraph::new(lines).block(boxed("update", "")), r);
 }
 
 /// Confirmação de encerrar processo (por cima da aba).
 fn draw_confirm_end(frame: &mut Frame<'_>, area: Rect, pid: u32, name: &str) {
-    let lines = vec![
-        Line::from(vec![
-            label(" End "),
+    let max_inner = area.width.saturating_sub(3).max(1);
+    let raw_rows = vec![
+        vec![
+            label("End "),
             Span::styled(
                 format!("{} (PID {pid})", printable(name)),
                 Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             ),
-            label("? Unsaved work in it is lost. "),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " y",
-                Style::new().fg(th().fail).add_modifier(Modifier::BOLD),
-            ),
+            label("? Unsaved work in it is lost."),
+        ],
+        vec![
+            Span::styled("y", Style::new().fg(th().fail).add_modifier(Modifier::BOLD)),
             label(" end process    "),
             Span::styled(
                 "n / esc",
                 Style::new().fg(th().title).add_modifier(Modifier::BOLD),
             ),
             label(" cancel"),
-        ]),
+        ],
     ];
+    let lines: Vec<Line<'static>> = raw_rows
+        .into_iter()
+        .flat_map(|row| wrap(row, max_inner, 1, 1))
+        .collect();
     let w = (lines.iter().map(|l| l.width() as u16).max().unwrap_or(0) + 3).min(area.width);
-    let h = 4.min(area.height);
-    let r = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = area.centered(Constraint::Length(w), Constraint::Length(h));
     frame.render_widget(ratatui::widgets::Clear, r);
     frame.render_widget(Paragraph::new(lines).block(boxed("end process", "")), r);
 }
 
 /// Atalhos e siglas da interface (tecla `?`), numa janela por cima da aba.
 const HELP: &[(&str, &str)] = &[
-    ("1-4", "switch tabs (Overview, Processes, GPU, Sensors)"),
+    (
+        "1-4, tab",
+        "switch tabs (Overview, Processes, GPU, Sensors)",
+    ),
     (
         "+ / -",
         "update interval (100 ms steps, saved to config.toml)",
@@ -530,7 +532,11 @@ const HELP: &[(&str, &str)] = &[
         "Processes tab: end the selected process (asks to confirm)",
     ),
     ("e", "Processes tab: tree of parent and child processes"),
-    ("q, esc", "quit (Ctrl+C also works)"),
+    (
+        "mouse",
+        "click tabs/rows/headers; Shift+drag to select text",
+    ),
+    ("q", "quit (Ctrl+C also works)"),
     ("", ""),
     (
         "kern",
@@ -560,22 +566,44 @@ const HELP: &[(&str, &str)] = &[
     ),
 ];
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
     let keys: Vec<String> = HELP.iter().map(|(k, _)| tr(k).into_owned()).collect();
-    let key_w = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
-    let lines: Vec<Line<'static>> = keys
+    let key_w = keys
         .iter()
-        .zip(HELP.iter().map(|(_, d)| d))
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {k:<key_w$}  "),
-                    Style::new().fg(th().title).add_modifier(Modifier::BOLD),
-                ),
-                label(d),
-            ])
-        })
-        .collect();
+        .map(|k| Span::raw(k.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let max_inner = area.width.saturating_sub(3).max(1);
+    let prefix_w = key_w + 3;
+    let desc_w = usize::from(max_inner).saturating_sub(prefix_w).max(8) as u16;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(HELP.len());
+    for (k, d) in keys.iter().zip(HELP.iter().map(|(_, d)| *d)) {
+        if k.is_empty() && d.is_empty() {
+            lines.push(Line::raw(""));
+            continue;
+        }
+        let pad = key_w.saturating_sub(Span::raw(k.as_str()).width());
+        let key_span = Span::styled(
+            format!(" {k}{:pad$}  ", ""),
+            Style::new().fg(th().title).add_modifier(Modifier::BOLD),
+        );
+        let desc = label(d);
+        if prefix_w + desc.width() <= usize::from(max_inner) {
+            lines.push(Line::from(vec![key_span, desc]));
+        } else {
+            let wrapped = wrap(vec![desc], desc_w, 0, 0);
+            for (idx, wl) in wrapped.into_iter().enumerate() {
+                let mut row = Vec::with_capacity(wl.spans.len() + 1);
+                if idx == 0 {
+                    row.push(key_span.clone());
+                } else {
+                    row.push(Span::raw(" ".repeat(prefix_w)));
+                }
+                row.extend(wl.spans);
+                lines.push(Line::from(row));
+            }
+        }
+    }
     let w = lines
         .iter()
         .map(|l| l.width() as u16)
@@ -584,15 +612,21 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         .saturating_add(3)
         .min(area.width);
     let h = (lines.len() as u16 + 2).min(area.height);
-    let r = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let vis_h = usize::from(h.saturating_sub(2));
+    let max_off = lines.len().saturating_sub(vis_h);
+    st.help_max = max_off;
+    st.help_offset = st.help_offset.min(max_off);
+    let right_title = if max_off > 0 {
+        "↑↓ scroll · any key closes"
+    } else {
+        "any key closes"
+    };
+    let r = area.centered(Constraint::Length(w), Constraint::Length(h));
     frame.render_widget(ratatui::widgets::Clear, r);
     frame.render_widget(
-        Paragraph::new(lines).block(boxed("help", "any key closes")),
+        Paragraph::new(lines)
+            .scroll((st.help_offset as u16, 0))
+            .block(boxed("help", right_title)),
         r,
     );
 }
@@ -606,7 +640,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
             Zoom::Cpu => {
                 draw_cpu(frame, body, st, mem_text(st, body.width));
             }
-            Zoom::Gpu => draw_gpu(frame, body, st, None),
+            Zoom::Gpu => draw_gpu(frame, body, st, None, None),
             Zoom::Net => draw_net(frame, body, st),
             Zoom::Disks => draw_disks(frame, body, st, &disk_order(st), None),
             Zoom::Game => draw_game(frame, body, st),
@@ -625,6 +659,8 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
     let notes = disk_notes(st, right_inner_w);
     let disk_rows = (order.len() + notes.len()) as u16;
     let gpu_w = body.width.saturating_sub(body.width * 56 / 100);
+    // Pré-calcula detalhes e engines da GPU uma única vez para `snap_top_height` e `draw_gpu`.
+    let gpu_prep = prepare_gpu(st, gpu_w);
     if st.hide_game {
         let bottom_min = (disk_rows.min(3) + 3).max(6).min(body.height / 2);
         let want_bottom = (body.height * 24 / 100)
@@ -633,7 +669,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
             .min(body.height / 2);
         let max_top = body.height.saturating_sub(bottom_min);
         let top_h = body.height.saturating_sub(want_bottom).min(max_top);
-        let top_h = snap_top_height(st, gpu_w, top_h, TOP_MIN.min(max_top), max_top);
+        let top_h = snap_top_height(gpu_prep.as_ref(), top_h, TOP_MIN.min(max_top), max_top);
         let [top, bottom] =
             Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
         let [cpu, gpu] =
@@ -643,7 +679,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
                 .areas(bottom);
         let mem = mem_text(st, cpu.width);
         let core_graph = draw_cpu(frame, cpu, st, mem);
-        draw_gpu(frame, gpu, st, core_graph);
+        draw_gpu(frame, gpu, st, core_graph, gpu_prep);
         draw_net(frame, net, st);
         draw_disks(frame, disks, st, &order, Some((right_inner_w, notes)));
         return;
@@ -657,7 +693,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
     let bottom_min = ((disk_rows.min(3) + 3 + game_min).max(9)).min(body.height / 2);
     let max_top = body.height.saturating_sub(bottom_min);
     let top_h = top_h.min(max_top);
-    let top_h = snap_top_height(st, gpu_w, top_h, TOP_MIN.min(max_top), max_top);
+    let top_h = snap_top_height(gpu_prep.as_ref(), top_h, TOP_MIN.min(max_top), max_top);
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Min(0)]).areas(body);
     let [cpu, gpu] =
@@ -672,7 +708,7 @@ fn draw_overview(frame: &mut Frame<'_>, body: Rect, st: &State) {
     let [disks, game] =
         Layout::vertical([Constraint::Length(disks_h), Constraint::Min(4)]).areas(right);
     let core_graph = draw_cpu(frame, cpu, st, mem);
-    draw_gpu(frame, gpu, st, core_graph);
+    draw_gpu(frame, gpu, st, core_graph, gpu_prep);
     draw_net(frame, net, st);
     draw_disks(frame, disks, st, &order, Some((right_inner_w, notes)));
     draw_game(frame, game, st);
@@ -861,7 +897,10 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, st: &State) {
         groups.push([key("g"), label(" next gpu  ")]);
     }
     if !filtering {
-        groups.push([key("p"), label(" pause  ")]);
+        groups.push([
+            key("p"),
+            label(if st.paused { " resume  " } else { " pause  " }),
+        ]);
         groups.push([key("?"), label(" help  ")]);
         groups.push([key("q"), label(" quit")]);
     }
@@ -1263,14 +1302,14 @@ fn aligned_bar_text_w(metrics: &[&Metric<(u64, u64)>]) -> u16 {
         .unwrap_or(0)
 }
 
-/// Largura do texto ao lado de uma barra: o valor inteiro antes da barra; sem valor, usa toda a
-/// largura depois do rótulo para a causa.
+/// Largura do texto ao lado de uma barra: o valor inteiro antes da barra; quando o valor não
+/// cabe junto com uma barra de 4 colunas, cede colunas da barra para nunca cortar `(69%)`.
 fn text_room(w: u16, missing: bool, width: u16, label_w: u16) -> u16 {
-    if missing {
-        w.min(width.saturating_sub(label_w))
+    let avail = width.saturating_sub(label_w);
+    if missing || w + 4 > avail {
+        w.min(avail)
     } else {
-        // O valor inteiro antes da barra: a barra encolhe (ex.: "(69%)" não perde o parêntese).
-        w.min(width.saturating_sub(label_w + 4))
+        w
     }
 }
 

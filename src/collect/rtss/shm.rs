@@ -166,29 +166,32 @@ pub(super) fn read_apps_at(
     Ok((apps, fg, ver))
 }
 
-/// Nome de executável na lista de ignorados (comparação sem diferenciar maiúsculas).
+/// Nome de executável na lista de ignorados (comparação ASCII sem diferenciar maiúsculas,
+/// sem alocar `String`).
 pub(super) fn is_ignored(list: &[String], name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    list.contains(&n)
+    list.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// Jogo atual: ativo, com API 3D e fora da lista de ignorados; o primeiro plano desempata,
-/// senão o de maior FPS.
+/// senão o de maior FPS (varredura única, sem alocar `Vec`).
 pub(super) fn select_game<'a>(
     apps: &'a [App],
     fg: Option<u32>,
     ignored: &[String],
 ) -> Option<&'a App> {
-    let candidates: Vec<&App> = apps
-        .iter()
-        .filter(|a| a.api != 0 && a.age_ms.is_some_and(|m| m < ACTIVE_MS))
-        .filter(|a| !is_ignored(ignored, &a.name))
-        .collect();
-    candidates
-        .iter()
-        .find(|a| Some(a.pid) == fg)
-        .or_else(|| candidates.iter().max_by(|a, b| a.fps.total_cmp(&b.fps)))
-        .copied()
+    let mut best: Option<&'a App> = None;
+    for a in apps {
+        if a.api == 0 || !a.age_ms.is_some_and(|m| m < ACTIVE_MS) || is_ignored(ignored, &a.name) {
+            continue;
+        }
+        if Some(a.pid) == fg {
+            return Some(a);
+        }
+        if best.is_none_or(|b| a.fps > b.fps) {
+            best = Some(a);
+        }
+    }
+    best
 }
 
 /// PIDs com o hook do RTSS agora (leitura direta da Shared Memory, sem esperar a thread do
@@ -218,14 +221,44 @@ pub(super) fn start_rtss() -> Result<(), String> {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     let sys = win::system_dir().ok_or("System32 not found")?;
     let windir = win::windows_dir().ok_or("Windows folder not found")?;
-    std::process::Command::new(&path)
+    let mut cmd = std::process::Command::new(&path);
+    // Ambiente limpo (`env_clear`) com lista branca derivada das APIs do Windows: evita herdar
+    // variáveis do `HKCU\Environment` (graváveis sem elevação) no processo elevado do RTSS.
+    cmd.env_clear()
+        .env("SystemRoot", &windir)
+        .env("windir", &windir)
+        .env("PATH", format!("{};{}", sys.display(), windir.display()))
+        .env("COMSPEC", sys.join("cmd.exe"))
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .current_dir(dir)
-        .env("PATH", format!("{};{}", sys.display(), windir.display()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if let Some(drive) = windir.to_str().and_then(|s| s.get(..2)) {
+        cmd.env("SystemDrive", drive);
+    }
+    if let Some(prof) = win::profile_dir() {
+        cmd.env("USERPROFILE", &prof);
+    }
+    if let Ok(pd) = win::known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramData) {
+        cmd.env("ProgramData", &pd);
+        cmd.env("ALLUSERSPROFILE", &pd);
+    }
+    if let Ok(pf) = win::known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles) {
+        cmd.env("ProgramFiles", &pf);
+    }
+    if let Ok(pf86) = win::known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFilesX86) {
+        cmd.env("ProgramFiles(x86)", &pf86);
+    }
+    if let Ok(ad) = win::known_folder(&windows::Win32::UI::Shell::FOLDERID_RoamingAppData) {
+        cmd.env("APPDATA", &ad);
+    }
+    if let Ok(lad) = win::known_folder(&windows::Win32::UI::Shell::FOLDERID_LocalAppData) {
+        cmd.env("LOCALAPPDATA", &lad);
+        let temp = lad.join("Temp");
+        cmd.env("TEMP", &temp).env("TMP", &temp);
+    }
+    cmd.spawn()
         .map(drop)
         .map_err(|e| format!("could not start {}: {e}", path.display()))
 }

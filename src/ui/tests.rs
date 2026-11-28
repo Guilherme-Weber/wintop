@@ -1992,3 +1992,62 @@ fn ocultar_caixa_de_fps_e_frametime() {
     let out_pt = pt_br(st, 210, 52);
     assert!(out_pt.contains("f mostrar fps"), "{out_pt}");
 }
+
+#[test]
+fn tema_mono_usa_trilha_distinta_e_selecao_invertida() {
+    use ratatui::style::Modifier;
+    use ratatui::widgets::Widget;
+
+    let prev = super::theme::th();
+    super::theme::set(super::theme::build_with_no_color("default", &[], true));
+    // Medidor pela metade em modo mono: preenchido (`⣿`) difere da trilha apagada (`⣀`).
+    let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    super::widgets::Meter { value: 0.5 }.render(area, &mut buf);
+    assert_eq!(buf[(0, 0)].symbol(), "⣿");
+    assert_eq!(buf[(3, 0)].symbol(), "⣀");
+
+    // Na aba Processos sob tema mono, a linha selecionada recebe REVERSED (não colide com BOLD).
+    let mut st = tab_state(view::Tab::Processes);
+    let mut t = Terminal::new(TestBackend::new(120, 20)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let b = t.backend().buffer();
+    let has_reversed = (0..20)
+        .flat_map(|y| (0..120).map(move |x| &b[(x, y)]))
+        .any(|c| c.modifier.contains(Modifier::REVERSED));
+    super::theme::set(prev);
+    assert!(
+        has_reversed,
+        "seleção em mono deveria usar Modifier::REVERSED"
+    );
+}
+
+#[test]
+fn nomes_cjk_e_combining_nao_quebram_bordas() {
+    let mut st = tab_state(view::Tab::Processes);
+    if let Some(Ok(list)) = &mut st.procs {
+        list[0].name = "游戏测试_café\u{0301}_日本語プロセス.exe".into();
+    }
+    bordas_intactas(&mut st, 80, 24);
+    st.modal = view::Modal::ConfirmEnd {
+        pid: 42,
+        name: "游戏测试_muito_longo_para_caber_em_uma_unica_linha_no_modal_de_confirmacao.exe"
+            .into(),
+        create: 1,
+    };
+    let out = render(&mut st, 60, 14);
+    assert!(out.contains("(PID 42)"), "{out}");
+    assert!(out.contains("╭ end process "), "{out}");
+    assert!(out.contains("y end process"), "{out}");
+}
+
+#[test]
+fn piso_80x24_nao_corta_percentual_de_vram() {
+    let mut st = filled();
+    let out = render(&mut st, 80, 24);
+    assert!(
+        out.contains("(69%)"),
+        "percentual de VRAM cortado em 80x24:\n{out}"
+    );
+    bordas_intactas(&mut st, 80, 24);
+}

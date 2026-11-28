@@ -191,8 +191,12 @@ fn create_protected(path: &Path, data: &[u8], users_read: bool) -> Result<(), St
     drop(sd);
     // SAFETY: handle recém-criado, só nosso; `own` o fecha se algo falhar.
     let mut f = std::fs::File::from(unsafe { crate::win::own(h) });
-    f.write_all(data)
-        .map_err(|e| format!("{}: {e}", path.display()))
+    if let Err(e) = f.write_all(data) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 /// Dono = Administradores em tudo dentro de `path` (a ACL vem herdada da pasta protegida).
@@ -215,6 +219,9 @@ fn secure_owner_tree(path: &Path) -> Result<(), String> {
 /// como administrador pelo atalho sem UAC). A raiz do volume só não pode ser link: nela
 /// Usuários criam pastas, mas não renomeiam nem apagam as existentes.
 pub fn trusted_file(file: &Path) -> Result<(), String> {
+    if !crate::win::is_local_absolute(file) {
+        return Err(format!("{} is not a local path (refused)", file.display()));
+    }
     if file.parent().is_none() {
         return Err(format!("{} has no folder", file.display()));
     }
@@ -336,7 +343,7 @@ pub fn task_xml(exe: &Path, user: &str) -> String {
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
-      <UserId>{user}</UserId>
+      <UserId>{}</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
@@ -364,6 +371,7 @@ pub fn task_xml(exe: &Path, user: &str) -> String {
   </Actions>
 </Task>
 "#,
+        esc(user),
         esc(&exe.to_string_lossy())
     )
 }
@@ -424,7 +432,7 @@ fn with_task_folder<T>(
 }
 
 /// Registra (ou atualiza) a tarefa agendada `wintop` em memória via `ITaskService`, sem XML em
-/// disco nem subprocesso `schtasks.exe`.
+/// disco nem subprocesso `schtasks.exe`, com SDDL explícito sem `CREATOR OWNER`.
 fn register_task(exe: &Path, user: &str) -> Result<(), String> {
     use windows::Win32::System::TaskScheduler::{
         TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
@@ -433,6 +441,9 @@ fn register_task(exe: &Path, user: &str) -> Result<(), String> {
     use windows::core::BSTR;
 
     let xml = task_xml(exe, user);
+    let sddl = VARIANT::from(BSTR::from(format!(
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;{user})"
+    )));
     with_task_folder("register", |folder| {
         let empty = VARIANT::default();
         // SAFETY: `folder` é um `ITaskFolder` válido conectado ao serviço local.
@@ -444,7 +455,7 @@ fn register_task(exe: &Path, user: &str) -> Result<(), String> {
                 &empty,
                 &empty,
                 TASK_LOGON_INTERACTIVE_TOKEN,
-                &empty,
+                &sddl,
             )?;
         }
         Ok(())
@@ -489,17 +500,128 @@ fn installed_version(exe: &Path) -> Option<String> {
     s.trim().strip_prefix("wintop ").map(str::to_string)
 }
 
+/// Teto para leitura do próprio executável (o binário distribuído tem ~2 MB).
+const MAX_OWN_EXE_BYTES: u64 = 64 << 20;
+
+/// Caminho real da imagem em execução pelo kernel (`QueryFullProcessImageNameW`), que acompanha
+/// renomeações (diferente de `current_exe()`, que lê o cache estático do PEB).
+fn process_image_path() -> Result<PathBuf, String> {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
+    };
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let mut len = buf.len() as u32;
+        // SAFETY: processo atual e buffer local com capacidade em caracteres.
+        match unsafe {
+            QueryFullProcessImageNameW(
+                GetCurrentProcess(),
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buf.as_mut_ptr()),
+                &raw mut len,
+            )
+        } {
+            Ok(()) => {
+                let s = String::from_utf16_lossy(&buf[..len as usize]);
+                return Ok(PathBuf::from(s));
+            }
+            Err(e) if buf.len() < 32_768 => {
+                let _ = e;
+                buf.resize(buf.len() * 2, 0);
+            }
+            Err(e) => return Err(format!("QueryFullProcessImageNameW: {e}")),
+        }
+    }
+}
+
+/// Lê os bytes do próprio executável em execução sem TOCTOU de renomeação: abre o caminho real
+/// informado pelo kernel sem `FILE_SHARE_DELETE`/`FILE_SHARE_WRITE`, confere que não é link nem
+/// hardlink e revalida o caminho final contra a imagem atual com o handle travado.
+fn read_own_exe() -> Result<(PathBuf, Vec<u8>), String> {
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+        FILE_SHARE_READ, FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+        GetFinalPathNameByHandleW, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
+    };
+
+    let image = process_image_path()?;
+    if !crate::win::is_local_absolute(&image) {
+        return Err(format!("{} is not a local path (refused)", image.display()));
+    }
+    let w = crate::win::wide_os(image.as_os_str());
+    // SAFETY: caminho terminado em zero; sem FILE_SHARE_DELETE/WRITE trava contra rename.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(w.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+            None,
+        )
+    }
+    .map_err(|e| format!("{}: {e}", image.display()))?;
+    // SAFETY: CreateFileW teve sucesso; handle válido e sem outro dono.
+    let owned = unsafe { crate::win::own(h) };
+    let raw = HANDLE(owned.as_raw_handle());
+    // SAFETY: handle válido.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_DISK {
+        return Err(format!("{} is not a disk file (refused)", image.display()));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: handle válido; estrutura local.
+    unsafe { GetFileInformationByHandle(raw, &raw mut info) }
+        .map_err(|e| format!("{}: {e}", image.display()))?;
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
+        return Err(format!("{} is a link or folder (refused)", image.display()));
+    }
+    if info.nNumberOfLinks > 1 {
+        return Err(format!("{} is a hardlink (refused)", image.display()));
+    }
+    // Com o handle segurando sem FILE_SHARE_DELETE, o caminho final não pode mudar: confere
+    // contra a imagem real do processo novamente para provar que lemos o próprio binário.
+    let mut fbuf = vec![0u16; 1024];
+    // SAFETY: handle válido e buffer local.
+    let n = unsafe { GetFinalPathNameByHandleW(raw, &mut fbuf, FILE_NAME_NORMALIZED) } as usize;
+    if n == 0 || n >= fbuf.len() {
+        return Err(format!("{}: could not verify final path", image.display()));
+    }
+    let final_s = String::from_utf16_lossy(&fbuf[..n]);
+    let final_clean = final_s.strip_prefix(r"\\?\").unwrap_or(&final_s);
+    let image_now = process_image_path()?;
+    if !final_clean.eq_ignore_ascii_case(&image_now.to_string_lossy()) {
+        return Err("running executable was moved during install (refused)".into());
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::from(owned)
+        .take(MAX_OWN_EXE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", image.display()))?;
+    if read as u64 > MAX_OWN_EXE_BYTES {
+        return Err(format!(
+            "{} is larger than {} MB",
+            image.display(),
+            MAX_OWN_EXE_BYTES >> 20
+        ));
+    }
+    Ok((image_now, bytes))
+}
+
 /// Troca o exe instalado mesmo com o wintop aberto: o Windows deixa renomear um exe em
-/// execução (não sobrescrever). O novo entra como `.new`, o atual vira `.old` e o novo assume o
-/// nome; a instância aberta segue na versão antiga até fechar. O `.old` de uma troca anterior é
-/// apagado antes (se ainda estiver em uso, fica para a próxima).
-fn replace_exe(from: &Path, exe: &Path) -> Result<(), String> {
+/// execução (não sobrescrever). O novo entra como `.new` já protegido (dono Administradores), o
+/// atual vira `.old` e o novo assume o nome; a instância aberta segue na versão antiga até fechar.
+fn replace_exe(exe_bytes: &[u8], exe: &Path) -> Result<(), String> {
     let new = exe.with_extension("exe.new");
     if is_link(&new) {
         return Err(format!("{} is a link (refused)", new.display()));
     }
     let _ = std::fs::remove_file(&new);
-    std::fs::copy(from, &new).map_err(|e| format!("copy to {}: {e}", new.display()))?;
+    create_protected(&new, exe_bytes, true)?;
     if swap_in(&new, exe)? {
         println!("wintop is open: the new version starts the next time it opens");
     }
@@ -753,7 +875,7 @@ pub fn install() -> Result<(), String> {
     }
     let dir = install_dir()?;
     let exe = dir.join("wintop.exe");
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let (me, exe_bytes) = read_own_exe()?;
     let here = me.parent().ok_or("no executable folder")?;
     // Antes de gravar qualquer coisa: a pasta pai (Program Files) e a de destino, se já existe,
     // sem links e sem escrita para quem não é administrador (senão a cópia em si já seria
@@ -788,7 +910,7 @@ pub fn install() -> Result<(), String> {
         let modules = read_modules(&here.join("modules"))?;
         let before = installed_version(&exe);
         write_protected_modules(&dir.join("modules"), &modules)?;
-        replace_exe(&me, &exe)?;
+        replace_exe(&exe_bytes, &exe)?;
         match before {
             Some(v) => println!(
                 "updated {} ({v} -> {})",
@@ -814,7 +936,10 @@ pub fn install() -> Result<(), String> {
     if tmp.exists() || is_link(&tmp) {
         std::fs::remove_file(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     }
-    create_shortcut(&tmp, &exe)?;
+    if let Err(e) = create_shortcut(&tmp, &exe) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     let bytes = std::fs::read(&tmp).map_err(|e| format!("{}: {e}", tmp.display()));
     let _ = std::fs::remove_file(&tmp);
     let (base, name) = programs()?;
@@ -876,7 +1001,7 @@ mod tests {
         let (src, exe) = (dir.join("novo.bin"), dir.join("wintop.exe"));
         std::fs::write(&src, b"novo").expect("origem");
         std::fs::write(&exe, b"antigo").expect("instalado");
-        replace_exe(&src, &exe).expect("troca");
+        replace_exe(b"novo", &exe).expect("troca");
         let left: Vec<String> = std::fs::read_dir(&dir)
             .expect("lista")
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
@@ -905,7 +1030,7 @@ mod tests {
             .expect("processo");
         let src = dir.join("novo.bin");
         std::fs::write(&src, b"novo").expect("origem");
-        let r = replace_exe(&src, &exe);
+        let r = replace_exe(b"novo", &exe);
         let content = std::fs::read(&exe);
         let _ = child.kill();
         let _ = child.wait();
@@ -953,9 +1078,89 @@ mod tests {
         );
         assert!(x.contains(r"<Command>C:\Program Files\wintop\wintop.exe</Command>"));
         assert!(!x.contains("<Triggers>"), "só sob demanda");
-        // Caracteres especiais do caminho escapados.
-        let y = task_xml(Path::new(r"C:\a&b<c>\w.exe"), "S-1");
+        // Caracteres especiais do caminho e do usuário escapados.
+        let y = task_xml(Path::new(r"C:\a&b<c>\w.exe"), "S-1&<x>");
         assert!(y.contains(r"C:\a&amp;b&lt;c&gt;\w.exe"), "{y}");
+        assert!(y.contains("<UserId>S-1&amp;&lt;x&gt;</UserId>"), "{y}");
+    }
+
+    #[test]
+    fn swap_exe_rollback_em_cada_falha() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let push = |s: &'static str| log.borrow_mut().push(s);
+        // Sucesso: chama cleanup_old, não chama restore nem remove_new.
+        assert!(
+            swap_exe(
+                || {
+                    push("free");
+                    Ok(())
+                },
+                || {
+                    push("cur->old");
+                    Ok(())
+                },
+                || {
+                    push("new->cur");
+                    Ok(())
+                },
+                || push("restore"),
+                || push("rm_new"),
+                || push("clean_old"),
+            )
+            .is_ok()
+        );
+        assert_eq!(*log.borrow(), ["free", "cur->old", "new->cur", "clean_old"]);
+
+        // Falha em free_old: só remove_new.
+        log.borrow_mut().clear();
+        assert!(
+            swap_exe(
+                || Err("busy".into()),
+                || {
+                    push("cur->old");
+                    Ok(())
+                },
+                || Ok(()),
+                || push("restore"),
+                || push("rm_new"),
+                || push("clean_old"),
+            )
+            .is_err()
+        );
+        assert_eq!(*log.borrow(), ["rm_new"]);
+
+        // Falha em move_current_to_old: só remove_new.
+        log.borrow_mut().clear();
+        assert!(
+            swap_exe(
+                || Ok(()),
+                || Err("locked".into()),
+                || {
+                    push("new->cur");
+                    Ok(())
+                },
+                || push("restore"),
+                || push("rm_new"),
+                || push("clean_old"),
+            )
+            .is_err()
+        );
+        assert_eq!(*log.borrow(), ["rm_new"]);
+
+        // Falha em move_new_to_current: restaura old e remove new.
+        log.borrow_mut().clear();
+        assert!(
+            swap_exe(
+                || Ok(()),
+                || Ok(()),
+                || Err("rename".into()),
+                || push("restore"),
+                || push("rm_new"),
+                || push("clean_old"),
+            )
+            .is_err()
+        );
+        assert_eq!(*log.borrow(), ["restore", "rm_new"]);
     }
 
     #[test]

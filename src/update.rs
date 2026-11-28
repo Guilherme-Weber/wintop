@@ -18,11 +18,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use windows::Win32::Networking::WinHttp::{
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION,
-    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetTimeouts,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH,
+    WINHTTP_DISABLE_COOKIES, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_AUTOLOGON_POLICY, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
+    WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
 use windows::core::PCWSTR;
 
@@ -75,14 +76,15 @@ pub fn mode() -> Mode {
     }
 }
 
-/// (maior, menor, correção) de "x.y.z".
+/// (maior, menor, correção) de "x.y.z" (apenas dígitos ASCII, sem `+`).
 fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     let mut it = s.split('.');
-    let v = (
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-    );
+    let part = |p: &str| -> Option<u32> {
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
+    let v = (part(it.next()?)?, part(it.next()?)?, part(it.next()?)?);
     it.next().is_none().then_some(v)
 }
 
@@ -122,13 +124,31 @@ struct Response {
     body: Vec<u8>,
 }
 
-/// `https://host/caminho` → (host, caminho). Só HTTPS.
+/// Apenas `github.com` e subdomínios de `githubusercontent.com` (evita SSRF em redirects).
+fn allowed_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    if h == "github.com" {
+        return true;
+    }
+    let Some(sub) = h.strip_suffix(".githubusercontent.com") else {
+        return false;
+    };
+    !sub.is_empty()
+        && !sub.starts_with('.')
+        && !sub.ends_with('.')
+        && !sub.contains("..")
+        && sub
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// `https://host/caminho` → (host, caminho). Só HTTPS para hosts do GitHub permitidos.
 fn split_url(url: &str) -> Result<(&str, &str), String> {
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| format!("not an https URL: {url}"))?;
     let (host, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
-    if host.is_empty() || host.contains(['@', ':']) {
+    if host.is_empty() || host.contains(['@', ':']) || !allowed_host(host) {
         return Err(format!("unexpected host in {url}"));
     }
     Ok((host, path))
@@ -179,11 +199,22 @@ fn get_once(url: &str, max: usize, timeout: Duration) -> Result<Response, String
     if req.0.is_null() {
         return Err(format!("{url}: {}", windows::core::Error::from_thread()));
     }
-    // Redirecionamentos seguidos à mão (só para HTTPS, com limite).
-    let off = WINHTTP_DISABLE_REDIRECTS.to_le_bytes();
+    // Redirecionamentos seguidos à mão (só para HTTPS em hosts do GitHub, com limite), sem
+    // cookies e sem envio automático de credenciais NTLM/Negotiate do processo elevado.
+    let off = (WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES).to_le_bytes();
     // SAFETY: `req` válido e slice `off` com tamanho de um u32.
     unsafe { WinHttpSetOption(Some(req.0), WINHTTP_OPTION_DISABLE_FEATURE, Some(&off)) }
         .map_err(|e| e.to_string())?;
+    let autologon = WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH.to_le_bytes();
+    // SAFETY: `req` válido e slice `autologon` com tamanho de um u32.
+    unsafe {
+        WinHttpSetOption(
+            Some(req.0),
+            WINHTTP_OPTION_AUTOLOGON_POLICY,
+            Some(&autologon),
+        )
+    }
+    .map_err(|e| e.to_string())?;
     // SAFETY: `req` válido, sem cabeçalhos extras nem corpo.
     unsafe { WinHttpSendRequest(req.0, None, None, 0, 0, 0) }
         .map_err(|e| format!("{host}: {e}"))?;
@@ -338,14 +369,20 @@ pub struct Package {
 /// Arquivos de `modules\` que a atualização leva (os mesmos da instalação).
 use crate::install::MODULE_FILES;
 
-/// Confere a assinatura ed25519 (`verify_strict`) de `data` com `key`.
-pub fn verify(data: &[u8], sig: &[u8], key: &[u8; 32]) -> Result<(), String> {
+/// Prova de tipo de que os bytes do zip passaram em `verify()` (ed25519 `verify_strict`):
+/// impede chamar `unpack` com bytes sem assinatura verificada.
+#[derive(Clone, Copy)]
+pub struct VerifiedZip<'a>(&'a [u8]);
+
+/// Confere a assinatura ed25519 (`verify_strict`) de `data` com `key` e devolve `VerifiedZip`.
+pub fn verify<'a>(data: &'a [u8], sig: &[u8], key: &[u8; 32]) -> Result<VerifiedZip<'a>, String> {
     use ed25519_dalek::{Signature, VerifyingKey};
     let sig: [u8; 64] = sig
         .try_into()
         .map_err(|_| format!("signature with {} bytes (expected 64)", sig.len()))?;
     let key = VerifyingKey::from_bytes(key).map_err(|e| format!("public key: {e}"))?;
     key.verify_strict(data, &Signature::from_bytes(&sig))
+        .map(|()| VerifiedZip(data))
         .map_err(|_| "signature does not match the wintop release key".to_string())
 }
 
@@ -442,9 +479,13 @@ fn zip_read(
     }
 }
 
-/// O exe e os módulos de um zip já conferido, que precisa ser o da `version`
+/// O exe e os módulos de um zip já conferido (`VerifiedZip`), que precisa ser o da `version`
 /// (`wintop-<versão>-windows-x64/...`).
-pub fn unpack(z: &[u8], version: &str) -> Result<Package, String> {
+pub fn unpack(verified: VerifiedZip<'_>, version: &str) -> Result<Package, String> {
+    if parse_version(version).is_none() {
+        return Err(format!("invalid version: {version}"));
+    }
+    let z = verified.0;
     let root = format!("wintop-{version}-windows-x64/");
     let entries = zip_entries(z)?;
     if entries.iter().any(|e| !e.0.starts_with(&root)) {
@@ -469,15 +510,24 @@ pub fn unpack(z: &[u8], version: &str) -> Result<Package, String> {
     Ok(Package { exe, modules })
 }
 
-/// Baixa e confere a release `version`.
+/// Baixa e confere a release `version` (rejeita versão inválida ou downgrade).
 pub fn download(version: &str) -> Result<Package, String> {
+    if parse_version(version).is_none() {
+        return Err(format!("invalid version: {version}"));
+    }
+    let cur = current();
+    if !is_newer(version, &cur) {
+        return Err(format!(
+            "refusing downgrade or same version ({cur} -> {version})"
+        ));
+    }
     let base = format!("https://github.com/{REPO}/releases/download/v{version}");
     let name = format!("wintop-{version}-windows-x64.zip");
     let sig = get(&format!("{base}/{name}.sig"), MAX_SIG, DOWNLOAD_TIMEOUT)
         .map_err(|e| format!("signature: {e}"))?;
     let zip = get(&format!("{base}/{name}"), MAX_ZIP, DOWNLOAD_TIMEOUT)?;
-    verify(&zip, &sig, &PUBLIC_KEY)?;
-    unpack(&zip, version)
+    let verified = verify(&zip, &sig, &PUBLIC_KEY)?;
+    unpack(verified, version)
 }
 
 /// Atualização aplicada no disco, pronta para reabrir a versão nova.
@@ -583,30 +633,90 @@ pub fn remove_stale_old(mode: &Mode) {
     }
 }
 
+/// Handle da atualização em segundo plano: cancela antes da troca em disco se a TUI sair, ou
+/// aguarda a troca concluir (evita o SO encerrar a thread no meio dos renames do exe).
+pub struct ApplyHandle {
+    rx: mpsc::Receiver<Result<PendingRestart, String>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApplyHandle {
+    pub fn try_recv(&self) -> Result<Result<PendingRestart, String>, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for ApplyHandle {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.cancel.store(true, Ordering::Release);
+        // Só bloqueia no `join` se a fase de gravação/troca em disco já começou (rápida, ms).
+        if self.writing.load(Ordering::Acquire)
+            && let Some(j) = self.join.take()
+        {
+            let _ = j.join();
+        }
+    }
+}
+
 /// Baixa, confere e aplica `version` na cópia em uso.
-pub fn apply(version: &str, mode: &Mode) -> Result<PendingRestart, String> {
+fn apply_with_guards(
+    version: &str,
+    mode: &Mode,
+    cancel: &std::sync::atomic::AtomicBool,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<PendingRestart, String> {
+    use std::sync::atomic::Ordering;
     let pkg = download(version)?;
-    match mode {
+    if cancel.load(Ordering::Acquire) {
+        return Err("update cancelled".into());
+    }
+    writing.store(true, Ordering::Release);
+    if cancel.load(Ordering::Acquire) {
+        writing.store(false, Ordering::Release);
+        return Err("update cancelled".into());
+    }
+    let res = match mode {
         Mode::Installed => {
             crate::install::update_installed(&pkg.exe, &pkg.modules)?;
             let exe = crate::install::install_dir()?.join("wintop.exe");
             Ok(PendingRestart { exe, _held: None })
         }
         Mode::Portable(d) | Mode::Undecided(d) => apply_portable(d, &pkg),
-    }
+    };
+    writing.store(false, Ordering::Release);
+    res
 }
 
 /// `apply` numa thread (a TUI segue desenhando).
-pub fn spawn_apply(version: String, mode: Mode) -> mpsc::Receiver<Result<PendingRestart, String>> {
-    let (tx, rx) = mpsc::channel();
-    let _ = std::thread::Builder::new()
+pub fn spawn_apply(version: String, mode: Mode) -> ApplyHandle {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c = std::sync::Arc::clone(&cancel);
+    let w = std::sync::Arc::clone(&writing);
+    let tx_err = tx.clone();
+    let join = match std::thread::Builder::new()
         .name("wintop-update".into())
         .spawn(move || {
-            let r = std::panic::catch_unwind(|| apply(&version, &mode))
+            let r = std::panic::catch_unwind(|| apply_with_guards(&version, &mode, &c, &w))
                 .unwrap_or_else(|_| Err("update failed (panic)".into()));
             let _ = tx.send(r);
-        });
-    rx
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            let _ = tx_err.send(Err(format!("update thread did not start: {e}")));
+            None
+        }
+    };
+    ApplyHandle {
+        rx,
+        cancel,
+        writing,
+        join,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -673,6 +783,12 @@ mod tests {
         assert!(!is_newer("1.2", "1.1.1"));
         assert!(!is_newer("1.2.0-rc1", "1.1.1"));
         assert!(!is_newer("1.2.0.1", "1.1.1"));
+        assert!(!is_newer("+1.2.0", "1.1.1"));
+        assert_eq!(parse_version("+1.2.0"), None);
+        assert_eq!(parse_version("1.+2.0"), None);
+        // Anti-downgrade e validação de versão em `download`.
+        assert!(download("0.0.1").is_err());
+        assert!(download("+9.9.9").is_err());
     }
 
     #[test]
@@ -700,6 +816,10 @@ mod tests {
             ("github.com", "/a/b?c=1")
         );
         assert_eq!(
+            split_url("https://objects.githubusercontent.com/pkg.zip").unwrap(),
+            ("objects.githubusercontent.com", "/pkg.zip")
+        );
+        assert_eq!(
             split_url("https://github.com").unwrap(),
             ("github.com", "/")
         );
@@ -707,27 +827,41 @@ mod tests {
         assert!(split_url("https://user@evil/a").is_err());
         assert!(split_url("https://h:80/a").is_err());
         assert!(split_url("https:///a").is_err());
+        // SSRF / redirect para fora do GitHub recusados.
+        assert!(split_url("https://evil.example/a").is_err());
+        assert!(split_url("https://evilgithub.com/a").is_err());
+        assert!(split_url("https://evilgithubusercontent.com/a").is_err());
+        assert!(split_url("https://.githubusercontent.com/a").is_err());
     }
 
-    /// Zip mínimo (método 0) com as entradas dadas.
-    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    /// Zip com método `method` (0 = stored, 8 = raw deflate).
+    fn zip_method(entries: &[(&str, &[u8], u16)]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut cen = Vec::new();
-        for (name, data) in entries {
+        for (name, data, method) in entries {
+            let payload: Vec<u8> = if *method == 8 {
+                miniz_oxide::deflate::compress_to_vec(data, 6)
+            } else {
+                data.to_vec()
+            };
             let off = out.len() as u32;
             out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[20, 0, 0, 0]);
+            out.extend_from_slice(&method.to_le_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]);
             out.extend_from_slice(&0u32.to_le_bytes()); // crc
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(data);
+            out.extend_from_slice(&payload);
             cen.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-            cen.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            cen.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+            cen.extend_from_slice(&method.to_le_bytes());
+            cen.extend_from_slice(&[0, 0, 0, 0]);
             cen.extend_from_slice(&0u32.to_le_bytes());
-            cen.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            cen.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             cen.extend_from_slice(&(data.len() as u32).to_le_bytes());
             cen.extend_from_slice(&(name.len() as u16).to_le_bytes());
             cen.extend_from_slice(&[0; 12]);
@@ -747,6 +881,12 @@ mod tests {
         out
     }
 
+    /// Zip mínimo (método 0) com as entradas dadas.
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let e: Vec<(&str, &[u8], u16)> = entries.iter().map(|&(n, d)| (n, d, 0)).collect();
+        zip_method(&e)
+    }
+
     #[test]
     fn zip_do_pacote() {
         let z = zip(&[
@@ -755,47 +895,69 @@ mod tests {
             ("wintop-1.2.0-windows-x64/modules/source/x.c", b"src"),
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe"),
         ]);
-        let p = unpack(&z, "1.2.0").unwrap();
+        let p = unpack(VerifiedZip(&z), "1.2.0").unwrap();
         assert_eq!(p.exe, b"MZexe");
         assert_eq!(
             p.modules,
             vec![("AMDFamily17.bin".to_string(), b"mod".to_vec())]
         );
+        // Deflate (método 8, o usado na release real) + método não suportado.
+        let zd = zip_method(&[
+            (
+                "wintop-1.2.0-windows-x64/wintop.exe",
+                b"MZexe-deflate-payload",
+                8,
+            ),
+            (
+                "wintop-1.2.0-windows-x64/modules/AMDFamily17.bin",
+                b"mod-deflate",
+                8,
+            ),
+        ]);
+        let pd = unpack(VerifiedZip(&zd), "1.2.0").unwrap();
+        assert_eq!(pd.exe, b"MZexe-deflate-payload");
+        assert_eq!(pd.modules[0].1, b"mod-deflate");
+        let z_bad_method = zip_method(&[
+            ("wintop-1.2.0-windows-x64/wintop.exe", b"MZ", 99),
+            ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"m", 0),
+        ]);
+        assert!(unpack(VerifiedZip(&z_bad_method), "1.2.0").is_err());
         // Outra versão no zip assinado: recusado (release antiga servida como nova).
-        assert!(unpack(&z, "1.3.0").is_err());
+        assert!(unpack(VerifiedZip(&z), "1.3.0").is_err());
         // Sem o exe ou sem o módulo.
         let z = zip(&[("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"m")]);
-        assert!(unpack(&z, "1.2.0").is_err());
+        assert!(unpack(VerifiedZip(&z), "1.2.0").is_err());
         let z = zip(&[("wintop-1.2.0-windows-x64/wintop.exe", b"MZ")]);
-        assert!(unpack(&z, "1.2.0").is_err());
+        assert!(unpack(VerifiedZip(&z), "1.2.0").is_err());
         // Entrada fora da pasta da versão.
         let z = zip(&[
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZ"),
             ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"m"),
             ("../evil.dll", b"x"),
         ]);
-        assert!(unpack(&z, "1.2.0").is_err());
+        assert!(unpack(VerifiedZip(&z), "1.2.0").is_err());
     }
 
     #[test]
-    fn zip_truncado_nao_quebra() {
-        let z = zip(&[
+    fn fuzz_zip_do_atualizador() {
+        let z0 = zip(&[
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe"),
             ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"mod"),
         ]);
-        for n in 0..z.len() {
-            let _ = unpack(&z[..n], "1.2.0");
+        let z8 = zip_method(&[
+            ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe", 8),
+            (
+                "wintop-1.2.0-windows-x64/modules/AMDFamily17.bin",
+                b"mod",
+                8,
+            ),
+        ]);
+        for n in 0..z0.len() {
+            let _ = unpack(VerifiedZip(&z0[..n]), "1.2.0");
         }
-        let mut seed = 1u64;
-        for _ in 0..20_000 {
-            let mut m = z.clone();
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let i = (seed as usize) % m.len();
-            m[i] = (seed >> 32) as u8;
-            let _ = unpack(&m, "1.2.0");
-        }
+        crate::fuzz::run("zip_updater", &[z0, z8], 512, |_, b| {
+            let _ = unpack(VerifiedZip(b), "1.2.0");
+        });
     }
 
     /// Troca portátil com o exe em execução (uma cópia do ping.exe rodando como wintop.exe), na
@@ -995,7 +1157,7 @@ mod real {
         let zip = std::env::var("WINTOP_TEST_ZIP").expect("WINTOP_TEST_ZIP");
         let data = std::fs::read(&zip).expect("zip");
         let sig = std::fs::read(format!("{zip}.sig")).expect("sig");
-        verify(&data, &sig, &PUBLIC_KEY).expect("assinatura");
+        let verified = verify(&data, &sig, &PUBLIC_KEY).expect("assinatura");
         let name = Path::new(&zip)
             .file_name()
             .unwrap()
@@ -1005,7 +1167,7 @@ mod real {
             .strip_prefix("wintop-")
             .and_then(|s| s.strip_suffix("-windows-x64.zip"))
             .unwrap();
-        let p = unpack(&data, v).expect("pacote");
+        let p = unpack(verified, v).expect("pacote");
         assert!(p.exe.starts_with(b"MZ"));
         let mut bad = data;
         let n = bad.len() / 2;

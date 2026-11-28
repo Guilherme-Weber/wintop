@@ -60,6 +60,21 @@ impl SharedView {
         if got == 0 || mbi.State != MEM_COMMIT {
             return None; // `me` desmapeia a view no Drop
         }
+        // Rejeita seções apoiadas em arquivo (disco/rede/placeholder): ler uma página com falha
+        // de I/O geraria SEH `EXCEPTION_IN_PAGE_ERROR` (fora do catch_unwind). A Shared Memory
+        // real do RTSS é apoiada no arquivo de paginação e não tem nome de arquivo mapeado.
+        let mut fname = [0u16; 4];
+        // SAFETY: processo atual e endereço da view recém-mapeada; buffer local.
+        let mapped_name = unsafe {
+            windows::Win32::System::ProcessStatus::K32GetMappedFileNameW(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                view.Value,
+                &mut fname,
+            )
+        };
+        if mapped_name > 0 {
+            return None; // `me` desmapeia a view no Drop
+        }
         me.len = mbi.RegionSize;
         Some(me)
     }

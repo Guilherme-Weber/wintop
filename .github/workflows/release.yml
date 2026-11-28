@@ -72,6 +72,7 @@ jobs:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write      # criar a release (rascunho)
     steps:
@@ -85,11 +86,14 @@ jobs:
       - name: Assinatura do zip
         env:
           KEY: ${{ secrets.WINTOP_UPDATE_KEY }}
+          TAG: ${{ github.ref_name }}
           UPDATE_PUBLIC_KEY: 07525fffb1d1a5b4a8e7904df5c1e8ff8423f9ea5493fce8339b7143ce74c2b6
         run: |
           set -euo pipefail
           if [ -z "$KEY" ]; then echo "secret WINTOP_UPDATE_KEY ausente"; exit 1; fi
-          zip=$(ls dist/*.zip)
+          zip="dist/wintop-${TAG#v}-windows-x64.zip"
+          test -f "$zip"
+          (cd dist && sha256sum -c "$(basename "$zip").sha256")
           umask 077
           key=$(mktemp)
           trap 'rm -f "$key" pub.der' EXIT
@@ -106,7 +110,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          zip=$(ls dist/*.zip)
+          zip="dist/wintop-${TAG#v}-windows-x64.zip"
+          test -f "$zip"
           gh release create "$TAG" --repo "$REPO" --draft --verify-tag \
             --title "wintop ${TAG#v}" --notes-file dist/notes.md \
             "$zip" "$zip.sha256" "$zip.sig"

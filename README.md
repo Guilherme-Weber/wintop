@@ -8,7 +8,7 @@ de jogos.
 
 ## Estado
 
-Versão 1.4.3. O histórico está em
+Versão 1.4.4. O histórico está em
 [CHANGELOG.md](CHANGELOG.md), o inventário completo de métricas em
 [docs/metricas.md](docs/metricas.md), as diferenças conhecidas em relação ao Gerenciador de
 Tarefas em [docs/divergencias.md](docs/divergencias.md) e as provas de viabilidade de cada fonte
@@ -61,10 +61,10 @@ wintop --uninstall
 wintop --version
 ```
 
-Na interface: `1` a `4` trocam de aba, `+` e `-` ajustam o intervalo de atualização (passos de
+Na interface: `1` a `4` (ou `Tab`/`Shift+Tab`) trocam de aba, `+` e `-` ajustam o intervalo de atualização (passos de
 100 ms), `r` zera os mínimos e máximos da sessão, `f` oculta ou mostra a caixa de FPS e frametime,
 `d` recolhe os membros do Storage Space e `q`
-(ou `Esc`, `Ctrl+C`) sai. Nas abas Processos e GPU, as setas (ou `j`/`k`, `PgUp`/`PgDn`,
+(ou `Ctrl+C`) sai. Nas abas Processos e GPU, as setas (ou `j`/`k`, `PgUp`/`PgDn`,
 `Home`/`End`) selecionam; na aba Processos, `←`/`→` mudam a coluna da ordem, `i` inverte e `/`
 filtra pelo nome ou PID; na aba GPU, `Enter` lista os runtimes de GPU do processo selecionado
 (lendo os módulos carregados; nunca em aplicativos com o hook do RTSS, que podem ser jogos com

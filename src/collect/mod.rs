@@ -148,18 +148,6 @@ pub struct SlowCollectors {
 /// Espera entre a 1ª leitura das taxas (aba recém-aberta) e a publicada.
 const TAB_WARMUP: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Dorme `d` em fatias, desistindo se a parada for pedida. `true` = parar.
-fn nap(d: std::time::Duration, stop: &AtomicBool) -> bool {
-    let end = Instant::now() + d;
-    while Instant::now() < end {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20).min(end - Instant::now()));
-    }
-    stop.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 impl SlowCollectors {
     pub fn new(nvml: SharedNvml) -> Self {
         Self {
@@ -173,11 +161,18 @@ impl SlowCollectors {
 
     /// `stop`: parada pedida (a leitura dos discos, lenta, desiste entre um disco e outro; durante
     /// o aquecimento de aba devolve `None` para não publicar falhas falsas de encerramento).
+    /// `wait`: espera interrompível pela `Condvar` do motor (`true` = parar).
     /// `view`: abas visíveis; processos e engines da GPU só são coletados com elas à vista
     /// (ao abrir, uma leitura de aquecimento e ~300 ms de espera: as taxas precisam de duas).
     /// `game_pid`: PID do jogo em foco (0 = nenhum), para medir o working set privado dele na
     /// barra da RAM sem abrir o processo.
-    pub fn collect(&mut self, stop: &AtomicBool, view: View, game_pid: u32) -> Option<Slow> {
+    pub fn collect(
+        &mut self,
+        stop: &AtomicBool,
+        wait: impl Fn(std::time::Duration) -> bool,
+        view: View,
+        game_pid: u32,
+    ) -> Option<Slow> {
         let start = Instant::now();
         let want_procs = view.procs || view.gpu;
         if !want_procs {
@@ -210,14 +205,14 @@ impl SlowCollectors {
             self.engines_open = true;
             warm = true;
         }
-        if warm && nap(TAB_WARMUP, stop) {
+        if warm && wait(TAB_WARMUP) {
             return None;
         }
         // Aba trocada entre Processos e GPU logo depois de uma leitura: a taxa precisa de uma
         // janela mínima (senão o tempo do sistema nem avançou um tick e a CPU sai 0%).
         if want_procs
             && let Some(left) = TAB_WARMUP.checked_sub(self.procs.since_last())
-            && nap(left, stop)
+            && wait(left)
         {
             return None;
         }

@@ -70,6 +70,12 @@ pub fn tr(s: &str) -> Cow<'_, str> {
     }
     let start = s.len() - s.trim_start().len();
     let (lead, trail) = (&s[..start], &s[start + core.len()..]);
+    if lead.is_empty()
+        && trail.is_empty()
+        && let Some(&t) = table().get(core)
+    {
+        return Cow::Borrowed(t);
+    }
     match tr_core(core) {
         Some(t) => Cow::Owned(format!("{lead}{t}{trail}")),
         None => Cow::Borrowed(s),
@@ -226,6 +232,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("show fps", "mostrar fps"),
     ("next gpu", "próxima gpu"),
     ("pause", "pausar"),
+    ("resume", "retomar"),
     ("quit", "sair"),
     ("select", "selecionar"),
     ("sort", "ordenar"),
@@ -254,8 +261,16 @@ const PT_BR: &[(&str, &str)] = &[
     ("[PAUSED]", "[PAUSADO]"),
     ("(z next, esc back)", "(z próxima, esc volta)"),
     ("any key closes", "qualquer tecla fecha"),
+    (
+        "↑↓ scroll · any key closes",
+        "↑↓ rolar · qualquer tecla fecha",
+    ),
     // Ajuda.
     ("p, space", "p, espaço"),
+    (
+        "click tabs/rows/headers; Shift+drag to select text",
+        "clique em abas/linhas/colunas; Shift+arrastar seleciona texto",
+    ),
     (
         "switch tabs (Overview, Processes, GPU, Sensors)",
         "trocar de aba (Geral, Processos, GPU, Sensores)",

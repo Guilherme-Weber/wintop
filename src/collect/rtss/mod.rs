@@ -55,19 +55,35 @@ const MULT_FRESH: Duration = Duration::from_secs(2);
 const FG_RATIO: f64 = 1.6;
 
 /// (1% low, 0,1% low) em FPS: média dos frametimes do 1% (0,1%) mais lento. Exige 100
-/// amostras; com menos de 1000, o 0,1% usa o pior frame.
-fn lows(samples_us: impl Iterator<Item = u32>) -> Option<(f64, f64)> {
-    let mut s: Vec<u32> = samples_us.filter(|&u| u > 0).collect();
-    if s.len() < 100 {
+/// amostras; com menos de 1000, o 0,1% usa o pior frame. Usa `select_nth_unstable_by` (O(n))
+/// reaproveitando `buf` para evitar alocar até 240 KB por segundo.
+fn lows_into(buf: &mut Vec<u32>, samples_us: impl Iterator<Item = u32>) -> Option<(f64, f64)> {
+    buf.clear();
+    buf.extend(samples_us.filter(|&u| u > 0));
+    let n = buf.len();
+    if n < 100 {
         return None;
     }
-    s.sort_unstable_by(|a, b| b.cmp(a));
-    let avg_fps = |k: usize| {
-        let k = k.clamp(1, s.len());
-        let avg = s[..k].iter().map(|&u| u64::from(u)).sum::<u64>() as f64 / k as f64;
+    let k1 = (n / 100).clamp(1, n);
+    let k01 = (n / 1000).clamp(1, n);
+    // Particiona os `k1` maiores (frametimes mais lentos) no prefixo `..k1`, depois os `k01`
+    // maiores dentro de `..k1`: O(n) em vez de O(n log n).
+    buf.select_nth_unstable_by(k1 - 1, |a, b| b.cmp(a));
+    let avg_fps = |slice: &[u32]| {
+        let avg = slice.iter().map(|&u| u64::from(u)).sum::<u64>() as f64 / slice.len() as f64;
         (avg > 0.0).then(|| 1e6 / avg)
     };
-    Some((avg_fps(s.len() / 100)?, avg_fps(s.len() / 1000)?))
+    let low1 = avg_fps(&buf[..k1])?;
+    if k01 < k1 {
+        buf[..k1].select_nth_unstable_by(k01 - 1, |a, b| b.cmp(a));
+    }
+    let low01 = avg_fps(&buf[..k01])?;
+    Some((low1, low01))
+}
+
+#[cfg(test)]
+fn lows(samples_us: impl Iterator<Item = u32>) -> Option<(f64, f64)> {
+    lows_into(&mut Vec::new(), samples_us)
 }
 
 /// Frames de um app (pipe, por índice da Shared Memory, ou amostras aproximadas, por PID).
@@ -307,6 +323,8 @@ struct FrameTracker {
     /// (um congelamento tira o jogo da lista de ativos do RTSS por um instante).
     last_game: Option<(u32, Instant)>,
     lows: LowsCache,
+    /// Buffer reaproveitado para o cálculo dos lows (evita realocar até 240 KB por segundo).
+    lows_scratch: Vec<u32>,
     /// PID e momento da publicação anterior do jogo (para o pior frame desde então).
     published: Option<(u32, Instant)>,
 }
@@ -322,6 +340,7 @@ impl FrameTracker {
             frames: EtwFrames::default(),
             last_game: None,
             lows: None,
+            lows_scratch: Vec::new(),
             published: None,
         }
     }
@@ -427,20 +446,33 @@ impl FrameTracker {
             FrameSource::Pipe => (self.exact.get(&g.index), now),
             FrameSource::Approx => (self.approx.get(&g.pid), now),
         };
-        let second: Vec<u32> =
-            ring.map_or_else(Vec::new, |r| r.last_second(t).filter(|&u| u > 0).collect());
+        let mut count = 0u64;
+        let mut sum = 0u64;
+        let mut lo_us = u32::MAX;
+        let mut hi_us = 0u32;
+        if let Some(r) = ring {
+            for u in r.last_second(t).filter(|&u| u > 0) {
+                count += 1;
+                sum += u64::from(u);
+                lo_us = lo_us.min(u);
+                hi_us = hi_us.max(u);
+            }
+        }
         let (fps, frametime) = if approx {
             // FPS do período do RTSS; frametime: o instantâneo e os extremos das amostras.
             let cur = f64::from(g.frametime_us) / 1000.0;
-            let (lo, hi) = min_max_ms(&second).unwrap_or((cur, cur));
+            let (lo, hi) = if count > 0 {
+                (f64::from(lo_us) / 1000.0, f64::from(hi_us) / 1000.0)
+            } else {
+                (cur, cur)
+            };
             (positive(g.fps), positive(cur).map(|c| (c, lo, hi)))
-        } else if second.is_empty() {
+        } else if count == 0 {
             let m = Missing::Neutral("no frames in the last second".into());
             (Err(m.clone()), Err(m))
         } else {
-            let sum: u64 = second.iter().map(|&u| u64::from(u)).sum();
-            let n = second.len() as f64;
-            let (lo, hi) = min_max_ms(&second).unwrap_or((0.0, 0.0));
+            let n = count as f64;
+            let (lo, hi) = (f64::from(lo_us) / 1000.0, f64::from(hi_us) / 1000.0);
             let avg = sum as f64 / n / 1000.0;
             // Congelamento em andamento: o tempo desde o último frame conta no FPS (senão um
             // travamento de 900 ms mostraria o FPS do frame anterior a ele).
@@ -454,7 +486,14 @@ impl FrameTracker {
                 positive(avg).map(|a| (a, lo, hi)),
             )
         };
-        let lows = cached_lows(&mut self.lows, g.pid, source, now, ring);
+        let lows = cached_lows(
+            &mut self.lows,
+            &mut self.lows_scratch,
+            g.pid,
+            source,
+            now,
+            ring,
+        );
         // Reais e apresentados na mesma janela (a do ETW, que chega atrasada).
         let framegen = if self.frames.pid == Some(g.pid) {
             // No modo aproximado a fila tem uma amostra por leitura, não um frame: o FPS dela.
@@ -647,18 +686,18 @@ impl RtssCollector {
         }
     }
 
-    /// `None` com a Shared Memory aberta; senão o estado do RTSS (iniciando ou falha).
-    fn open_view(&mut self) -> Option<Missing> {
+    /// Shared Memory aberta, ou o estado do RTSS (iniciando ou falha).
+    fn open_view(&mut self) -> Result<&SharedView, Missing> {
         if self.view.is_none() {
             self.view = SharedView::open(SHM_NAME);
         }
-        if self.view.is_some() {
+        if let Some(v) = self.view.as_ref() {
             self.started_at = None;
             self.start_error = None;
-            return None;
+            return Ok(v);
         }
         if !self.start_rtss {
-            return Some(Missing::Fail("RTSS not running".into()));
+            return Err(Missing::Fail("RTSS not running".into()));
         }
         // Nova tentativa de iniciar depois de `RTSS_START_RETRY`.
         if self
@@ -669,9 +708,9 @@ impl RtssCollector {
             self.start_error = start_rtss().err();
         }
         if let Some(e) = &self.start_error {
-            return Some(Missing::Fail(format!("RTSS not running: {e}")));
+            return Err(Missing::Fail(format!("RTSS not running: {e}")));
         }
-        Some(
+        Err(
             if self
                 .started_at
                 .is_some_and(|t| t.elapsed() < RTSS_START_GRACE)
@@ -702,20 +741,22 @@ impl RtssCollector {
             Err(Some(e)) => fail(e.clone()),
             Err(None) => neutral("not started in --check"),
         };
-        if let Some(missing) = self.open_view() {
-            self.forget_frames();
-            return Fps {
-                rtss: Err(missing.clone()),
-                pipe,
-                etw: self.etw_status(),
-                game: Err(missing),
-                hooked: Vec::new(),
-            };
-        }
-        let read = self.view.as_ref().map(read_apps);
+        let read = match self.open_view() {
+            Ok(v) => read_apps(v),
+            Err(missing) => {
+                self.forget_frames();
+                return Fps {
+                    rtss: Err(missing.clone()),
+                    pipe,
+                    etw: self.etw_status(),
+                    game: Err(missing),
+                    hooked: Vec::new(),
+                };
+            }
+        };
         let (apps, fg, ver) = match read {
-            Some(Ok(x)) => x,
-            Some(Err(e)) => {
+            Ok(x) => x,
+            Err(e) => {
                 // 0xDEAD ou lixo: desmapeia e reconecta na próxima amostra.
                 self.view = None;
                 self.forget_frames();
@@ -727,7 +768,6 @@ impl RtssCollector {
                     hooked: Vec::new(),
                 };
             }
-            None => unreachable!("view aberta em open_view"),
         };
         let rtss = Ok(format!("shared memory {}.{}", ver >> 16, ver & 0xFFFF));
         let now = Instant::now();
@@ -800,6 +840,7 @@ impl RtssCollector {
 
 fn cached_lows(
     cache: &mut LowsCache,
+    scratch: &mut Vec<u32>,
     pid: u32,
     source: FrameSource,
     now: Instant,
@@ -813,7 +854,7 @@ fn cached_lows(
         return v.clone();
     }
     let v = ring
-        .and_then(|r| lows(r.frames.iter().map(|(_, us)| *us)))
+        .and_then(|r| lows_into(scratch, r.frames.iter().map(|(_, us)| *us)))
         .map_or_else(|| neutral("waiting for samples"), Ok);
     *cache = Some((now, pid, source, v.clone()));
     v
@@ -825,12 +866,6 @@ fn positive(v: f64) -> Metric<f64> {
     } else {
         neutral("no frames in the last second")
     }
-}
-
-fn min_max_ms(us: &[u32]) -> Option<(f64, f64)> {
-    let lo = us.iter().min()?;
-    let hi = us.iter().max()?;
-    Some((f64::from(*lo) / 1000.0, f64::from(*hi) / 1000.0))
 }
 
 #[cfg(test)]

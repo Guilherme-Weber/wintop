@@ -345,6 +345,7 @@ pub(super) fn draw_sensors(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
         .filter_map(sensor_of)
         .collect();
     st.sensor_overflow = !beyond.is_empty();
+    st.sensor_beyond = beyond.len();
     if !beyond.is_empty()
         && let Some(last) = layout.get_mut(ncols - 1)
     {

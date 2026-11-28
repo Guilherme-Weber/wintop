@@ -339,8 +339,12 @@ pub(super) fn draw_gpu_tab(frame: &mut Frame<'_>, area: Rect, st: &mut State) {
             ],
         );
         if Some(i) == sel {
-            // Fundo e negrito: a seleção não depende só da cor (NO_COLOR, temas claros).
-            line = line.style(Style::new().bg(th().selected).add_modifier(Modifier::BOLD));
+            // Fundo e negrito; em NO_COLOR/mono usa REVERSED para não colidir com o negrito do jogo.
+            let mut style = Style::new().bg(th().selected).add_modifier(Modifier::BOLD);
+            if crate::ui::theme::no_color() || th().name == "mono" {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            line = line.style(style);
         }
         let y = table_y + 1 + (i - offset) as u16;
         put(

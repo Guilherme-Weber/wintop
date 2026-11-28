@@ -41,20 +41,23 @@ const CLOSE_WAIT: Duration = Duration::from_millis(4500);
 /// Roda numa thread criada pelo Windows: só marca a parada; o laço principal encerra o motor
 /// (as threads de coleta terminam e os handles são fechados) e sai de `run`.
 unsafe extern "system" fn on_console_event(kind: u32) -> BOOL {
-    if matches!(kind, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
-        STOP.store(true, Ordering::SeqCst);
-        // Ao fechar a janela o Windows encerra o processo quando o handler retorna: espera a
-        // parada terminar de fato (motor encerrado), até o limite que o Windows concede.
-        if kind == CTRL_CLOSE_EVENT {
-            let t = std::time::Instant::now();
-            while !DONE.load(Ordering::SeqCst) && t.elapsed() < CLOSE_WAIT {
-                std::thread::sleep(Duration::from_millis(20));
+    std::panic::catch_unwind(|| {
+        if matches!(kind, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
+            STOP.store(true, Ordering::SeqCst);
+            // Ao fechar a janela o Windows encerra o processo quando o handler retorna: espera a
+            // parada terminar de fato (motor encerrado), até o limite que o Windows concede.
+            if kind == CTRL_CLOSE_EVENT {
+                let t = std::time::Instant::now();
+                while !DONE.load(Ordering::SeqCst) && t.elapsed() < CLOSE_WAIT {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
+            BOOL(1)
+        } else {
+            BOOL(0)
         }
-        BOOL(1)
-    } else {
-        BOOL(0)
-    }
+    })
+    .unwrap_or(BOOL(0))
 }
 
 const HELP: &str = "\
