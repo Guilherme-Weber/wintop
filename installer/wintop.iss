@@ -80,7 +80,9 @@ Source: "{#Payload}\modules\*"; DestDir: "{tmp}\wintop\modules"; Flags: ignoreve
 
 [Run]
 Filename: "{#RtssUrl}"; Flags: shellexec nowait runasoriginaluser; Tasks: rtss
-Filename: "{commonpf64}\wintop\wintop.exe"; Description: "{cm:RunWintop}"; Flags: postinstall nowait skipifsilent; Check: WintopInstalled
+; Pela tarefa agendada, como o atalho do Menu Iniciar: a caixa da tela final roda como o usuário
+; original (sem elevação) e o exe direto falharia com o erro 740 (requireAdministrator).
+Filename: "{sys}\schtasks.exe"; Parameters: "/run /tn ""wintop"""; Description: "{cm:RunWintop}"; Flags: postinstall nowait skipifsilent runhidden; Check: WintopInstalled
 
 [Code]
 var
