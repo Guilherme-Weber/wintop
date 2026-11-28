@@ -357,6 +357,96 @@ pub fn profile_dir() -> Option<PathBuf> {
     is_local_absolute(&p).then_some(p)
 }
 
+/// Chave do registro aberta para gravação (HKLM, visão de 64 bits); fecha no Drop.
+pub struct RegKey(windows::Win32::System::Registry::HKEY);
+
+impl RegKey {
+    /// Cria (ou abre) `HKLM\<key>` para gravar valores.
+    pub fn create_hklm(key: &str) -> Result<Self, String> {
+        use windows::Win32::System::Registry::{
+            HKEY, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_OPTION_NON_VOLATILE, RegCreateKeyExW,
+        };
+        let k = wide(key);
+        let mut h = HKEY::default();
+        // SAFETY: caminho terminado em zero; `h` recebe a chave aberta.
+        unsafe {
+            RegCreateKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(k.as_ptr()),
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_WOW64_64KEY,
+                None,
+                &raw mut h,
+                None,
+            )
+        }
+        .ok()
+        .map_err(|e| format!(r"HKLM\{key}: {e}"))?;
+        Ok(Self(h))
+    }
+
+    fn set(
+        &self,
+        name: &str,
+        kind: windows::Win32::System::Registry::REG_VALUE_TYPE,
+        data: &[u8],
+    ) -> Result<(), String> {
+        use windows::Win32::System::Registry::RegSetValueExW;
+        let n = wide(name);
+        // SAFETY: chave aberta para gravação; dados locais com o tamanho informado.
+        unsafe { RegSetValueExW(self.0, PCWSTR(n.as_ptr()), None, kind, Some(data)) }
+            .ok()
+            .map_err(|e| format!("registry value {name}: {e}"))
+    }
+
+    pub fn set_sz(&self, name: &str, value: &str) -> Result<(), String> {
+        let bytes: Vec<u8> = wide(value).iter().flat_map(|c| c.to_le_bytes()).collect();
+        self.set(name, windows::Win32::System::Registry::REG_SZ, &bytes)
+    }
+
+    pub fn set_dword(&self, name: &str, value: u32) -> Result<(), String> {
+        self.set(
+            name,
+            windows::Win32::System::Registry::REG_DWORD,
+            &value.to_le_bytes(),
+        )
+    }
+
+    /// Apaga `HKLM\<key>` (só valores, sem subchaves). `Ok(false)` = não existia.
+    pub fn delete_hklm(key: &str) -> Result<bool, String> {
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        use windows::Win32::System::Registry::{KEY_WOW64_64KEY, RegDeleteKeyExW};
+        let k = wide(key);
+        // SAFETY: caminho terminado em zero.
+        let r = unsafe {
+            RegDeleteKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(k.as_ptr()),
+                KEY_WOW64_64KEY.0,
+                None,
+            )
+        };
+        if r == ERROR_FILE_NOT_FOUND {
+            Ok(false)
+        } else {
+            r.ok()
+                .map(|()| true)
+                .map_err(|e| format!(r"HKLM\{key}: {e}"))
+        }
+    }
+}
+
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        // SAFETY: chave aberta por `create_hklm`, fechada uma vez.
+        unsafe {
+            let _ = windows::Win32::System::Registry::RegCloseKey(self.0);
+        }
+    }
+}
+
 /// Maximiza a janela do console clássico (conhost, onde o atalho sem UAC abre o wintop com
 /// 120x30). No Windows Terminal a janela do console é um pseudoconsole oculto: nada muda.
 /// Devolve se maximizou.

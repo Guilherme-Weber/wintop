@@ -52,6 +52,14 @@ fn disk(n: u32, model: &str, letters: &[&str], bus: Bus, ssd: bool, member: bool
         capacity: Ok(477 * GB),
         pool_member: Ok(member),
         letters: letters.iter().map(ToString::to_string).collect(),
+        // O disco 8 (F:) com menos de 10% livre (laranja); sem letra, estado neutro.
+        free: if letters.is_empty() {
+            crate::model::neutral("no volume")
+        } else if n == 8 {
+            Ok((30 * GB, 477 * GB))
+        } else {
+            Ok((210 * GB, 477 * GB))
+        },
         system: letters.contains(&"C:"),
         pagefile: letters.contains(&"C:"),
         active: Ok(f64::from(n) * 3.0),
@@ -277,6 +285,32 @@ fn filled() -> State {
     }
     st.slow = Some(slow().into());
     st
+}
+
+/// Coluna "free" dos discos: laranja (`disk_low`) abaixo de 10% livre, cor de rótulo acima.
+#[test]
+fn espaco_livre_laranja_abaixo_de_10_por_cento() {
+    let mut st = filled();
+    let mut t = Terminal::new(TestBackend::new(160, 48)).expect("terminal de teste");
+    t.draw(|f| view::draw(f, &mut st)).expect("desenho");
+    let buf = t.backend().buffer().clone();
+    let find = |text: &str| -> (u16, u16) {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(i) = row.find(text) {
+                let x = row[..i].chars().count() as u16;
+                return (x, y);
+            }
+        }
+        panic!("{text} não encontrado");
+    };
+    let th = super::theme::th();
+    let (x, y) = find(" 30.0 GB ");
+    assert_eq!(buf[(x + 1, y)].fg, th.disk_low);
+    let (x, y) = find(" 210 GB ");
+    assert_eq!(buf[(x + 1, y)].fg, th.label);
 }
 
 #[test]

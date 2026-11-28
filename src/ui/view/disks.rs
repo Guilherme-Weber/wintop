@@ -142,6 +142,9 @@ pub(super) fn disk_notes(st: &State, width: u16) -> Vec<Line<'static>> {
                 _ => {}
             }
         }
+        if let Err(m @ Missing::Fail(_)) = &d.free {
+            note(&name, "free space", m);
+        }
         // Contadores de I/O (o mesmo IOCTL): uma nota com a causa, a coluna mostra "! failed".
         if let Some(m) = [&d.active, &d.response, &d.read, &d.write]
             .into_iter()
@@ -197,23 +200,24 @@ pub(super) fn draw_disks(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Atividade (5), resposta (8), leitura e escrita (10 cada) e temperatura (1 ou 2 + "! failed").
-    // Depois do nome: barramento (7), tipo (4), capacidade (7 + espaço), flags (4) e 2 espaços.
+    // Depois do nome: barramento (7), tipo (4), capacidade e livre (7 + espaço cada), flags (4)
+    // e 2 espaços.
     // Sem largura para tudo (o conhost abre com 120 colunas), saem primeiro barramento, tipo e
     // resposta (as falhas deles continuam nas notas); leitura, escrita e temperatura ficam.
-    let compact = inner.width < 12 + 25 + 43;
+    let compact = inner.width < 12 + 33 + 43;
     // Ainda mais estreito (o piso de 80 colunas): as flags S/P vão junto do nome, para a
     // temperatura não ser cortada.
     let tiny = inner.width < 12 + 14 + 35;
     // Com folga (nome inteiro e a atividade), IOPS e fila entram depois da escrita.
-    let wide = inner.width >= 26 + 25 + 54 + 12;
+    let wide = inner.width >= 26 + 33 + 54 + 12;
     let (left_w, info_full): (u16, u16) = if tiny {
         (8, 34)
     } else if compact {
-        (14, 35)
+        (22, 35)
     } else if wide {
-        (25, 54)
+        (33, 54)
     } else {
-        (25, 43)
+        (33, 43)
     };
     // O nome encolhe antes de tudo (até 9 cols no piso 80×24 para "! failed" de temperatura
     // caber inteiro); a atividade fica com a sobra. As colunas nunca se sobrepõem.
@@ -240,9 +244,12 @@ pub(super) fn draw_disks(
     let left_head = if tiny {
         format!("{:>7} ", "cap")
     } else if compact {
-        format!("{:>7} {:<4}  ", "cap", "flg")
+        format!("{:>7} {:>7} {:<4}  ", "cap", "free", "flg")
     } else {
-        format!("{:<7}{:<4}{:>7} {:<4}  ", "bus", "typ", "cap", "flg")
+        format!(
+            "{:<7}{:<4}{:>7} {:>7} {:<4}  ",
+            "bus", "typ", "cap", "free", "flg"
+        )
     };
     line(
         frame,
@@ -375,16 +382,34 @@ pub(super) fn draw_disks(
                 Style::new().fg(if *member { th().label } else { th().text }),
             ));
         }
+        // Espaço livre: laranja abaixo de 10% do total dos volumes; sem volume, em branco.
+        let free = match &d.free {
+            Ok((f, t)) => Span::styled(
+                format!("{:>7} ", compact_bytes(*f)),
+                Style::new().fg(if f.saturating_mul(10) < *t {
+                    th().disk_low
+                } else {
+                    th().label
+                }),
+            ),
+            Err(m @ Missing::Fail(_)) => Span::styled(
+                format!("{:>7} ", missing_mark(m)),
+                Style::new().fg(th().fail),
+            ),
+            Err(_) => Span::raw(" ".repeat(8)),
+        };
         if tiny {
             left_spans.push(label(&format!("{cap:>7} ")));
         } else if compact {
             left_spans.push(label(&format!("{cap:>7} ")));
+            left_spans.push(free);
             left_spans.push(Span::styled(
                 format!("{flags:<4}  "),
                 Style::new().fg(th().accent),
             ));
         } else {
             left_spans.push(label(&format!("{bus:<7}{typ:<4}{cap:>7} ")));
+            left_spans.push(free);
             left_spans.push(Span::styled(
                 format!("{flags:<4}  "),
                 Style::new().fg(th().accent),

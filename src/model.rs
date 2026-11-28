@@ -181,6 +181,9 @@ pub struct Disk {
     pub pool_member: Metric<bool>,
     /// Letras das unidades (ex.: `["C:"]`); membros do pool não têm letra.
     pub letters: Vec<String>,
+    /// Espaço (livre, total) em bytes somado dos volumes com letra deste disco; neutro sem
+    /// volume com letra (membro do pool, disco sem partição montada).
+    pub free: Metric<(u64, u64)>,
     pub system: bool,
     pub pagefile: bool,
     /// Tempo ativo, 0-100.
@@ -647,6 +650,7 @@ impl Disk {
         f("bus", self.bus.as_ref().err());
         f("ssd", self.ssd.as_ref().err());
         f("capacity", self.capacity.as_ref().err());
+        f("free", self.free.as_ref().err());
         f("pool_member", self.pool_member.as_ref().err());
         f("active", self.active.as_ref().err());
         f("read", self.read.as_ref().err());

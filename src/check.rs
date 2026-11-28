@@ -382,6 +382,9 @@ fn fast_report<W: Write>(r: &mut Report<W>, f: &Fast) {
                 r.line("  Bus", &d.bus, ToString::to_string);
                 r.line("  Type", &d.ssd, |s| if *s { "SSD" } else { "HDD" }.into());
                 r.line("  Capacity", &d.capacity, |v| bytes(*v));
+                r.line("  Free space", &d.free, |(f, t)| {
+                    format!("{} of {}", bytes(*f), bytes(*t))
+                });
                 r.line("  Storage Spaces member", &d.pool_member, |m| {
                     if *m { "yes" } else { "no" }.into()
                 });

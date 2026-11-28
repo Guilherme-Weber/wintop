@@ -40,6 +40,8 @@ pub struct Theme {
     pub decode: Color,
     pub ram_in_use: Color,
     pub ram_compressed: Color,
+    /// Espaço livre do disco abaixo de 10% (laranja).
+    pub disk_low: Color,
     pub ram_modified: Color,
     pub ram_standby: Color,
     pub game: Color,
@@ -84,6 +86,7 @@ pub const DEFAULT: Theme = Theme {
     decode: Color::Rgb(176, 132, 224),
     ram_in_use: Color::Rgb(78, 184, 176),
     ram_compressed: Color::Rgb(157, 124, 216),
+    disk_low: rgb(0xFB923C),
     ram_modified: rgb(0xD4B85A),
     ram_standby: Color::Rgb(92, 120, 170),
     game: Color::Rgb(224, 138, 60),
@@ -123,6 +126,7 @@ const NORD: Theme = Theme {
     decode: rgb(0xb48ead),
     ram_in_use: rgb(0x88c0d0),
     ram_compressed: rgb(0xb48ead),
+    disk_low: rgb(0xd08770),
     ram_modified: rgb(0xebcb8b),
     ram_standby: rgb(0x5e81ac),
     game: rgb(0xd08770),
@@ -160,6 +164,7 @@ const GRUVBOX: Theme = Theme {
     decode: rgb(0xd3869b),
     ram_in_use: rgb(0x8ec07c),
     ram_compressed: rgb(0xd3869b),
+    disk_low: rgb(0xfe8019),
     ram_modified: rgb(0xd79921),
     ram_standby: rgb(0x458588),
     game: rgb(0xfe8019),
@@ -197,6 +202,7 @@ const DRACULA: Theme = Theme {
     decode: rgb(0xbd93f9),
     ram_in_use: rgb(0x8be9fd),
     ram_compressed: rgb(0xbd93f9),
+    disk_low: rgb(0xffb86c),
     ram_modified: rgb(0xf1fa8c),
     ram_standby: rgb(0x6272a4),
     game: rgb(0xffb86c),
@@ -235,6 +241,7 @@ const MONO: Theme = Theme {
     decode: rgb(0x909090),
     ram_in_use: rgb(0xc8c8c8),
     ram_compressed: rgb(0xb4b4b4),
+    disk_low: rgb(0xf0f0f0),
     ram_modified: rgb(0xa0a0a0),
     ram_standby: rgb(0x787878),
     game: rgb(0xffffff),
@@ -338,6 +345,7 @@ pub fn is_color_name(name: &str) -> bool {
             | "decode"
             | "ram_in_use"
             | "ram_compressed"
+            | "disk_low"
             | "ram_modified"
             | "ram_standby"
             | "game"
@@ -376,6 +384,7 @@ fn slot<'a>(t: &'a mut Theme, name: &str) -> Option<&'a mut Color> {
         "decode" => &mut t.decode,
         "ram_in_use" => &mut t.ram_in_use,
         "ram_compressed" => &mut t.ram_compressed,
+        "disk_low" => &mut t.disk_low,
         "ram_modified" => &mut t.ram_modified,
         "ram_standby" => &mut t.ram_standby,
         "game" => &mut t.game,
@@ -461,6 +470,7 @@ mod tests {
             "decode",
             "ram_in_use",
             "ram_compressed",
+            "disk_low",
             "ram_modified",
             "ram_standby",
             "game",

@@ -50,6 +50,10 @@ const SPACES_PROTECTIVE: [u8; 16] = [
 ];
 const PAGEFILES_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
 
+/// Espaço livre dos volumes relido a cada 5 s (metadado do sistema de arquivos em memória: não
+/// acorda o disco).
+const FREE_EVERY: Duration = Duration::from_secs(5);
+
 /// Nova tentativa de ler capacidade e layout de um HDD que estava em repouso.
 const RETRY_ASLEEP: Duration = Duration::from_secs(60);
 
@@ -741,6 +745,52 @@ pub struct DiskCollector {
     discovered: Option<Instant>,
     system_drive: Option<char>,
     pagefile_drives: Vec<char>,
+    /// (letra, (livre, total)) da última leitura e quando foi feita.
+    free: Vec<VolumeFree>,
+    free_at: Option<Instant>,
+}
+
+/// Letra e (livre, total) do volume, ou a causa da falha.
+type VolumeFree = (String, Result<(u64, u64), String>);
+
+/// Livre e total de um volume (`X:`) pelo `GetDiskFreeSpaceExW` (espaço livre total, sem a
+/// cota do usuário, como o Explorer mostra para o administrador).
+fn volume_free(letter: &str) -> Result<(u64, u64), String> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let root = wide(&format!(r"{letter}\"));
+    let (mut total, mut free) = (0u64, 0u64);
+    // SAFETY: caminho terminado em zero; ponteiros para u64 locais.
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(root.as_ptr()),
+            None,
+            Some(&raw mut total),
+            Some(&raw mut free),
+        )
+    }
+    .map_err(|e| format!("GetDiskFreeSpaceExW({letter}): {e}"))?;
+    Ok((free, total))
+}
+
+/// Soma o espaço dos volumes do disco; a primeira falha aparece (não some calada na soma).
+fn sum_free(letters: &[String], cache: &[VolumeFree]) -> Metric<(u64, u64)> {
+    let mut sum = (0u64, 0u64);
+    let mut any = false;
+    for l in letters {
+        match cache.iter().find(|(c, _)| c == l).map(|(_, r)| r) {
+            Some(Ok((f, t))) => {
+                sum = (sum.0.saturating_add(*f), sum.1.saturating_add(*t));
+                any = true;
+            }
+            Some(Err(e)) => return fail(e.clone()),
+            None => {}
+        }
+    }
+    if any && sum.1 > 0 {
+        Ok(sum)
+    } else {
+        neutral("no volume")
+    }
 }
 
 impl DiskCollector {
@@ -756,6 +806,8 @@ impl DiskCollector {
             discovered: Some(Instant::now()),
             system_drive: win::windows_drive(),
             pagefile_drives,
+            free: Vec::new(),
+            free_at: None,
         }
     }
 
@@ -764,6 +816,8 @@ impl DiskCollector {
         self.discovered = Some(Instant::now());
         refresh(&mut self.disks);
         self.letters = volume_letters();
+        // Letras novas (pendrive ligado): o espaço livre entra já na próxima coleta.
+        self.free_at = None;
     }
 
     pub fn read(&mut self) -> Metric<Vec<Disk>> {
@@ -778,6 +832,18 @@ impl DiskCollector {
                 .iter()
                 .any(|l| l.starts_with(c) && l.len() == 2 && l.ends_with(':'))
         };
+        if self.free_at.is_none_or(|t| t.elapsed() >= FREE_EVERY) {
+            let mut seen: Vec<&str> = Vec::new();
+            let mut fresh = Vec::new();
+            for (_, l) in &self.letters {
+                if !seen.contains(&l.as_str()) {
+                    seen.push(l);
+                    fresh.push((l.clone(), volume_free(l)));
+                }
+            }
+            self.free = fresh;
+            self.free_at = Some(Instant::now());
+        }
         let mut out = Vec::with_capacity(self.disks.len());
         for inv in &mut self.disks {
             inv.retry_if_asleep();
@@ -810,6 +876,7 @@ impl DiskCollector {
                 pool_member: inv.pool_member.clone(),
                 system: self.system_drive.is_some_and(|c| has(&letters, c)),
                 pagefile: self.pagefile_drives.iter().any(|&c| has(&letters, c)),
+                free: sum_free(&letters, &self.free),
                 letters,
                 active: act.as_ref().map(|a| a.0.0).map_err(Clone::clone),
                 read: act.as_ref().map(|a| a.0.1).map_err(Clone::clone),

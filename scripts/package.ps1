@@ -10,6 +10,8 @@
     O exe é compilado sem a pasta do usuário nos caminhos e o zip é determinístico (o mesmo exe
     dá o mesmo zip). -RequireNotes (a release) falha se o CHANGELOG não tiver a seção da versão.
     Ao lado do zip, wintop-<versão>-windows-x64.zip.sha256 (formato do sha256sum).
+    Depois, o instalador wintop-<versão>-setup.exe (Inno Setup 6, installer\wintop.iss) com o
+    seu .sha256; -NoSetup pula (sem o Inno Setup instalado, o script falha).
 
 .EXAMPLE
     .\scripts\package.ps1
@@ -18,7 +20,8 @@
 [CmdletBinding()]
 param(
     [switch]$NoBuild,
-    [switch]$RequireNotes
+    [switch]$RequireNotes,
+    [switch]$NoSetup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -103,6 +106,23 @@ $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 # Formato do sha256sum (LF, sem BOM): `sha256sum -c` confere direto.
 [IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n")
 
+# Instalador (Inno Setup): extrai o pacote numa pasta temporária e roda o `--install`.
+$setup = Join-Path $dist "wintop-$version-setup.exe"
+if (-not $NoSetup) {
+    $iscc = @(
+        (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $iscc) { throw 'Inno Setup 6 não encontrado (winget install JRSoftware.InnoSetup) ou use -NoSetup' }
+    if (Test-Path $setup) { Remove-Item $setup -Force }
+    & $iscc /Q "/DAppVersion=$version" "/DPayload=$stage" installer\wintop.iss
+    if ($LASTEXITCODE -ne 0) { throw 'ISCC falhou' }
+    $setupHash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText("$setup.sha256", "$setupHash  wintop-$version-setup.exe`n")
+    Write-Host "instalador: $setup"
+}
+
 # Notas da release: a seção "## [<versão>]" do CHANGELOG (sem ela, sem notas: o workflow de
 # release falha de propósito, para a versão não sair sem o que mudou).
 $notes = Join-Path $dist 'notes.md'
@@ -114,9 +134,12 @@ if ($section.Success) {
 
 ## Instalação e verificação
 
-Extraia o zip, abra um terminal como administrador na pasta extraída e rode
-``.\wintop.exe --install`` (copia para ``C:\Program Files\wintop`` e cria o atalho sem UAC no
-Menu Iniciar), ou rode ``.\wintop.exe`` direto. Requisitos no README.
+Mais simples: rode ``wintop-$version-setup.exe``. O assistente instala em
+``C:\Program Files\wintop`` com o atalho sem UAC no Menu Iniciar, instala o PawnIO (temperatura
+da CPU) se faltar e oferece o RTSS; a desinstalação fica em "Aplicativos instalados".
+
+Sem instalador: extraia o zip e rode ``.\wintop.exe`` (pergunta se instala ou roda portátil),
+ou ``.\wintop.exe --install`` num terminal como administrador. Requisitos no README.
 
 O executável não tem assinatura Authenticode: o Windows pode mostrar o aviso do SmartScreen
 ("Mais informações" > "Executar assim mesmo"; em inglês, "More info" > "Run anyway") e o UAC
@@ -126,6 +149,7 @@ Confira o download antes:
 ``````powershell
 (Get-FileHash $name.zip -Algorithm SHA256).Hash   # igual ao $name.zip.sha256
 gh attestation verify $name.zip -R Guilherme-Weber/wintop
+gh attestation verify wintop-$version-setup.exe -R Guilherme-Weber/wintop
 ``````
 "@
     [IO.File]::WriteAllText($notes, $section.Groups[1].Value.Trim() + "`n" + $verify)

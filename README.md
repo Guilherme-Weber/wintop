@@ -16,8 +16,22 @@ em [docs/spike-etapa0.md](docs/spike-etapa0.md).
 
 ## Instalação
 
-Baixe o `wintop-<versão>-windows-x64.zip` da página de
-[releases](https://github.com/Guilherme-Weber/wintop/releases), extraia e abra o `wintop.exe`.
+O caminho mais simples é o instalador: baixe o `wintop-<versão>-setup.exe` da página de
+[releases](https://github.com/Guilherme-Weber/wintop/releases) e execute. O assistente (em
+português ou inglês, conforme o Windows):
+
+- instala em `C:\Program Files\wintop` com o atalho sem UAC no Menu Iniciar (ver
+  [Atalho sem UAC](#atalho-sem-uac)); por dentro, roda o mesmo `wintop.exe --install`;
+- instala o [PawnIO](https://pawnio.eu), se ainda não estiver instalado (caixa marcada por
+  padrão: baixa o instalador oficial da versão fixada e confere o SHA-256 antes de executar);
+- oferece abrir a página de download do RTSS (caixa desmarcada; ele não pode ser
+  redistribuído) e abrir o wintop no fim.
+
+A desinstalação fica em Configurações > Aplicativos > Aplicativos instalados (equivale a
+`wintop --uninstall`; o `config.toml` do usuário é mantido). Rodar o instalador de uma versão
+nova sobre a instalada atualiza a cópia, mesmo com o wintop aberto.
+
+Sem instalador, baixe o `wintop-<versão>-windows-x64.zip`, extraia e abra o `wintop.exe`.
 Na primeira abertura, o wintop pergunta como rodar:
 
 - **Install**: copia para `C:\Program Files\wintop` e cria um atalho no Menu Iniciar que o abre
@@ -91,8 +105,9 @@ sem gatilhos) e um atalho no Menu Iniciar que dispara essa tarefa, sem a janela 
 criar a tarefa, o instalador confere que nenhum usuário sem elevação pode alterar a pasta ou o
 executável (a pasta recebe dono Administradores e uma ACL própria); caso contrário, recusa a
 instalação. Aberto pelo atalho, o wintop usa o console clássico do Windows (o Agendador de
-Tarefas não repassa para o Windows Terminal). `wintop --uninstall` remove a tarefa, o atalho e
-a cópia instalada.
+Tarefas não repassa para o Windows Terminal). `wintop --install` também registra o wintop em
+"Aplicativos instalados". `wintop --uninstall` remove a tarefa, o atalho, essa entrada e a cópia
+instalada (inclusive quando roda a partir dela).
 
 Com o atalho instalado, qualquer programa do usuário consegue abrir o wintop elevado. Por isso o
 que o wintop lê e grava na pasta do usuário (o `config.toml`) passa por verificações: links,

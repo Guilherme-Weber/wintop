@@ -90,7 +90,7 @@ pub fn run() {
             let r = if cmd == "--install" {
                 install::install()
             } else {
-                install::uninstall()
+                install::uninstall(std::env::args().any(|a| a == "--prompt"))
             };
             if let Err(e) = r {
                 eprintln!("wintop {cmd}: {e}");

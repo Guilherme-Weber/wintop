@@ -6,6 +6,17 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Adicionado
+
+- Instalador `wintop-<versão>-setup.exe` (Inno Setup, português e inglês): instala em
+  `C:\Program Files\wintop` pelo mesmo `--install` endurecido, instala o PawnIO se faltar
+  (release oficial 2.2.0, SHA-256 conferido), oferece a página do RTSS e abre o wintop no fim.
+  Gerado pelo `package.ps1` e publicado na release junto do zip, com atestado de procedência.
+- `wintop --install` registra o wintop em "Aplicativos instalados"; desinstalar ali (ou
+  `wintop --uninstall`) remove tudo, inclusive a pasta quando o comando roda a partir dela.
+- Coluna `free` na tabela de discos: espaço livre somado dos volumes do disco, em laranja
+  (cor `disk_low`, configurável em `[colors]`) abaixo de 10%; também no `--check`.
+
 ## [1.4.5] - 2026-11-27
 
 ### Adicionado

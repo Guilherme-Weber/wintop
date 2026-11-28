@@ -193,6 +193,7 @@ fn template(c: &Config) -> String {
          # UI: border, title, text, label, accent, ok, warn, neutral, fail, selected, dim.\n\
          # Graphs & bars: net_send, net_recv, fps, frametime, frametime_spike, fps_over,\n\
          #   fps_low, encode, decode, ram_in_use, ram_compressed, ram_modified, ram_standby, game,\n\
+         #   disk_low (free disk space under 10%),\n\
          #   vram_app, vram_compositor, vram_browser, vram_system, vram_kernel, low, mid, high.\n",
         c.interval_ms,
         c.theme,
