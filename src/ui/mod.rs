@@ -3,6 +3,7 @@
 //! Redesenha só quando há dado novo, tecla ou mudança de tamanho. `ratatui::init` liga o modo
 //! raw e a tela alternativa e instala um panic hook que restaura o terminal.
 
+pub mod glyphs;
 pub mod theme;
 mod view;
 mod widgets;
@@ -59,6 +60,11 @@ pub fn run(
     if stop.load(Ordering::SeqCst) {
         return Ok(Outcome::Quit);
     }
+    // Fonte do console antes de maximizar (a célula muda de tamanho) e da tela alternativa. A
+    // guarda devolve a fonte original na saída (inclusive nos retornos de erro abaixo).
+    let (symbols, _font_restore, why) = glyphs::prepare(cfg.config.graph_symbols);
+    glyphs::set(symbols);
+    crate::debug::log("ui", &format!("graph symbols: {why}"));
     // Antes da tela alternativa: o tamanho novo da janela já vale no primeiro desenho.
     if cfg.config.start_maximized {
         crate::win::maximize_classic_console();

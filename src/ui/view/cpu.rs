@@ -65,8 +65,7 @@ pub(super) fn draw_cpu(
     let sensors = st.fast.as_ref().map(|f| &f.cpu_sensors);
     let cpu_tctl = sensors
         .and_then(|r| r.as_ref().ok())
-        .and_then(|s| s.tctl.as_ref().ok())
-        .copied();
+        .and_then(|s| s.tctl.as_ref().ok().map(|t| (*t, s.limit)));
     let right = match &c.topology {
         Ok(t) => format!("{} cores · {} threads", t.cores, t.logical),
         Err(_) => format!("{per_len} threads"),
@@ -111,21 +110,36 @@ pub(super) fn draw_cpu(
     }
     match sensors {
         Some(Ok(s)) => {
-            l1.extend([sep(), label("Tctl "), temp_colored(&s.tctl, 95.0)]);
+            l1.extend([
+                sep(),
+                label(&format!("{} ", s.label)),
+                temp_colored(&s.tctl, s.limit),
+            ]);
             if let Some((_, hi)) = st.session.tctl.get() {
                 l1.push(label(&format!(" (max {})", num(hi, 1))));
             }
             match &s.ccds {
+                // Muitas zonas (um sensor por núcleo na Intel): só a mais quente aqui; todas
+                // na aba Sensores.
+                Ok(list) if list.len() > 2 => {
+                    if let Some((n, t)) = list.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+                        l1.extend([
+                            sep(),
+                            label(&format!("hottest {n} ")),
+                            temp_colored(&Ok(*t), s.limit),
+                        ]);
+                    }
+                }
                 Ok(list) => {
                     for (n, t) in list {
                         l1.extend([
                             sep(),
-                            label(&format!("CCD{n} ")),
-                            temp_colored(&Ok(*t), 95.0),
+                            label(&format!("{n} ")),
+                            temp_colored(&Ok(*t), s.limit),
                         ]);
                     }
                 }
-                Err(e) => l1.extend([sep(), label("CCD "), missing(e)]),
+                Err(e) => l1.extend([sep(), label(&format!("{} ", s.zone)), missing(e)]),
             }
             l1.extend([
                 sep(),
@@ -213,8 +227,8 @@ pub(super) fn draw_cpu(
     } else {
         (graphs, None)
     };
-    if let (Some(t_val), Some(t_area)) = (cpu_tctl, temp_area) {
-        draw_temp_bar(frame, t_area, t_val, 95.0);
+    if let (Some((t_val, limit)), Some(t_area)) = (cpu_tctl, temp_area) {
+        draw_temp_bar(frame, t_area, t_val, limit);
     }
     // Total à esquerda (~45%), divisor vertical fino e grade por lógico no resto.
     let total_w = total_width(graphs_main.width);

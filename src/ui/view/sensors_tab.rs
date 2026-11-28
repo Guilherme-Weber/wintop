@@ -67,14 +67,14 @@ pub(in crate::ui) fn sensor_rows(st: &State) -> Vec<SensorRow> {
     let cpu = "CPU";
     match &f.cpu_sensors {
         Ok(s) => {
-            out.push(temp_row(cpu, "Tctl", s.tctl.clone(), 1, 95.0));
+            out.push(temp_row(cpu, s.label, s.tctl.clone(), 1, s.limit));
             match &s.ccds {
                 Ok(list) => {
                     for (n, t) in list {
-                        out.push(temp_row(cpu, &format!("CCD{n}"), Ok(*t), 1, 95.0));
+                        out.push(temp_row(cpu, n, Ok(*t), 1, s.limit));
                     }
                 }
-                Err(e) => out.push(temp_row(cpu, "CCD", Err(e.clone()), 1, 95.0)),
+                Err(e) => out.push(temp_row(cpu, s.zone, Err(e.clone()), 1, s.limit)),
             }
             out.push(num_row(
                 cpu,

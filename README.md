@@ -108,8 +108,12 @@ redirecionamentos e caminhos que não sejam locais são recusados.
 - [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/)
   para identificar o jogo (API, resolução, tempo de GPU). Os frames vêm do ETW (DXGI), com o
   pipe do RTSS de reserva; com DLSS Frame Generation, o FPS real aparece ao lado do apresentado.
-- [PawnIO](https://pawnio.eu) para temperatura e potência de processadores AMD
-  (`winget install namazso.PawnIO`).
+- [PawnIO](https://pawnio.eu) para temperatura e potência do processador, AMD (Tctl e CCDs) ou
+  Intel (pacote e cada núcleo) (`winget install namazso.PawnIO`).
+- No console clássico (conhost) os gráficos usam braille. Se a fonte do console não tiver esses
+  caracteres (a Consolas, padrão do Windows 10), o wintop troca para uma fonte monoespaçada
+  instalada que os tenha (Cascadia Mono, DejaVu Sans Mono, etc.) e restaura a original ao sair;
+  sem nenhuma, desenha com blocos. A opção `graph_symbols` do `config.toml` fixa o modo.
 
 ## Compilação
 
@@ -142,6 +146,7 @@ $env:WINTOP_FUZZ_ITERS = 2000000; cargo test --profile fuzz --locked fuzz_
 
 ## Licença
 
-Distribuído sob a licença MIT (arquivo [LICENSE](LICENSE)). O módulo `modules/AMDFamily17.bin`
-pertence ao projeto PawnIO.Modules e é distribuído sob a LGPL-2.1, em arquivo separado
+Distribuído sob a licença MIT (arquivo [LICENSE](LICENSE)). Os módulos `modules/AMDFamily17.bin`
+e `modules/IntelMSR.bin` pertencem ao projeto PawnIO.Modules e são distribuídos sob a LGPL-2.1,
+em arquivos separados
 (detalhes em [modules/README.md](modules/README.md)).

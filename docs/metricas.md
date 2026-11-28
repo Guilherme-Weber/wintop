@@ -39,7 +39,10 @@ aberto (não impede a remoção segura). Todas as leituras de temperatura de dis
 | Virtualização | `IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED)` | | | E1 |
 | Processos, threads, handles | `GetPerformanceInfo` | | | E1 |
 | Tempo ligado | `GetTickCount64` | | | E1 |
-| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | "CPU não suportada" (não AMD ou fora de 17h-1Ah) | E2 (wintop: ±0,2 °C do Afterburner no spike) |
+| Temperatura Tctl | PawnIO + `AMDFamily17`, SMN `0x59800` (bit 19 = faixa -49 °C), mutex `Global\Access_PCI` | A | "CPU não suportada" (fabricante sem módulo ou AMD fora de 17h-1Ah) | E2 (wintop: ±0,2 °C do Afterburner no spike) |
+| Temperatura do pacote (Intel) | PawnIO + `IntelMSR`: `IA32_PACKAGE_THERM_STATUS` (`0x1B1`, bits 22:16 abaixo do TjMax), lido com a thread presa num lógico de cada pacote; principal = pacote mais quente; sem o sensor de pacote (CPUID 6, bit 6) = núcleo mais quente | A | "CPU has no digital thermal sensor" (CPUID 6, bit 0) | 1.4.5 (sem hardware Intel: parsers e afinidade testados) |
+| Temperatura por núcleo (Intel) | `IA32_THERM_STATUS` (`0x19C`, bit 31 = válido) com a thread presa no 1º lógico de cada núcleo (`SetThreadGroupAffinity`); TjMax de `MSR_TEMPERATURE_TARGET` (`0x1A2`, bits 23:16; 0 = 100 °C) lido por núcleo na abertura. Caixa da CPU: o mais quente; aba Sensores: todos | A | | 1.4.5 (idem) |
+| Potência do pacote (Intel) | RAPL: `MSR_PKG_ENERGY_STATUS` (`0x611`, 32 bits com volta) × unidade de `MSR_RAPL_POWER_UNIT` (`0x606`, bits 12:8), somada por pacote | A | | 1.4.5 (idem) |
 | Temperatura por CCD | SMN por família/modelo; validado só Zen 3 Vermeer (19h, 20h-2Fh): `0x59954 + 4·n`, bit 11 = válido | A | "não validado nesta família" | E2 (Zen 3) |
 | Potência do pacote (W) | MSR `0xC001029B` (energia, 32 bits com volta) e `0xC0010299` (unidade) | A | "CPU não suportada" | E2 (Zen 3) |
 
@@ -53,7 +56,7 @@ numa CPU real. A máquina de desenvolvimento tem só um Zen 3, então o estado a
 | Zen 3 Vermeer (19h, 20h-2Fh) | sim | sim | validado no 5700X3D |
 | Zen 2 (17h, 31h/71h) | sim (mesmos registradores de 17h-1Ah) | neutro "not validated on this CPU family" | CCD no mesmo `0x59954 + 4·n` do Zen 3 |
 | Zen 4 (19h, 60h-7Fh) e Zen 5 (1Ah) | sim | neutro | CCD em `0x59B08 + 4·n` (outra base), bit 11 = válido |
-| Intel | neutro "CPU not supported (not AMD)" | — | outro módulo do PawnIO (`IntelMSR`): `IA32_PACKAGE_THERM_STATUS` (`0x1B1`) e `IA32_THERM_STATUS` (`0x19C`) por núcleo, com o TjMax de `MSR_TEMPERATURE_TARGET` (`0x1A2`); potência pelo RAPL (`0x611` com a unidade de `0x606`) |
+| Intel (1.4.5) | pacote, cada núcleo e potência pelo módulo `IntelMSR` (ver a tabela acima) | — | primeira máquina: Xeon E5-2670 v3 (Haswell-EP) no Windows 10; conferir com o HWiNFO/LHM |
 
 Para validar uma família: rodar `cargo run --example spike_pawnio` numa CPU dela, comparar com o
 HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_support` (com teste).
@@ -79,8 +82,8 @@ HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_suppor
 | --- | --- | --- | --- | --- |
 | Fabricante e modelo | nome amigável do PnP (SetupAPI, `GUID_DEVINTERFACE_DISK` + `IOCTL_STORAGE_GET_DEVICE_NUMBER`), igual ao Task Manager; sem ele, VendorId + ProductId do `StorageDeviceProperty` | | | E2 (= Task Manager) |
 | Barramento (SATA, NVMe, Spaces) | `StorageDeviceProperty.BusType` (11, 17, 16) | | | Spike |
-| SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | | Spike |
-| Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s) | Spike |
+| SSD ou HDD | `StorageDeviceSeekPenaltyProperty` (vale também para o disco virtual) | | "n/a" (USB que não responde à consulta: pendrive, leitor de cartão, ponte USB) | Spike |
+| Capacidade (unidade binária, igual ao Task Manager) | `IOCTL_DISK_GET_LENGTH_INFO` (handle com leitura); se recusado (pendrives), `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` (`DiskSize`) e depois `IOCTL_STORAGE_READ_CAPACITY` (`DiskLength`) | A | "em repouso" (HDD parado na descoberta: não é aberto para leitura; nova tentativa a cada 60 s); "empty" (`ERROR_NOT_READY`/`ERROR_NO_MEDIA_IN_DRIVE`: leitor sem cartão) | Spike |
 | Membro de Storage Space | partição GPT "Storage Spaces protective" (`E75CAF8F-...`) por `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` | A | "em repouso" (como a capacidade) | Spike (1 pool, 5 membros) |
 | Letras das unidades | `GetLogicalDrives` (só unidades fixas e removíveis) + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` em `\\.\X:` → números dos discos; relido a cada 30 s; membros do pool não têm letra | | | E1 |
 | Disco do sistema / arquivo de paginação | letra do Windows (`GetSystemWindowsDirectoryW`) e dos pagefiles (`ExistingPageFiles` no registro) → disco pelas letras | | | E1 |
@@ -89,7 +92,7 @@ HWiNFO ou o LibreHardwareMonitor e só então acrescentar a linha em `cpu_suppor
 | Tempo médio de resposta | `IOCTL_DISK_PERFORMANCE`: Δ(`ReadTime` + `WriteTime`) / Δ(`ReadCount` + `WriteCount`) | | | E1 (= PDH) |
 | IOPS e fila | `IOCTL_DISK_PERFORMANCE`: Δ(`ReadCount` + `WriteCount`) por segundo; `QueueDepth` do instante (colunas só com tela larga; sempre no `--check`) | | | 1.1 |
 | Temperatura NVMe (e alguns SATA) | `StorageDeviceTemperatureProperty` (52), primeira entrada diferente de "não reportado"; a cada 10 s | A | | E2 (= `Get-StorageReliabilityCounter`) |
-| Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190), a cada 60 s | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido) | E2 (= `Get-StorageReliabilityCounter`; repouso real ainda não testado) |
+| Temperatura SATA | SMART por `IOCTL_STORAGE_PREDICT_FAILURE`, atributo 194 (senão 190), a cada 60 s | A | "em repouso" (HDD parado: `GetDevicePowerState` consultado antes; nada é lido); "n/a" (disco USB sem sensor nativo e com o SMART recusado antes de qualquer leitura boa; vale também para a previsão de falha) | E2 (= `Get-StorageReliabilityCounter`; repouso real ainda não testado) |
 | Temperatura do Storage Space | máximo dos membros | A | "vários pools: associação pendente"; "em repouso" (todos os membros parados) | E2 |
 | Previsão de falha (SMART) | `PredictFailure` de `IOCTL_STORAGE_PREDICT_FAILURE`, a cada 60 s, só com o disco acordado; falha prevista = aviso em vermelho | A | "not reported by the drive" (NVMe sem SMART pelo IOCTL); "see the member disks" (Storage Space) | 1.1 |
 

@@ -352,6 +352,7 @@ impl DiskTempIo for WinDiskTempIo<'_> {
 }
 
 fn read_one(d: &mut Inventory, st: &mut State, now: Instant) {
+    let usb = d.bus() == Some(crate::model::Bus::Usb);
     // Handle guardado morto (disco removido, talvez outro no mesmo número): não lê nada por
     // ele nem por um handle novo (seria o outro disco com o modelo antigo).
     // Sem handle guardado (USB), `check_alive` confere o modelo: outro disco no mesmo número.
@@ -364,6 +365,9 @@ fn read_one(d: &mut Inventory, st: &mut State, now: Instant) {
     let opened = d.with_handle(|inv, meta| {
         let mut io = WinDiskTempIo::new(inv, meta);
         read_with_io(number, &model, st, &mut io, now);
+        if usb {
+            usb_without_smart(st);
+        }
     });
     if opened.is_none() {
         st.value = fail("disk not found");
@@ -546,6 +550,22 @@ fn read_temp_io(
     (true, lost)
 }
 
+/// Pendrives, leitores de cartão e a maioria das pontes USB não têm sensor nativo nem repassam
+/// o SMART (`ERROR_INVALID_FUNCTION`): sem nenhuma leitura boa até agora, a falha vira o estado
+/// neutro "n/a" e a saúde também (a consulta volta no ritmo normal do SMART, sem as tentativas
+/// rápidas da partida). Uma ponte que já respondeu e passa a falhar continua sendo falha.
+fn usb_without_smart(st: &mut State) {
+    // Sem acesso (não elevado) continua falha: não é limitação do USB.
+    let unsupported = matches!(&st.value, Err(Missing::Fail(m)) if !m.contains("access"));
+    if st.method == Method::None && unsupported {
+        st.value = neutral("n/a");
+        st.smart_fails = 0;
+        if matches!(st.health, Err(Missing::Fail(_))) {
+            st.health = neutral("n/a");
+        }
+    }
+}
+
 /// Falha do SMART que não aparece: já houve leitura boa há menos de `SMART_GRACE` e o disco
 /// continua lá.
 fn smart_tolerated(st: &State, lost: bool, now: Instant) -> bool {
@@ -560,6 +580,29 @@ fn smart_tolerated(st: &State, lost: bool, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pendrive (BR28 UDISK no Windows 10): sem sensor nativo e com o SMART recusado
+    /// (`ERROR_INVALID_FUNCTION`) vira "n/a"; sem acesso continua falha; uma ponte que já leu
+    /// e passa a falhar também.
+    #[test]
+    fn usb_sem_smart_e_estado_neutro() {
+        let mut st = State::new();
+        st.method = Method::None;
+        st.value = fail("SMART: IOCTL 0x2D1100: error 0x1");
+        st.health = fail("x");
+        st.smart_fails = 2;
+        usb_without_smart(&mut st);
+        assert_eq!(st.value, neutral("n/a"));
+        assert_eq!(st.health, neutral("n/a"));
+        assert_eq!(st.smart_fails, 0);
+        st.value = fail("SMART: no read/write access (not elevated?)");
+        usb_without_smart(&mut st);
+        assert!(matches!(st.value, Err(Missing::Fail(_))));
+        st.method = Method::Smart;
+        st.value = fail("SMART: IOCTL 0x2D1100: error 0x1F");
+        usb_without_smart(&mut st);
+        assert!(matches!(st.value, Err(Missing::Fail(_))));
+    }
 
     #[test]
     fn smart_recusado_por_minutos_nao_vira_falha() {

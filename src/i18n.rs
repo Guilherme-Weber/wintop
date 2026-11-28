@@ -146,6 +146,11 @@ const PREFIXES: &[(&str, &str)] = &[
     ("this tab needs ", "esta aba precisa de "),
     ("; the terminal is ", "; o terminal tem "),
     ("min ", "mín "),
+    ("hottest ", "mais quente "),
+    ("Package ", "Pacote "),
+    ("Core ", "Núcleo "),
+    ("RAPL not available: ", "RAPL indisponível: "),
+    ("CPU not supported (", "CPU sem suporte ("),
     ("max ", "máx "),
     ("gpu processes", "processos da gpu"),
     ("zoom: ", "zoom: "),
@@ -359,8 +364,8 @@ const PT_BR: &[(&str, &str)] = &[
         "frametime; FPS médio dos 1% e 0,1% frames mais lentos",
     ),
     (
-        "AMD control and per-chiplet temperatures (PawnIO)",
-        "temperatura de controle e por chiplet da AMD (PawnIO)",
+        "AMD control/per-chiplet temps (Intel: Package, Core)",
+        "temp. de controle/por chiplet da AMD (Intel: Pacote, Núcleo)",
     ),
     // Estados e avisos.
     (
@@ -547,6 +552,17 @@ const PT_BR: &[(&str, &str)] = &[
         "nenhuma GPU encontrada (NVML e DXGI)",
     ),
     ("CPU not supported (not AMD)", "CPU sem suporte (não é AMD)"),
+    (
+        "CPU has no digital thermal sensor",
+        "CPU sem sensor térmico digital",
+    ),
+    ("no valid core sensor", "nenhum sensor de núcleo válido"),
+    (
+        "no valid temperature sensor",
+        "nenhum sensor de temperatura válido",
+    ),
+    ("n/a", "n/d"),
+    ("empty", "vazio"),
     (
         "not validated on this CPU family",
         "não validado nesta família de CPU",

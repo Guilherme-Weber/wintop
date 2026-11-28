@@ -366,15 +366,40 @@ pub struct VramBreakdown {
     pub processes: Vec<VramProc>,
 }
 
-/// Sensores da CPU pelo PawnIO.
+/// Sensores da CPU pelo PawnIO (AMD: `AMDFamily17`; Intel: `IntelMSR`).
 #[derive(Clone, Debug)]
 pub struct CpuSensors {
-    /// °C.
+    /// Nome da leitura principal: "Tctl" (AMD) ou "Package" (Intel).
+    pub label: &'static str,
+    /// Nome das zonas quando falham: "CCD" (AMD) ou "Core" (Intel).
+    pub zone: &'static str,
+    /// Limite térmico para as cores e o termômetro (95 °C na AMD; TjMax na Intel).
+    pub limit: f64,
+    /// Leitura principal em °C (Tctl na AMD; maior pacote na Intel).
     pub tctl: Metric<f64>,
-    /// (número do CCD a partir de 1, °C).
-    pub ccds: Metric<Vec<(u32, f64)>>,
+    /// (nome, °C) por zona: "CCD1".. na AMD, "Core 0".. (e "Package n" com vários soquetes) na
+    /// Intel.
+    pub ccds: Metric<Vec<(String, f64)>>,
     /// Watts.
     pub package_power: Metric<f64>,
+}
+
+impl CpuSensors {
+    /// Sensores da AMD (Tctl e CCDs; limite de 95 °C).
+    pub fn amd(
+        tctl: Metric<f64>,
+        ccds: Metric<Vec<(String, f64)>>,
+        package_power: Metric<f64>,
+    ) -> Self {
+        Self {
+            label: "Tctl",
+            zone: "CCD",
+            limit: 95.0,
+            tctl,
+            ccds,
+            package_power,
+        }
+    }
 }
 
 /// Temperatura de um disco (thread lenta).

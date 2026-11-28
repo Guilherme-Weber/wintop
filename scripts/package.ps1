@@ -46,11 +46,15 @@ $env:__COMPAT_LAYER = 'RunAsInvoker'
 try { $reported = & $exe --version } finally { Remove-Item Env:__COMPAT_LAYER }
 if ($reported -ne "wintop $version") { throw "o executável diz '$reported', o Cargo.toml diz $version" }
 
-# O módulo distribuído tem de ser o documentado (binário oficial e assinado, sem modificações).
-$doc = Select-String -Path modules\README.md -Pattern 'SHA-256 do binário: `([0-9a-f]{64})`'
-$expected = $doc.Matches[0].Groups[1].Value
-$actual = (Get-FileHash modules\AMDFamily17.bin -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actual -ne $expected) { throw "AMDFamily17.bin com SHA-256 $actual (documentado: $expected)" }
+# Os módulos distribuídos têm de ser os documentados (binários oficiais e assinados, sem
+# modificações).
+foreach ($mod in 'AMDFamily17.bin', 'IntelMSR.bin') {
+    $doc = Select-String -Path modules\README.md -Pattern ('SHA-256 de `' + [regex]::Escape($mod) + '`: `([0-9a-f]{64})`')
+    if (-not $doc) { throw "modules\README.md sem o SHA-256 de $mod" }
+    $expected = $doc.Matches[0].Groups[1].Value
+    $actual = (Get-FileHash (Join-Path modules $mod) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) { throw "$mod com SHA-256 $actual (documentado: $expected)" }
+}
 
 $name = "wintop-$version-windows-x64"
 $dist = Join-Path $root 'dist'

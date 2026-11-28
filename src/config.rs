@@ -91,6 +91,8 @@ pub struct Config {
     pub mouse: bool,
     /// Maximizar a janela do console clássico ao abrir (o atalho abre o conhost com 120x30).
     pub start_maximized: bool,
+    /// Símbolos dos gráficos: braille, blocos ou automático pela fonte do console (na abertura).
+    pub graph_symbols: crate::ui::glyphs::Symbols,
     /// Idioma da interface (en-US padrão; pt-BR).
     pub language: crate::i18n::Lang,
     /// Procurar versão nova no GitHub ao abrir (e oferecer a atualização).
@@ -119,6 +121,7 @@ impl Default for Config {
             net_bytes: false,
             mouse: true,
             start_maximized: true,
+            graph_symbols: crate::ui::glyphs::Symbols::Auto,
             language: crate::i18n::Lang::EnUs,
             check_updates: true,
             debug: false,
@@ -163,6 +166,13 @@ fn template(c: &Config) -> String {
          # 120x30). The Windows Terminal is not touched.\n\
          start_maximized = {}\n\
          \n\
+         # Graph and bar symbols: \"braille\" (like btop), \"block\", or \"auto\": braille when the\n\
+         # console font has it; in the classic console without it (Consolas, the Windows 10\n\
+         # default) wintop switches to an installed monospace font with braille (Cascadia Mono,\n\
+         # DejaVu Sans Mono, ...) and restores the original on exit, or draws with blocks if\n\
+         # there is none. Applies when wintop opens.\n\
+         graph_symbols = \"{}\"\n\
+         \n\
          # Interface language: \"en-US\" (default) or \"pt-BR\" (Brazilian Portuguese).\n\
          language = \"{}\"\n\
          \n\
@@ -192,6 +202,7 @@ fn template(c: &Config) -> String {
         if c.net_bytes { "bytes" } else { "bits" },
         c.mouse,
         c.start_maximized,
+        c.graph_symbols.name(),
         c.language.code(),
         c.check_updates,
         c.debug,
@@ -406,6 +417,12 @@ fn from_doc(doc: &DocumentMut, warn: &mut Vec<String>) -> Config {
             Some("bits") => c.net_bytes = false,
             Some("bytes") => c.net_bytes = true,
             _ => warn.push("config: net_unit must be bits or bytes".into()),
+        }
+    }
+    if let Some(v) = doc.get("graph_symbols") {
+        match v.as_str().and_then(crate::ui::glyphs::Symbols::from_name) {
+            Some(s) => c.graph_symbols = s,
+            None => warn.push("config: graph_symbols must be auto, braille or block".into()),
         }
     }
     if let Some(v) = doc.get("language") {

@@ -49,7 +49,7 @@ fn main() {
 /// `target\<perfil>\modules\`, o mesmo layout da instalação (`<pasta do exe>\modules\`): o
 /// executável elevado nunca procura o módulo num caminho gravado na compilação.
 fn copy_module() {
-    const FILES: [&str; 2] = ["AMDFamily17.bin", "COPYING-LGPL-2.1"];
+    const FILES: [&str; 3] = ["AMDFamily17.bin", "IntelMSR.bin", "COPYING-LGPL-2.1"];
     for f in FILES {
         println!("cargo:rerun-if-changed=modules/{f}");
     }

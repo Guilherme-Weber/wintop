@@ -63,6 +63,57 @@ pub fn darker(c: Color) -> Color {
 const LEFT: [u8; 4] = [0x40, 0x04, 0x02, 0x01];
 const RIGHT: [u8; 4] = [0x80, 0x20, 0x10, 0x08];
 
+use super::glyphs::{self, Glyphs};
+
+/// Níveis por linha de cada conjunto de símbolos.
+fn levels(g: Glyphs) -> usize {
+    match g {
+        Glyphs::Braille => 4,
+        Glyphs::Eighths => 8,
+        Glyphs::Halves => 2,
+    }
+}
+
+/// Oitavos de baixo para cima.
+const LOWER8: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Bloco com `fill` níveis (1..=levels) acesos; `invert` cresce de cima para baixo (só há ▔, ▀ e
+/// █ entre os blocos de cima).
+fn block_char(g: Glyphs, fill: usize, invert: bool) -> char {
+    match (g, invert) {
+        (Glyphs::Halves | Glyphs::Braille, false) => {
+            if fill >= 2 {
+                '█'
+            } else {
+                '▄'
+            }
+        }
+        (Glyphs::Halves | Glyphs::Braille, true) => {
+            if fill >= 2 {
+                '█'
+            } else {
+                '▀'
+            }
+        }
+        (Glyphs::Eighths, false) => LOWER8[fill.min(8)],
+        (Glyphs::Eighths, true) => match fill {
+            0..=3 => '▔',
+            4..=7 => '▀',
+            _ => '█',
+        },
+    }
+}
+
+/// Linha de base (amostra zerada) em modo bloco: `_`/`¯` existem em toda fonte de console.
+fn baseline_char(g: Glyphs, invert: bool) -> char {
+    match (g, invert) {
+        (Glyphs::Eighths, false) => '▁',
+        (Glyphs::Eighths, true) => '▔',
+        (_, false) => '_',
+        (_, true) => '¯',
+    }
+}
+
 /// Como colorir o gráfico.
 #[derive(Clone, Copy)]
 pub enum GraphColor {
@@ -152,7 +203,10 @@ impl Widget for Graph<'_> {
         }
         let w = usize::from(area.width);
         let h = usize::from(area.height);
-        let max = h * 4;
+        let g = glyphs::get();
+        let braille = g == Glyphs::Braille;
+        let lv = levels(g);
+        let max = h * lv;
         let norm = |v: f64| -> f64 {
             if self.scale == 1.0 {
                 v
@@ -197,8 +251,15 @@ impl Widget for Graph<'_> {
         }
         for col in 0..w {
             let (sl, sr) = (sample(col * 2), sample(col * 2 + 1));
-            let (l, r) = (dots(sl, max), dots(sr, max));
             let peak = sl.max(sr);
+            // Em blocos a célula tem uma coluna só: a maior das duas amostras (a mesma janela de
+            // tempo do braille, sem perder picos).
+            let (l, r) = if braille {
+                (dots(sl, max), dots(sr, max))
+            } else {
+                let n = dots(peak, max);
+                (n, n)
+            };
             let col_color = match self.color {
                 GraphColor::Height if h > 1 => Color::Reset,
                 GraphColor::Height | GraphColor::Value => {
@@ -233,42 +294,25 @@ impl Widget for Graph<'_> {
             let k = under_dots(col * 2).min(under_dots(col * 2 + 1));
             for row in 0..h {
                 // Linha 0 = a da base (a de baixo; a de cima se invertido).
-                let base = row * 4;
-                let mut bits = 0u8;
-                for d in 0..4 {
-                    // Invertido, os pontos de cada célula também enchem de cima para baixo.
-                    let (lb, rb) = if self.invert {
-                        (LEFT[3 - d], RIGHT[3 - d])
+                let base = row * lv;
+                let block = (!braille).then(|| {
+                    let fill = l.saturating_sub(base).min(lv);
+                    if fill > 0 {
+                        Some((block_char(g, fill, self.invert), false))
+                    } else if row == 0 && self.baseline.is_some() {
+                        Some((baseline_char(g, self.invert), true))
                     } else {
-                        (LEFT[d], RIGHT[d])
-                    };
-                    if l > base + d {
-                        bits |= lb;
+                        None
                     }
-                    if r > base + d {
-                        bits |= rb;
-                    }
-                }
-                // Base das amostras zeradas (só a 1ª linha de pontos, na cor da base).
-                let mut base_only = false;
-                if row == 0 && self.baseline.is_some() {
-                    let (lb, rb) = if self.invert {
-                        (LEFT[3], RIGHT[3])
-                    } else {
-                        (LEFT[0], RIGHT[0])
-                    };
-                    base_only = bits == 0;
-                    if l == 0 {
-                        bits |= lb;
-                    }
-                    if r == 0 {
-                        bits |= rb;
-                    }
-                }
-                if bits == 0 {
-                    continue;
-                }
-                let ch = char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ');
+                });
+                let (ch, base_only) = match block {
+                    Some(Some(b)) => b,
+                    Some(None) => continue,
+                    None => match braille_cell(l, r, base, row, self.invert, self.baseline) {
+                        Some(b) => b,
+                        None => continue,
+                    },
+                };
                 let color = if matches!(self.color, GraphColor::Height) && h > 1 {
                     if row < row_colors.len() {
                         row_colors[row]
@@ -282,7 +326,11 @@ impl Widget for Graph<'_> {
                 };
                 // Pelo menos metade da célula na parte de kernel: o mesmo tom, mais escuro (com a
                 // célula inteira, kernel baixo nunca apareceria na grade por núcleo).
-                let color = if k >= base + 2 { darker(color) } else { color };
+                let color = if k >= base + lv / 2 {
+                    darker(color)
+                } else {
+                    color
+                };
                 let color = match self.baseline {
                     Some(b) if base_only => b,
                     _ => color,
@@ -296,10 +344,62 @@ impl Widget for Graph<'_> {
     }
 }
 
+/// Célula de braille da linha `row` (pontos de `base` a `base + 3`): o caractere e se ele só
+/// tem a linha de base. `None` = célula vazia.
+fn braille_cell(
+    l: usize,
+    r: usize,
+    base: usize,
+    row: usize,
+    invert: bool,
+    baseline: Option<Color>,
+) -> Option<(char, bool)> {
+    let mut bits = 0u8;
+    for d in 0..4 {
+        // Invertido, os pontos de cada célula também enchem de cima para baixo.
+        let (lb, rb) = if invert {
+            (LEFT[3 - d], RIGHT[3 - d])
+        } else {
+            (LEFT[d], RIGHT[d])
+        };
+        if l > base + d {
+            bits |= lb;
+        }
+        if r > base + d {
+            bits |= rb;
+        }
+    }
+    // Base das amostras zeradas (só a 1ª linha de pontos, na cor da base).
+    let mut base_only = false;
+    if row == 0 && baseline.is_some() {
+        let (lb, rb) = if invert {
+            (LEFT[3], RIGHT[3])
+        } else {
+            (LEFT[0], RIGHT[0])
+        };
+        base_only = bits == 0;
+        if l == 0 {
+            bits |= lb;
+        }
+        if r == 0 {
+            bits |= rb;
+        }
+    }
+    (bits != 0).then(|| {
+        (
+            char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' '),
+            base_only,
+        )
+    })
+}
+
 /// Glifo da trilha apagada de medidores: em temas coloridos usa `⣿` em `dim` (estilo btop);
 /// sob `NO_COLOR` ou tema `mono`, usa `⣀` para manter contraste visual sem depender de cor.
 fn empty_track_glyph() -> &'static str {
-    if crate::ui::theme::no_color() || crate::ui::theme::th().name == "mono" {
+    if glyphs::get() != Glyphs::Braille {
+        // Em blocos: sombra leve (WGL4), que se distingue do cheio mesmo sem cor.
+        "░"
+    } else if crate::ui::theme::no_color() || crate::ui::theme::th().name == "mono" {
         "⣀"
     } else {
         "⣿"
@@ -335,16 +435,21 @@ impl Widget for Meter {
         let empty = empty_track_glyph();
         let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
         let denom = w.max(2).saturating_sub(1) as f64;
+        let (half, full) = if glyphs::get() == Glyphs::Braille {
+            ("⡇", "⣿")
+        } else {
+            ("▌", "█")
+        };
         for i in 0..w {
             let fill = steps.saturating_sub(i * 2).min(2);
             let (sym, style) = match fill {
                 0 => (empty, Style::new().fg(dim)),
                 1 => (
-                    "⡇",
+                    half,
                     Style::new().fg(gradient_rgb(i as f64 / denom, low, mid, high)),
                 ),
                 _ => (
-                    "⣿",
+                    full,
                     Style::new().fg(gradient_rgb(i as f64 / denom, low, mid, high)),
                 ),
             };
@@ -545,8 +650,11 @@ impl Widget for VerticalBar {
         } else {
             0.0
         };
-        // Resolução de 4 fileiras de pontos braille por linha; qualquer valor > 0 acende a base.
-        let max_steps = h * 4;
+        // Resolução de 4 fileiras de pontos braille por linha (8 ou 2 em blocos); qualquer valor
+        // > 0 acende a base.
+        let g = glyphs::get();
+        let lv = levels(g);
+        let max_steps = h * lv;
         let steps = if v <= 0.0 {
             0
         } else {
@@ -558,18 +666,24 @@ impl Widget for VerticalBar {
         let (low, mid, high) = (rgb_f64(t3.low), rgb_f64(t3.mid), rgb_f64(t3.high));
         for row in 0..h {
             // `row` = 0 na base, `h - 1` no topo.
-            let base = row * 4;
-            let fill = steps.saturating_sub(base).min(4);
+            let base = row * lv;
+            let fill = steps.saturating_sub(base).min(lv);
             let t = if h > 1 {
                 row as f64 / (h - 1) as f64
             } else {
                 v
             };
+            let mut tmp = [0u8; 4];
             let (sym, style) = if fill == 0 {
                 (empty, Style::new().fg(dim))
-            } else {
+            } else if g == Glyphs::Braille {
                 (
                     VBRAILLE[fill],
+                    Style::new().fg(gradient_rgb(t, low, mid, high)),
+                )
+            } else {
+                (
+                    &*block_char(g, fill, false).encode_utf8(&mut tmp),
                     Style::new().fg(gradient_rgb(t, low, mid, high)),
                 )
             };
@@ -591,6 +705,11 @@ impl Widget for Segmented<'_> {
         }
         let dim = crate::ui::theme::th().dim;
         let empty = empty_track_glyph();
+        let full = if glyphs::get() == Glyphs::Braille {
+            "⣿"
+        } else {
+            "█"
+        };
         for i in 0..w {
             // Meio da célula, em bytes.
             let mid = ((i as f64 + 0.5) / w as f64) * self.total as f64;
@@ -606,10 +725,65 @@ impl Widget for Segmented<'_> {
                 }
             }
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y)) {
-                let sym = if filled { "⣿" } else { empty };
+                let sym = if filled { full } else { empty };
                 cell.set_symbol(sym).set_style(Style::new().fg(color));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// Fonte sem braille (Consolas): gráfico, medidor, barra vertical e segmentada só com os
+    /// blocos do WGL4; o gráfico junta as duas amostras da célula pelo máximo.
+    #[test]
+    fn modo_meio_bloco() {
+        glyphs::set(Glyphs::Halves);
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[0.0, 1.0, 0.3, 0.0], GraphColor::Fixed(Color::Red)).render(area, &mut buf);
+        assert_eq!(buf[(0, 1)].symbol(), "█");
+        assert_eq!(buf[(0, 0)].symbol(), "█");
+        assert_eq!(buf[(1, 1)].symbol(), "▄");
+        assert_eq!(buf[(1, 0)].symbol(), " ");
+        // Linha de base nas amostras zeradas; invertido, cresce de cima.
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[0.0, 0.0, 0.2, 0.2], GraphColor::Fixed(Color::Red))
+            .with_baseline(Color::Blue)
+            .inverted()
+            .render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "¯");
+        assert_eq!(buf[(0, 0)].fg, Color::Blue);
+        assert_eq!(buf[(1, 0)].symbol(), "▀");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        Meter { value: 0.375 }.render(Rect::new(0, 0, 4, 1), &mut buf);
+        let row: String = (0..4).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "█▌░░");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 2));
+        VerticalBar { value: 0.25 }.render(Rect::new(0, 0, 1, 2), &mut buf);
+        assert_eq!(buf[(0, 1)].symbol(), "▄");
+        assert_eq!(buf[(0, 0)].symbol(), "░");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        Segmented {
+            parts: &[(1, Color::Red)],
+            total: 2,
+        }
+        .render(Rect::new(0, 0, 2, 1), &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "█");
+        assert_eq!(buf[(1, 0)].symbol(), "░");
+        glyphs::set(Glyphs::Braille);
+    }
+
+    #[test]
+    fn modo_oitavos() {
+        glyphs::set(Glyphs::Eighths);
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+        Graph::new(&[0.5, 0.25], GraphColor::Fixed(Color::Red)).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "▄");
+        glyphs::set(Glyphs::Braille);
     }
 }
 

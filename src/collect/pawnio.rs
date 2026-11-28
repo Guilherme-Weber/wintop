@@ -1,9 +1,14 @@
-//! Sensores da CPU AMD pelo PawnIO + módulo `AMDFamily17` (LGPL-2.1, arquivo separado em
-//! `modules/`): Tctl, temperatura por CCD e potência do pacote.
+//! Sensores da CPU pelo PawnIO, com os módulos oficiais do PawnIO.Modules (LGPL-2.1, arquivos
+//! separados em `modules/`):
 //!
-//! Registradores conforme o AMD PPR (mesma lógica do LibreHardwareMonitor), validados no Zen 3
-//! (5700X3D) na Etapa 0. `PawnIOLib.dll` por caminho absoluto (`InstallLocation` do registro);
-//! o módulo vem de `<pasta do exe>\modules\` (o `build.rs` copia para lá na compilação).
+//! - AMD (`AMDFamily17`): Tctl, temperatura por CCD e potência do pacote. Registradores conforme
+//!   o AMD PPR (mesma lógica do LibreHardwareMonitor), validados no Zen 3 (5700X3D) na Etapa 0.
+//! - Intel (`IntelMSR`): temperatura do pacote (`IA32_PACKAGE_THERM_STATUS`) e de cada núcleo
+//!   (`IA32_THERM_STATUS`, lido com a thread presa no núcleo) a partir do TjMax
+//!   (`MSR_TEMPERATURE_TARGET`), e potência do pacote pelo RAPL (Intel SDM vol. 4).
+//!
+//! `PawnIOLib.dll` por caminho absoluto (`InstallLocation` do registro); o módulo vem de
+//! `<pasta do exe>\modules\` (o `build.rs` copia para lá na compilação).
 
 use std::ffi::CStr;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
@@ -17,13 +22,15 @@ use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
+use windows::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows::Win32::System::Threading::{
-    CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
-    SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    CreateMutexW, GetCurrentThread, MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex,
+    SYNCHRONIZATION_ACCESS_RIGHTS, SYNCHRONIZATION_SYNCHRONIZE, SetThreadGroupAffinity,
+    WaitForSingleObject,
 };
 use windows::core::{HRESULT, PCSTR, PCWSTR, w};
 
-use crate::model::{CpuSensors, Metric, Missing, fail, neutral};
+use crate::model::{CpuSensors, Metric, fail, neutral};
 use crate::win::{SecurityDescriptor, own, wide};
 
 type FnOpen = unsafe extern "system" fn(*mut HANDLE) -> HRESULT;
@@ -42,7 +49,16 @@ type FnClose = unsafe extern "system" fn(HANDLE) -> HRESULT;
 const SMN_THM_TCON_CUR_TMP: u32 = 0x0005_9800;
 const MSR_PWR_UNIT: u64 = 0xC001_0299;
 const MSR_PKG_ENERGY_STAT: u64 = 0xC001_029B;
-const MODULE: &str = "AMDFamily17.bin";
+const AMD_MODULE: &str = "AMDFamily17.bin";
+
+const INTEL_MODULE: &str = "IntelMSR.bin";
+const IA32_THERM_STATUS: u64 = 0x19C;
+const MSR_TEMPERATURE_TARGET: u64 = 0x1A2;
+const IA32_PACKAGE_THERM_STATUS: u64 = 0x1B1;
+const MSR_RAPL_POWER_UNIT: u64 = 0x606;
+const MSR_PKG_ENERGY_STATUS: u64 = 0x611;
+/// TjMax quando o `MSR_TEMPERATURE_TARGET` não informa (mesmo padrão do LibreHardwareMonitor).
+const TJMAX_DEFAULT: f64 = 100.0;
 /// Espera máxima pelo mutex `Access_PCI` (outro monitor lendo o SMN).
 const PCI_WAIT_MS: u32 = 100;
 
@@ -79,6 +95,149 @@ fn tctl_from_raw(raw: u32) -> f64 {
 /// CCD: bit 11 = válido; bits 10:0 em passos de 0,125 °C a partir de -49 °C.
 fn ccd_from_raw(raw: u32) -> Option<f64> {
     (raw & (1 << 11) != 0).then(|| f64::from(raw & 0x7FF) * 0.125 - 49.0)
+}
+
+/// TjMax em °C: bits 23:16 do `MSR_TEMPERATURE_TARGET` (zero = não informado).
+fn tjmax_from_raw(raw: u64) -> f64 {
+    match (raw >> 16) & 0xFF {
+        0 => TJMAX_DEFAULT,
+        t => t as f64,
+    }
+}
+
+/// Temperatura de `IA32_THERM_STATUS`/`IA32_PACKAGE_THERM_STATUS`: bits 22:16 = graus abaixo
+/// do TjMax. No do núcleo, o bit 31 diz se a leitura é válida (o do pacote não tem esse bit).
+fn intel_temp(raw: u64, tjmax: f64, needs_valid: bool) -> Option<f64> {
+    (!needs_valid || raw & (1 << 31) != 0).then_some(tjmax - ((raw >> 16) & 0x7F) as f64)
+}
+
+/// Joules por contagem do RAPL e da AMD: bits 12:8 da unidade de energia (1 / 2^ESU).
+fn joules_per_count(unit: u64) -> f64 {
+    1.0 / f64::from(1u32 << ((unit >> 8) & 0x1F))
+}
+
+/// Sensores térmicos do CPUID 6 (EAX bit 0 = DTS por núcleo, bit 6 = sensor do pacote).
+fn intel_thermal_features() -> (bool, bool) {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(0).eax < 6 {
+        return (false, false);
+    }
+    let eax = __cpuid(6).eax;
+    (eax & 1 != 0, eax & (1 << 6) != 0)
+}
+
+/// Um lógico para prender a thread: grupo e máscara de um único bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pin {
+    group: u16,
+    mask: u64,
+}
+
+/// Núcleos e pacotes físicos (um lógico de cada) pelos registros
+/// `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`: `GroupCount` u16 em +30 e `GROUP_AFFINITY` (máscara
+/// u64, grupo u16) de 16 bytes a partir de +32. O primeiro bit da primeira máscara representa o
+/// núcleo (os irmãos SMT leem o mesmo sensor).
+fn parse_pins(b: &[u8]) -> (Vec<Pin>, Vec<Pin>) {
+    const CORE: u32 = 0;
+    const PACKAGE: u32 = 3;
+    let (mut cores, mut packages) = (Vec::new(), Vec::new());
+    let u32_at = |o: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            b.get(o..o.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let mut off = 0usize;
+    while let (Some(rel), Some(size)) = (u32_at(off), u32_at(off.saturating_add(4))) {
+        let size = size as usize;
+        let Some(end) = off.checked_add(size).filter(|&e| size >= 8 && e <= b.len()) else {
+            break;
+        };
+        let rec = &b[off..end];
+        if rel == CORE || rel == PACKAGE {
+            let first = || -> Option<Pin> {
+                let groups = u16::from_le_bytes(rec.get(30..32)?.try_into().ok()?);
+                if groups == 0 {
+                    return None;
+                }
+                let mask = u64::from_le_bytes(rec.get(32..40)?.try_into().ok()?);
+                let group = u16::from_le_bytes(rec.get(40..42)?.try_into().ok()?);
+                (mask != 0).then(|| Pin {
+                    group,
+                    mask: 1 << mask.trailing_zeros(),
+                })
+            };
+            if let Some(p) = first() {
+                if rel == CORE {
+                    cores.push(p);
+                } else {
+                    packages.push(p);
+                }
+            }
+        }
+        off = end;
+    }
+    (cores, packages)
+}
+
+/// Núcleos e pacotes pela topologia do Windows (buffer alinhado em 8).
+fn processor_pins() -> Result<(Vec<Pin>, Vec<Pin>), String> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationAll,
+    };
+    let mut len = 0u32;
+    // SAFETY: primeira chamada só mede o buffer.
+    let _ = unsafe { GetLogicalProcessorInformationEx(RelationAll, None, &raw mut len) };
+    if len == 0 {
+        return Err("GetLogicalProcessorInformationEx returned no data".into());
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: buffer alinhado de pelo menos `len` bytes.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationAll, Some(buf.as_mut_ptr().cast()), &raw mut len)
+    }
+    .map_err(|e| format!("GetLogicalProcessorInformationEx: {e}"))?;
+    // SAFETY: Vec<u64> visto como bytes, dentro do tamanho alocado.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), (len as usize).min(buf.len() * 8))
+    };
+    let (cores, packages) = parse_pins(bytes);
+    if cores.is_empty() || packages.is_empty() {
+        return Err("processor topology has no cores".into());
+    }
+    Ok((cores, packages))
+}
+
+/// Afinidade da thread trocada para um lógico; a original volta no Drop. O MSR é lido no
+/// processador em que a chamada ao driver roda: cada núcleo exige a thread nele.
+struct Pinned {
+    previous: GROUP_AFFINITY,
+}
+
+impl Pinned {
+    fn to(p: Pin) -> Result<Self, String> {
+        let ga = GROUP_AFFINITY {
+            Mask: p.mask as usize,
+            Group: p.group,
+            Reserved: [0; 3],
+        };
+        let mut previous = GROUP_AFFINITY::default();
+        // SAFETY: pseudo-handle da própria thread; estruturas locais.
+        unsafe {
+            SetThreadGroupAffinity(GetCurrentThread(), &raw const ga, Some(&raw mut previous))
+        }
+        .ok()
+        .map_err(|e| format!("thread affinity (group {}): {e}", p.group))?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: devolve a afinidade lida na troca.
+        unsafe {
+            let _ = SetThreadGroupAffinity(GetCurrentThread(), &raw const self.previous, None);
+        }
+    }
 }
 
 /// (fabricante, família, modelo) pelo CPUID.
@@ -124,7 +283,8 @@ unsafe impl Send for Executor {}
 
 struct PawnIo {
     exec_fn: FnExec,
-    pci_mutex: OwnedHandle,
+    /// `Global\Access_PCI` (só para o SMN da AMD).
+    pci_mutex: Option<OwnedHandle>,
     executor: Executor,
     /// Por último: a DLL só é liberada depois do `pawnio_close` do executor.
     _lib: Library,
@@ -159,7 +319,8 @@ impl Drop for PciLock<'_> {
 }
 
 impl PawnIo {
-    fn open(module: &[u8]) -> Result<Self, String> {
+    /// `name`: nome do módulo para as mensagens; `pci`: abrir o mutex `Access_PCI` (SMN).
+    fn open(module: &[u8], name: &str, pci: bool) -> Result<Self, String> {
         let dll = install_dir()?.join("PawnIOLib.dll");
         // Carregada no processo elevado: só de uma pasta que ninguém sem elevação altera (um
         // PawnIO instalado numa pasta do usuário viraria código do usuário rodando elevado).
@@ -200,10 +361,10 @@ impl PawnIo {
         // SAFETY: `module` vive durante a chamada; o driver copia o blob.
         unsafe { load(executor.handle, module.as_ptr(), module.len()) }
             .ok()
-            .map_err(|e| format!("pawnio_load(AMDFamily17): {e}"))?;
+            .map_err(|e| format!("pawnio_load({name}): {e}"))?;
         Ok(Self {
             exec_fn,
-            pci_mutex: open_pci_mutex()?,
+            pci_mutex: if pci { Some(open_pci_mutex()?) } else { None },
             executor,
             _lib: library,
         })
@@ -238,10 +399,14 @@ impl PawnIo {
     /// Mutex global que os monitores (HWiNFO, LHM, ...) usam para não intercalar os acessos de
     /// índice/dado do SMN.
     fn lock(&self) -> Result<PciLock<'_>, String> {
+        let mutex = self
+            .pci_mutex
+            .as_ref()
+            .ok_or("Access_PCI mutex not opened")?;
         // SAFETY: handle de mutex válido.
-        let w = unsafe { WaitForSingleObject(HANDLE(self.pci_mutex.as_raw_handle()), PCI_WAIT_MS) };
+        let w = unsafe { WaitForSingleObject(HANDLE(mutex.as_raw_handle()), PCI_WAIT_MS) };
         if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
-            Ok(PciLock(&self.pci_mutex))
+            Ok(PciLock(mutex))
         } else if w == WAIT_FAILED {
             Err(format!(
                 "Access_PCI: {}",
@@ -334,10 +499,10 @@ fn install_dir() -> Result<PathBuf, String> {
 /// Caminho do módulo: `<pasta do exe>\modules\` (o `build.rs` copia para `target\<perfil>`).
 /// Só nos testes (o executável de teste fica na pasta de build do Cargo) vale também a pasta
 /// `modules\` do repositório; o binário distribuído nunca procura fora da própria pasta.
-fn module_path() -> Result<PathBuf, String> {
+fn module_path(module: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = exe.parent().ok_or("executable has no folder")?;
-    let primary = dir.join("modules").join(MODULE);
+    let primary = dir.join("modules").join(module);
     if primary.is_file() {
         return Ok(primary);
     }
@@ -345,18 +510,18 @@ fn module_path() -> Result<PathBuf, String> {
     {
         let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("modules")
-            .join(MODULE);
+            .join(module);
         if dev.is_file() {
             return Ok(dev);
         }
     }
     Err(format!(
-        "{MODULE} not found in {}",
+        "{module} not found in {} (reinstall wintop from the full zip)",
         dir.join("modules").display()
     ))
 }
 
-/// Teto para `AMDFamily17.bin` (o módulo real tem ~10 KB).
+/// Teto para os módulos (os reais têm ~10 KB).
 const MAX_MODULE_BYTES: u64 = 16 << 20;
 
 /// Lê um módulo do PawnIO pelo handle sem seguir reparse points, hardlinks, pipes ou UNC, com
@@ -424,16 +589,32 @@ fn read_module_safe(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Núcleos e pacotes da Intel, com o TjMax de cada um (lido na abertura).
+struct IntelTopo {
+    /// (lógico do núcleo, TjMax).
+    cores: Vec<(Pin, f64)>,
+    /// (lógico do pacote, TjMax).
+    packages: Vec<(Pin, f64)>,
+    /// `IA32_PACKAGE_THERM_STATUS` existe (CPUID 6, bit 6).
+    package_sensor: bool,
+}
+
+enum Kind {
+    Amd(CpuSupport),
+    Intel(IntelTopo),
+}
+
 enum State {
-    /// CPU fora do módulo (estado neutro).
+    /// CPU fora dos módulos (estado neutro).
     Unsupported(String),
     Failed(String),
     Ready {
         pio: Box<PawnIo>,
-        support: CpuSupport,
-        joules_per_count: f64,
-        /// (instante, contador de energia de 32 bits) da leitura anterior.
-        last_energy: Option<(Instant, u32)>,
+        kind: Kind,
+        /// Joules por contagem do contador de energia; `Err` = sem contador (causa).
+        joules_per_count: Result<f64, String>,
+        /// (instante, contador de energia de 32 bits) da leitura anterior, por pacote.
+        last_energy: Vec<Option<(Instant, u32)>>,
     },
 }
 
@@ -444,103 +625,240 @@ pub struct PawnIoCollector {
 impl PawnIoCollector {
     pub fn new() -> Self {
         let (vendor, family, model) = cpu_id();
-        if vendor != "AuthenticAMD" {
-            return Self {
-                state: State::Unsupported("CPU not supported (not AMD)".into()),
-            };
-        }
-        let Some(support) = cpu_support(family, model) else {
-            return Self {
-                state: State::Unsupported(format!(
+        let state = match vendor.as_str() {
+            "AuthenticAMD" => match cpu_support(family, model) {
+                Some(support) => Self::open_amd(support).unwrap_or_else(State::Failed),
+                None => State::Unsupported(format!(
                     "CPU not supported (family {family:#x} outside 17h-1Ah)"
                 )),
-            };
-        };
-        let state = match Self::open(support) {
-            Ok(s) => s,
-            Err(e) => State::Failed(e),
+            },
+            "GenuineIntel" => match intel_thermal_features() {
+                (false, _) => State::Unsupported("CPU has no digital thermal sensor".into()),
+                (true, package_sensor) => {
+                    Self::open_intel(package_sensor).unwrap_or_else(State::Failed)
+                }
+            },
+            other => State::Unsupported(format!("CPU not supported ({})", other.trim())),
         };
         Self { state }
     }
 
-    fn open(support: CpuSupport) -> Result<State, String> {
-        let path = module_path()?;
-        let module = read_module_safe(&path)?;
-        let pio = PawnIo::open(&module)?;
+    fn open_amd(support: CpuSupport) -> Result<State, String> {
+        let module = read_module_safe(&module_path(AMD_MODULE)?)?;
+        let pio = PawnIo::open(&module, "AMDFamily17", true)?;
         let unit = pio.msr(MSR_PWR_UNIT)?;
         Ok(State::Ready {
             pio: Box::new(pio),
-            support,
-            joules_per_count: 1.0 / f64::from(1u32 << ((unit >> 8) & 0x1F)),
-            last_energy: None,
+            kind: Kind::Amd(support),
+            joules_per_count: Ok(joules_per_count(unit)),
+            last_energy: vec![None],
+        })
+    }
+
+    fn open_intel(package_sensor: bool) -> Result<State, String> {
+        let (cores, packages) = processor_pins()?;
+        let module = read_module_safe(&module_path(INTEL_MODULE)?)?;
+        let pio = PawnIo::open(&module, "IntelMSR", false)?;
+        // TjMax de cada núcleo e pacote, com a thread nele (pode variar entre soquetes).
+        let tjmax = |p: Pin| -> Result<(Pin, f64), String> {
+            let _pin = Pinned::to(p)?;
+            let t = pio
+                .msr(MSR_TEMPERATURE_TARGET)
+                .map_or(TJMAX_DEFAULT, tjmax_from_raw);
+            Ok((p, t))
+        };
+        let cores = cores
+            .into_iter()
+            .map(tjmax)
+            .collect::<Result<Vec<_>, _>>()?;
+        let packages = packages
+            .into_iter()
+            .map(tjmax)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Sem RAPL (anterior ao Sandy Bridge) o MSR não existe: a potência mostra a causa.
+        let jpc = pio
+            .msr(MSR_RAPL_POWER_UNIT)
+            .map(joules_per_count)
+            .map_err(|e| format!("RAPL not available: {e}"));
+        let n = packages.len();
+        Ok(State::Ready {
+            pio: Box::new(pio),
+            kind: Kind::Intel(IntelTopo {
+                cores,
+                packages,
+                package_sensor,
+            }),
+            joules_per_count: jpc,
+            last_energy: vec![None; n],
         })
     }
 
     pub fn read(&mut self) -> Metric<CpuSensors> {
-        let (pio, support, jpc, last_energy) = match &mut self.state {
-            State::Unsupported(s) => return neutral(s.clone()),
-            State::Failed(e) => return fail(e.clone()),
+        match &mut self.state {
+            State::Unsupported(s) => neutral(s.clone()),
+            State::Failed(e) => fail(e.clone()),
             State::Ready {
                 pio,
-                support,
+                kind: Kind::Amd(support),
                 joules_per_count,
                 last_energy,
-            } => (pio, support, *joules_per_count, last_energy),
-        };
-        // Um `Access_PCI` para todas as leituras SMN da coleta: menos disputa com outros
-        // monitores, e Tctl e CCDs ficam coerentes (ou todos lidos, ou a mesma causa).
-        let lock = pio.lock();
-        let smn = |addr: u32| -> Result<u32, String> {
-            lock.as_ref().map_err(Clone::clone)?;
-            pio.smn_locked(addr)
-        };
-        let tctl = smn(SMN_THM_TCON_CUR_TMP).map(tctl_from_raw).or_else(fail);
-        let ccds = match support.ccd_base {
-            None => neutral("not validated on this CPU family"),
-            Some(base) => {
-                let mut list = Vec::new();
-                let mut err = None;
-                for c in 0..support.ccds {
-                    match smn(base + c * 4) {
-                        Ok(raw) => {
-                            if let Some(t) = ccd_from_raw(raw) {
-                                list.push((c + 1, t));
-                            }
+            } => Ok(read_amd(pio, support, joules_per_count, last_energy)),
+            State::Ready {
+                pio,
+                kind: Kind::Intel(topo),
+                joules_per_count,
+                last_energy,
+            } => Ok(read_intel(pio, topo, joules_per_count, last_energy)),
+        }
+    }
+}
+
+fn read_amd(
+    pio: &PawnIo,
+    support: &CpuSupport,
+    jpc: &Result<f64, String>,
+    last_energy: &mut [Option<(Instant, u32)>],
+) -> CpuSensors {
+    // Um `Access_PCI` para todas as leituras SMN da coleta: menos disputa com outros
+    // monitores, e Tctl e CCDs ficam coerentes (ou todos lidos, ou a mesma causa).
+    let lock = pio.lock();
+    let smn = |addr: u32| -> Result<u32, String> {
+        lock.as_ref().map_err(Clone::clone)?;
+        pio.smn_locked(addr)
+    };
+    let tctl = smn(SMN_THM_TCON_CUR_TMP).map(tctl_from_raw).or_else(fail);
+    let ccds = match support.ccd_base {
+        None => neutral("not validated on this CPU family"),
+        Some(base) => {
+            let mut list = Vec::new();
+            let mut err = None;
+            for c in 0..support.ccds {
+                match smn(base + c * 4) {
+                    Ok(raw) => {
+                        if let Some(t) = ccd_from_raw(raw) {
+                            list.push((format!("CCD{}", c + 1), t));
                         }
-                        Err(e) => err = Some(format!("CCD{}: {e}", c + 1)),
+                    }
+                    Err(e) => err = Some(format!("CCD{}: {e}", c + 1)),
+                }
+            }
+            // Um CCD que falhou não some calado: a causa aparece no lugar da lista.
+            match (list.is_empty(), err) {
+                (_, Some(e)) => fail(e),
+                (false, None) => Ok(list),
+                (true, None) => fail("no valid CCD sensor"),
+            }
+        }
+    };
+    drop(lock);
+    let energy = pio.msr(MSR_PKG_ENERGY_STAT);
+    let package_power = match last_energy.first_mut() {
+        Some(last) => power(jpc, last, energy),
+        None => fail("no energy counter"),
+    };
+    CpuSensors::amd(tctl, ccds, package_power)
+}
+
+fn read_intel(
+    pio: &PawnIo,
+    topo: &IntelTopo,
+    jpc: &Result<f64, String>,
+    last_energy: &mut [Option<(Instant, u32)>],
+) -> CpuSensors {
+    let mut zones = Vec::with_capacity(topo.cores.len() + topo.packages.len());
+    let mut err = None;
+    for (i, &(pin, tjmax)) in topo.cores.iter().enumerate() {
+        let raw = Pinned::to(pin).and_then(|_pin| pio.msr(IA32_THERM_STATUS));
+        match raw {
+            Ok(raw) => {
+                if let Some(t) = intel_temp(raw, tjmax, true) {
+                    zones.push((format!("Core {i}"), t));
+                }
+            }
+            Err(e) => err = Some(format!("Core {i}: {e}")),
+        }
+    }
+    let multi = topo.packages.len() > 1;
+    let mut hottest_pkg: Option<f64> = None;
+    let mut pkg_err = None;
+    let mut watts_sum: Metric<f64> = Ok(0.0);
+    for (p, (&(pin, tjmax), last)) in topo.packages.iter().zip(last_energy).enumerate() {
+        let pinned = Pinned::to(pin);
+        let read = |msr: u64| -> Result<u64, String> {
+            pinned.as_ref().map_err(Clone::clone)?;
+            pio.msr(msr)
+        };
+        if topo.package_sensor {
+            match read(IA32_PACKAGE_THERM_STATUS) {
+                Ok(raw) => {
+                    let t = intel_temp(raw, tjmax, false).unwrap_or(tjmax);
+                    hottest_pkg = Some(hottest_pkg.map_or(t, |h| h.max(t)));
+                    if multi {
+                        zones.push((format!("Package {p}"), t));
                     }
                 }
-                // Um CCD que falhou não some calado: a causa aparece no lugar da lista.
-                match (list.is_empty(), err) {
-                    (_, Some(e)) => fail(e),
-                    (false, None) => Ok(list),
-                    (true, None) => fail("no valid CCD sensor"),
-                }
+                Err(e) => pkg_err = Some(format!("package {p}: {e}")),
             }
+        }
+        let w = power(jpc, last, read(MSR_PKG_ENERGY_STATUS));
+        drop(pinned);
+        watts_sum = match (watts_sum, w) {
+            (Ok(a), Ok(b)) => Ok(a + b),
+            (Err(e), _) | (_, Err(e)) => Err(e),
         };
-        drop(lock);
-        let package_power = match pio.msr(MSR_PKG_ENERGY_STAT) {
-            Err(e) => fail(e),
-            Ok(raw) => {
-                let now = (Instant::now(), raw as u32);
-                match last_energy.replace(now) {
-                    None => fail("waiting for a second sample"),
-                    Some(prev) => watts(prev, now, jpc).map_or_else(
-                        || {
-                            Err(Missing::Fail(
-                                "no time elapsed since the last sample".into(),
-                            ))
-                        },
-                        Ok,
-                    ),
-                }
-            }
-        };
-        Ok(CpuSensors {
-            tctl,
-            ccds,
-            package_power,
-        })
+    }
+    // Leitura principal: o pacote mais quente; sem sensor de pacote, o núcleo mais quente.
+    let main = match (pkg_err, hottest_pkg) {
+        (Some(e), _) => fail(e),
+        (None, Some(t)) => Ok(t),
+        (None, None) => zones
+            .iter()
+            .map(|z| z.1)
+            .reduce(f64::max)
+            .map_or_else(|| fail("no valid temperature sensor"), Ok),
+    };
+    let zones = match (zones.is_empty(), err) {
+        (_, Some(e)) => fail(e),
+        (false, None) => Ok(zones),
+        (true, None) => fail("no valid core sensor"),
+    };
+    let limit = topo
+        .packages
+        .iter()
+        .chain(&topo.cores)
+        .map(|p| p.1)
+        .reduce(f64::max)
+        .unwrap_or(TJMAX_DEFAULT);
+    CpuSensors {
+        label: "Package",
+        zone: "Core",
+        limit,
+        tctl: main,
+        ccds: zones,
+        package_power: watts_sum,
+    }
+}
+
+/// Potência pelo contador de energia de 32 bits (precisa de duas leituras).
+fn power(
+    jpc: &Result<f64, String>,
+    last: &mut Option<(Instant, u32)>,
+    energy: Result<u64, String>,
+) -> Metric<f64> {
+    let jpc = match jpc {
+        Ok(j) => *j,
+        Err(e) => return fail(e.clone()),
+    };
+    let raw = match energy {
+        Ok(raw) => raw,
+        Err(e) => return fail(e),
+    };
+    let now = (Instant::now(), raw as u32);
+    match last.replace(now) {
+        None => fail("waiting for a second sample"),
+        Some(prev) => {
+            watts(prev, now, jpc).map_or_else(|| fail("no time elapsed since the last sample"), Ok)
+        }
     }
 }
 
@@ -567,6 +885,100 @@ mod tests {
     fn ccd_invalido_e_valido() {
         assert_eq!(ccd_from_raw(0), None);
         assert!((ccd_from_raw((1 << 11) | 712).expect("válido") - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn intel_tjmax_e_leituras() {
+        // TjMax 100 °C (bits 23:16 = 0x64); zero = padrão de 100.
+        assert!((tjmax_from_raw(0x0064_0000) - 100.0).abs() < 1e-9);
+        assert!((tjmax_from_raw(0x0069_0000) - 105.0).abs() < 1e-9);
+        assert!((tjmax_from_raw(0) - TJMAX_DEFAULT).abs() < 1e-9);
+        // Núcleo: 48 graus abaixo do TjMax com o bit 31 (válido).
+        let core = (1u64 << 31) | (48 << 16);
+        assert!((intel_temp(core, 100.0, true).expect("válido") - 52.0).abs() < 1e-9);
+        assert_eq!(intel_temp(48 << 16, 100.0, true), None);
+        // Pacote: sem o bit de validade.
+        assert!((intel_temp(48 << 16, 100.0, false).expect("pacote") - 52.0).abs() < 1e-9);
+        // RAPL: ESU = 14 (Haswell) -> 1/16384 J.
+        assert!((joules_per_count(0x000A_0E03) - 1.0 / 16384.0).abs() < 1e-12);
+    }
+
+    /// Registro `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` de núcleo/pacote com uma máscara.
+    fn pin_record(rel: u32, mask: u64, group: u16) -> Vec<u8> {
+        let mut r = vec![0u8; 48];
+        r[..4].copy_from_slice(&rel.to_le_bytes());
+        r[4..8].copy_from_slice(&48u32.to_le_bytes());
+        r[30..32].copy_from_slice(&1u16.to_le_bytes());
+        r[32..40].copy_from_slice(&mask.to_le_bytes());
+        r[40..42].copy_from_slice(&group.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn nucleos_e_pacotes_da_topologia() {
+        let mut b = pin_record(3, 0xFF, 0);
+        b.extend(pin_record(0, 0b1100, 0));
+        b.extend(pin_record(2, 0, 0)); // cache: ignorado
+        b.extend(pin_record(0, 1 << 40, 1));
+        let (cores, packages) = parse_pins(&b);
+        assert_eq!(
+            cores,
+            vec![
+                Pin {
+                    group: 0,
+                    mask: 0b100
+                },
+                Pin {
+                    group: 1,
+                    mask: 1 << 40
+                }
+            ]
+        );
+        assert_eq!(packages, vec![Pin { group: 0, mask: 1 }]);
+        // Registro truncado ou com tamanho zero não trava nem lê fora.
+        let (c, p) = parse_pins(&b[..50]);
+        assert_eq!((c.len(), p.len()), (0, 1));
+        let mut zero = pin_record(0, 1, 0);
+        zero[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse_pins(&zero), (vec![], vec![]));
+    }
+
+    #[test]
+    fn fuzz_topologia_intel() {
+        let mut seed = pin_record(3, 0xFF, 0);
+        seed.extend(pin_record(0, 0b11, 0));
+        crate::fuzz::run("intel_pins", &[seed], 256, |_, b| {
+            let (c, p) = parse_pins(b);
+            assert!(c.iter().chain(&p).all(|x| x.mask.count_ones() == 1));
+        });
+    }
+
+    /// O MSR por núcleo (Intel) é lido no processador onde a thread roda: com a afinidade
+    /// trocada, a thread está mesmo no núcleo pedido, e a afinidade original volta no Drop.
+    #[test]
+    fn prende_a_thread_em_cada_nucleo() {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcessorNumber, GetThreadGroupAffinity,
+        };
+        let (cores, packages) = processor_pins().expect("topologia");
+        assert!(!packages.is_empty());
+        let affinity = || {
+            let mut ga = GROUP_AFFINITY::default();
+            // SAFETY: pseudo-handle da própria thread; estrutura local.
+            unsafe { GetThreadGroupAffinity(GetCurrentThread(), &raw mut ga) }
+                .ok()
+                .expect("afinidade");
+            (ga.Group, ga.Mask)
+        };
+        let before = affinity();
+        for p in cores {
+            let _pin = Pinned::to(p).expect("trocar afinidade");
+            // Número do lógico dentro do grupo da thread (o grupo é o da afinidade).
+            // SAFETY: sem pré-condições.
+            let n = unsafe { GetCurrentProcessorNumber() };
+            assert_eq!((affinity().0, 1u64 << n), (p.group, p.mask));
+        }
+        assert_eq!(affinity(), before);
     }
 
     #[test]

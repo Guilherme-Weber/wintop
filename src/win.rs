@@ -361,23 +361,34 @@ pub fn profile_dir() -> Option<PathBuf> {
 /// 120x30). No Windows Terminal a janela do console é um pseudoconsole oculto: nada muda.
 /// Devolve se maximizou.
 pub fn maximize_classic_console() -> bool {
-    use windows::Win32::System::Console::GetConsoleWindow;
-    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_MAXIMIZE, ShowWindow};
-    // SAFETY: sem pré-condições; janela nula = sem console.
-    let hwnd = unsafe { GetConsoleWindow() };
-    if hwnd.is_invalid() {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow};
+    let Some(hwnd) = classic_console_window() else {
         return false;
-    }
-    let mut buf = [0u16; 64];
-    // SAFETY: janela válida e buffer local com o tamanho informado.
-    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
-    if String::from_utf16_lossy(&buf[..n.min(buf.len())]) != "ConsoleWindowClass" {
-        return false;
-    }
+    };
     // SAFETY: janela do console deste processo. O retorno diz se ela estava visível antes,
     // não se deu certo.
     let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
     true
+}
+
+/// O processo está no console clássico (conhost), que não faz fallback de fonte. No Windows
+/// Terminal e em outros pseudoconsoles a janela do console é oculta, de outra classe.
+pub fn is_classic_console() -> bool {
+    classic_console_window().is_some()
+}
+
+fn classic_console_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    // SAFETY: sem pré-condições; janela nula = sem console.
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let mut buf = [0u16; 64];
+    // SAFETY: janela válida e buffer local com o tamanho informado.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    (String::from_utf16_lossy(&buf[..n.min(buf.len())]) == "ConsoleWindowClass").then_some(hwnd)
 }
 
 /// Taxa de atualização (Hz) do monitor principal, pelo modo de vídeo atual. `None` quando o

@@ -346,10 +346,12 @@ pub(super) fn draw_disks(
             .bus
             .as_ref()
             .map_or_else(missing_mark, ToString::to_string);
-        let typ = d
-            .ssd
-            .as_ref()
-            .map_or_else(missing_mark, |s| if *s { "SSD" } else { "HDD" }.to_string());
+        let typ = match &d.ssd {
+            Ok(s) => if *s { "SSD" } else { "HDD" }.to_string(),
+            // "n/a" (pendrive/ponte USB sem a consulta) cabe na coluna.
+            Err(Missing::Neutral(n)) if tr(n).chars().count() <= 3 => tr(n).into_owned(),
+            Err(e) => missing_mark(e),
+        };
         let cap = match &d.capacity {
             Ok(c) => compact_bytes(*c),
             Err(Missing::Neutral(n)) if tr(n).chars().count() <= 7 => tr(n).into_owned(),

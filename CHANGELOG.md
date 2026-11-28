@@ -6,6 +6,31 @@ Todas as mudanças relevantes do projeto. Formato baseado em
 
 ## [Não lançado]
 
+### Adicionado
+
+- Temperatura e potência de processadores Intel pelo PawnIO (módulo oficial `IntelMSR`, LGPL-2.1,
+  em `modules/`): pacote, cada núcleo (lido com a thread presa no núcleo) a partir do TjMax e
+  potência do pacote pelo RAPL. A caixa da CPU mostra o pacote e o núcleo mais quente; a aba
+  Sensores, todos os núcleos.
+- Opção `graph_symbols` (`auto`, `braille`, `block`) no `config.toml`.
+
+### Corrigido
+
+- Gráficos e barras como quadrados vazios no console clássico do Windows 10: a fonte padrão
+  (Consolas) não tem braille e o conhost não faz fallback de fonte. Agora o wintop confere a
+  fonte na abertura; sem braille, troca para uma fonte monoespaçada instalada que tenha (e
+  restaura a original ao sair) ou, sem nenhuma, desenha com blocos.
+- Discos USB (pendrives, leitores de cartão, pontes USB) sem falsas falhas: tipo de mídia não
+  informado vira "n/a", a capacidade tenta a geometria e o `READ CAPACITY` quando
+  `IOCTL_DISK_GET_LENGTH_INFO` é recusado (leitor sem cartão = "empty") e a temperatura de um
+  disco USB sem SMART vira "n/a".
+
+### Observação
+
+- A atualização automática a partir da 1.4.4 ou anterior não copia o `IntelMSR.bin` (a lista de
+  módulos é a da versão em uso). Em CPUs Intel, reinstalar pelo zip completo
+  (`wintop --install`) ou extrair o zip de novo na pasta portátil.
+
 ## [1.4.4] - 2026-11-27
 
 ### Corrigido

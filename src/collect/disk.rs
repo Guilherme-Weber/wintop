@@ -13,20 +13,21 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SPDRP_FRIENDLYNAME, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
 };
-use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
+use windows::Win32::Foundation::{ERROR_NO_MEDIA_IN_DRIVE, ERROR_NOT_READY, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
     GetLogicalDrives, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    GUID_DEVINTERFACE_DISK, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
-    IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
+    GUID_DEVINTERFACE_DISK, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+    IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+    IOCTL_STORAGE_QUERY_PROPERTY, IOCTL_STORAGE_READ_CAPACITY,
 };
 use windows::Win32::System::Power::GetDevicePowerState;
 use windows::core::{BOOL, PCWSTR};
 
-use crate::model::{Bus, Disk, Metric, fail, neutral};
+use crate::model::{Bus, Disk, Metric, Missing, fail, neutral};
 use crate::win::{self, own, wide};
 
 const PROP_DEVICE: u32 = 0; // StorageDeviceProperty
@@ -88,6 +89,17 @@ impl Handle {
         input: Option<&[u8]>,
         out: &mut [u8],
     ) -> Result<usize, String> {
+        self.ioctl_raw(code, input, out).map_err(|e| e.1)
+    }
+
+    /// Como `ioctl_into`, com o código do Win32 junto da mensagem (para separar "sem mídia" ou
+    /// "não suportado" de uma falha de verdade).
+    fn ioctl_raw(
+        &self,
+        code: u32,
+        input: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<usize, (u32, String)> {
         let mut ret = 0u32;
         // SAFETY: buffers locais com os tamanhos informados; chamada síncrona.
         unsafe {
@@ -102,7 +114,10 @@ impl Handle {
                 None,
             )
         }
-        .map_err(|e| format!("IOCTL 0x{:X}: error 0x{:X}", code, e.code().0 & 0xFFFF))?;
+        .map_err(|e| {
+            let win32 = (e.code().0 & 0xFFFF) as u32;
+            (win32, format!("IOCTL 0x{code:X}: error 0x{win32:X}"))
+        })?;
         Ok((ret as usize).min(out.len()))
     }
 
@@ -399,6 +414,9 @@ impl Inventory {
         let ssd = match meta.property(PROP_SEEK_PENALTY) {
             Ok(b) if b.len() > 8 => Ok(b[8] == 0),
             Ok(_) => fail("response too short"),
+            // Pendrives, leitores de cartão e muitas pontes USB não respondem a esta consulta
+            // (ERROR_INVALID_FUNCTION): o tipo de mídia não existe para eles, não é falha.
+            Err(_) if bus == Ok(Bus::Usb) => neutral("n/a"),
             Err(e) => fail(e),
         };
         let mut inv = Self {
@@ -437,18 +455,20 @@ impl Inventory {
             self.pool_member = fail("no read access (not elevated?)");
             return;
         };
-        self.capacity = reader
-            .ioctl(IOCTL_DISK_GET_LENGTH_INFO, None, 8)
-            .and_then(|b| u64_at(&b, 0).ok_or_else(|| "response too short".into()))
-            .or_else(fail);
-        self.pool_member = reader
-            .ioctl(
-                IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
-                None,
-                L_ENTRIES + 128 * P_SIZE,
-            )
-            .map(|l| is_pool_member(&l))
-            .or_else(fail);
+        self.capacity = capacity(&reader);
+        self.pool_member = if matches!(self.capacity, Err(Missing::Neutral(_))) {
+            // Leitor sem cartão: não há tabela de partições para ler.
+            self.capacity.clone().map(|_| false)
+        } else {
+            reader
+                .ioctl(
+                    IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+                    None,
+                    L_ENTRIES + 128 * P_SIZE,
+                )
+                .map(|l| is_pool_member(&l))
+                .or_else(fail)
+        };
     }
 
     /// O disco ainda é o mesmo e está presente. Com handle guardado: ele ainda responde (se
@@ -553,6 +573,40 @@ impl Inventory {
                 .map(|a| (a, iops(&prev, &now), now.queue))
                 .map_or_else(|| fail("counters went backwards (disk reset)"), Ok),
         }
+    }
+}
+
+/// Capacidade do disco em bytes. `IOCTL_DISK_GET_LENGTH_INFO` primeiro (o que o Task Manager
+/// mostra); alguns pendrives e pontes USB recusam esse IOCTL e respondem à geometria
+/// (`DiskSize` em +24 de `DISK_GEOMETRY_EX`) ou ao `READ CAPACITY` (`DiskLength` em +24 de
+/// `STORAGE_READ_CAPACITY`). Sem mídia (leitor de cartão vazio): estado neutro "empty".
+fn capacity(h: &Handle) -> Metric<u64> {
+    let mut buf = [0u8; 256];
+    let first = match h.ioctl_raw(IOCTL_DISK_GET_LENGTH_INFO, None, &mut buf[..8]) {
+        Ok(n) => {
+            return u64_at(&buf[..n], 0).map_or_else(|| fail("response too short"), Ok);
+        }
+        Err(e) => e,
+    };
+    for code in [
+        IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+        IOCTL_STORAGE_READ_CAPACITY,
+    ] {
+        if let Ok(n) = h.ioctl_raw(code, None, &mut buf)
+            && let Some(v) = u64_at(&buf[..n], 24).filter(|&v| v > 0)
+        {
+            return Ok(v);
+        }
+    }
+    capacity_failure(first)
+}
+
+/// Causa da falha da capacidade: sem mídia é estado neutro.
+fn capacity_failure((code, msg): (u32, String)) -> Metric<u64> {
+    if code == ERROR_NOT_READY.0 || code == ERROR_NO_MEDIA_IN_DRIVE.0 {
+        neutral("empty")
+    } else {
+        fail(msg)
     }
 }
 

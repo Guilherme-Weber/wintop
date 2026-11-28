@@ -283,10 +283,12 @@ fn fast_report<W: Write>(r: &mut Report<W>, f: &Fast) {
     match &f.cpu_sensors {
         Err(e) => r.missing("PawnIO", e),
         Ok(s) => {
-            r.line("Tctl", &s.tctl, |v| format!("{} °C", num(*v, 1)));
-            r.line("CCD temperatures", &s.ccds, |v| {
+            r.line(s.label, &s.tctl, |v| {
+                format!("{} °C (limit {} °C)", num(*v, 1), num(s.limit, 0))
+            });
+            r.line(&format!("{} temperatures", s.zone), &s.ccds, |v| {
                 v.iter()
-                    .map(|(n, t)| format!("CCD{n} {} °C", num(*t, 1)))
+                    .map(|(n, t)| format!("{n} {} °C", num(*t, 1)))
                     .collect::<Vec<_>>()
                     .join(", ")
             });

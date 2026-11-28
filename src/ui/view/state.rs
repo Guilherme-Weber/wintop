@@ -696,11 +696,11 @@ impl State {
         };
         if let Ok(s) = &f.cpu_sensors {
             if let Ok(v) = s.tctl {
-                bump("CPU/Tctl", v);
+                bump(&format!("CPU/{}", s.label), v);
             }
             if let Ok(list) = &s.ccds {
                 for (n, t) in list {
-                    bump(&format!("CPU/CCD{n}"), *t);
+                    bump(&format!("CPU/{n}"), *t);
                 }
             }
             if let Ok(v) = s.package_power {

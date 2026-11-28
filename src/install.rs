@@ -799,7 +799,13 @@ fn running_from(exe: &Path) -> bool {
 }
 
 /// Arquivos de `modules\` que a instalação leva (o que o wintop usa e a licença dele).
-pub const MODULE_FILES: [&str; 3] = ["AMDFamily17.bin", "COPYING-LGPL-2.1", "README.md"];
+/// Os `.bin` são obrigatórios (os módulos do PawnIO: AMD e Intel).
+pub const MODULE_FILES: [&str; 4] = [
+    "AMDFamily17.bin",
+    "IntelMSR.bin",
+    "COPYING-LGPL-2.1",
+    "README.md",
+];
 
 /// Teto de tamanho de cada arquivo de `modules\` lido da pasta de origem.
 const MAX_MODULE_BYTES: u64 = 16 << 20;
@@ -818,10 +824,10 @@ fn read_modules(from: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
     })?;
     let mut out = Vec::new();
-    for (i, f) in MODULE_FILES.iter().enumerate() {
+    for f in MODULE_FILES {
         match src.read_bytes(f, MAX_MODULE_BYTES)? {
-            Some(data) => out.push(((*f).to_string(), data)),
-            None if i == 0 => {
+            Some(data) => out.push((f.to_string(), data)),
+            None if f.ends_with(".bin") => {
                 return Err(format!(
                     "{} not found: extract the whole zip next to wintop.exe",
                     from.join(f).display()

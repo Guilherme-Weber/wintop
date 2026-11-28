@@ -109,11 +109,11 @@ pub(super) fn fast(step: u32) -> Fast {
     g.usage = Ok(step * 11 % 100);
     Fast {
         cpu: Ok(c),
-        cpu_sensors: Ok(CpuSensors {
-            tctl: Ok(61.0),
-            ccds: Ok(vec![(1, 58.25)]),
-            package_power: Ok(57.5),
-        }),
+        cpu_sensors: Ok(CpuSensors::amd(
+            Ok(61.0),
+            Ok(vec![("CCD1".into(), 58.25)]),
+            Ok(57.5),
+        )),
         memory: Ok(Memory {
             total: Ok(32 * GB),
             used: Ok(21 * GB),

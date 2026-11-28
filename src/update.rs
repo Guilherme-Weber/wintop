@@ -504,8 +504,10 @@ pub fn unpack(verified: VerifiedZip<'_>, version: &str) -> Result<Package, Strin
             modules.push((f.to_string(), r?));
         }
     }
-    if !modules.iter().any(|(n, _)| n == MODULE_FILES[0]) {
-        return Err(format!("modules/{} not in the package", MODULE_FILES[0]));
+    for f in MODULE_FILES.iter().filter(|f| f.ends_with(".bin")) {
+        if !modules.iter().any(|(n, _)| n == f) {
+            return Err(format!("modules/{f} not in the package"));
+        }
     }
     Ok(Package { exe, modules })
 }
@@ -892,6 +894,7 @@ mod tests {
         let z = zip(&[
             ("wintop-1.2.0-windows-x64/README.md", b"r"),
             ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"mod"),
+            ("wintop-1.2.0-windows-x64/modules/IntelMSR.bin", b"intel"),
             ("wintop-1.2.0-windows-x64/modules/source/x.c", b"src"),
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe"),
         ]);
@@ -899,8 +902,17 @@ mod tests {
         assert_eq!(p.exe, b"MZexe");
         assert_eq!(
             p.modules,
-            vec![("AMDFamily17.bin".to_string(), b"mod".to_vec())]
+            vec![
+                ("AMDFamily17.bin".to_string(), b"mod".to_vec()),
+                ("IntelMSR.bin".to_string(), b"intel".to_vec()),
+            ]
         );
+        // Sem um dos módulos obrigatórios (pacote anterior ao IntelMSR): recusado.
+        let sem_intel = zip(&[
+            ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"mod"),
+            ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe"),
+        ]);
+        assert!(unpack(VerifiedZip(&sem_intel), "1.2.0").is_err());
         // Deflate (método 8, o usado na release real) + método não suportado.
         let zd = zip_method(&[
             (
@@ -911,6 +923,11 @@ mod tests {
             (
                 "wintop-1.2.0-windows-x64/modules/AMDFamily17.bin",
                 b"mod-deflate",
+                8,
+            ),
+            (
+                "wintop-1.2.0-windows-x64/modules/IntelMSR.bin",
+                b"intel-deflate",
                 8,
             ),
         ]);
@@ -943,6 +960,7 @@ mod tests {
         let z0 = zip(&[
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe"),
             ("wintop-1.2.0-windows-x64/modules/AMDFamily17.bin", b"mod"),
+            ("wintop-1.2.0-windows-x64/modules/IntelMSR.bin", b"intel"),
         ]);
         let z8 = zip_method(&[
             ("wintop-1.2.0-windows-x64/wintop.exe", b"MZexe", 8),
@@ -951,6 +969,7 @@ mod tests {
                 b"mod",
                 8,
             ),
+            ("wintop-1.2.0-windows-x64/modules/IntelMSR.bin", b"intel", 8),
         ]);
         for n in 0..z0.len() {
             let _ = unpack(VerifiedZip(&z0[..n]), "1.2.0");

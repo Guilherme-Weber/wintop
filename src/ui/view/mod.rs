@@ -544,7 +544,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "Tctl, CCD",
-        "AMD control and per-chiplet temperatures (PawnIO)",
+        "AMD control/per-chiplet temps (Intel: Package, Core)",
     ),
     ("S  P", "disk with the system / with a page file"),
     ("act, resp", "disk active time / average response time"),
